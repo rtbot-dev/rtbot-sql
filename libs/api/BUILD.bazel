@@ -1,0 +1,15 @@
+cc_library(
+    name = "api",
+    hdrs = glob(["include/**/*.h"]),
+    strip_include_prefix = "include",
+    visibility = ["//visibility:public"],
+)
+
+cc_test(
+    name = "version_test",
+    srcs = ["src/version_test.cpp"],
+    deps = [
+        ":api",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
