@@ -1,0 +1,19 @@
+# Bazel
+/bazel-*
+/dist/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.clangd/
+compile_commands.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env*

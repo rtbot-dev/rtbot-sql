@@ -1,0 +1,20 @@
+module(
+    name = "rtbot-sql",
+    version = "0.1.0",
+)
+
+# --- Core dependencies ---
+
+bazel_dep(name = "platforms", version = "1.0.0")
+bazel_dep(name = "rules_cc", version = "0.1.1")
+bazel_dep(name = "bazel_skylib", version = "1.8.1")
+bazel_dep(name = "googletest", version = "1.15.2", repo_name = "com_google_googletest")
+bazel_dep(name = "protobuf", version = "31.1", repo_name = "com_google_protobuf")
+
+# --- rtbot dependency ---
+# Will be added once rtbot has a MODULE.bazel or via a module extension
+# (similar to platform's rtbot_ext.bzl). For now the compiler library
+# has no rtbot dependency — operator JSON is plain strings.
+#
+# bazel_dep(name = "rtbot", version = "...")
+# local_path_override(module_name = "rtbot", path = "../rtbot")

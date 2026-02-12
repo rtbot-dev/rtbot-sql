@@ -1,0 +1,13 @@
+build --cxxopt=-std=c++17
+build --host_cxxopt=-std=c++17
+
+# macOS clang
+build:macos --cxxopt=-stdlib=libc++
+build:macos --host_cxxopt=-stdlib=libc++
+build:macos --linkopt=-stdlib=libc++
+
+build --enable_platform_specific_config
+build --repo_env=CC=clang
+
+# Test output
+test --test_output=errors
