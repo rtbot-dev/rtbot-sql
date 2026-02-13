@@ -1,1 +1,19 @@
-# Placeholder
+cc_test(
+    name = "compiler_integration_test",
+    srcs = ["compiler_integration_test.cpp"],
+    deps = [
+        "//libs/api:api_compiler",
+        "@json-cpp//:lib",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "view_chaining_test",
+    srcs = ["view_chaining_test.cpp"],
+    deps = [
+        "//libs/api:api_compiler",
+        "@json-cpp//:lib",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
