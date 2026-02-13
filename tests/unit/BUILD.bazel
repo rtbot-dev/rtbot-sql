@@ -96,3 +96,30 @@ cc_test(
         "@com_google_googletest//:gtest_main",
     ],
 )
+
+cc_test(
+    name = "tier_test",
+    srcs = ["tier_test.cpp"],
+    deps = [
+        "//libs/planner",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "evaluator_test",
+    srcs = ["evaluator_test.cpp"],
+    deps = [
+        "//libs/planner",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "plan_test",
+    srcs = ["plan_test.cpp"],
+    deps = [
+        "//libs/planner",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
