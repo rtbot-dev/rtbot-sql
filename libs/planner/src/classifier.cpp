@@ -171,10 +171,17 @@ SelectTier classify_select(const parser::ast::SelectStmt& stmt,
     return SelectTier::TIER3_EPHEMERAL;
   }
 
-  // STREAM without LIMIT → error
-  if (type == EntityType::STREAM && !stmt.limit.has_value()) {
-    throw std::runtime_error("stream '" + stmt.from_table +
-                             "' requires LIMIT or WHERE time bounds");
+  // STREAM: stateful queries (GROUP BY, aggregates, windowed) are Tier 3
+  // and don't need LIMIT — they create ephemeral pipelines.
+  if (type == EntityType::STREAM) {
+    if (has_aggregates(stmt) || has_windowed_functions(stmt) ||
+        has_group_by(stmt)) {
+      return SelectTier::TIER3_EPHEMERAL;
+    }
+    if (!stmt.limit.has_value()) {
+      throw std::runtime_error("stream '" + stmt.from_table +
+                               "' requires LIMIT or WHERE time bounds");
+    }
   }
 
   // MATERIALIZED_VIEW or STREAM from here on

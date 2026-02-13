@@ -52,6 +52,31 @@ SelectPlan plan_select(const parser::ast::SelectStmt& stmt,
       plan.read_stream = stmt.from_table;
       plan.limit = stmt.limit.value_or(-1);
 
+      // Validate column names in SELECT list
+      if (!stmt.select_list.empty()) {
+        auto schema = resolve_schema(stmt.from_table, catalog);
+        for (size_t i = 0; i < stmt.select_list.size(); ++i) {
+          auto* col = std::get_if<parser::ast::ColumnRef>(
+              &stmt.select_list[i].expr);
+          if (col) {
+            auto idx = schema.column_index(col->column_name);
+            if (!idx.has_value()) {
+              std::string avail;
+              for (const auto& c : schema.columns) {
+                if (!avail.empty()) avail += ", ";
+                avail += c.name;
+              }
+              throw std::runtime_error(
+                  "Column '" + col->column_name + "' not found in '" +
+                  stmt.from_table + "'. Available: " + avail);
+            }
+            std::string alias = stmt.select_list[i].alias.value_or(
+                col->column_name);
+            plan.field_map[alias] = *idx;
+          }
+        }
+      }
+
       // Check for key filter (WHERE key = X on keyed views)
       if (stmt.where_clause.has_value()) {
         auto view = catalog.lookup_view(stmt.from_table);
