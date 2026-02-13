@@ -1,0 +1,5 @@
+{
+  "streams": {
+    "trades": ["instrument_id", "price", "quantity", "account_id"]
+  }
+}
