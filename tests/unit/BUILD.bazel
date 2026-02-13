@@ -51,3 +51,48 @@ cc_test(
         "@com_google_googletest//:gtest_main",
     ],
 )
+
+cc_test(
+    name = "function_test",
+    srcs = ["function_test.cpp"],
+    deps = [
+        "//libs/compiler",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "select_test",
+    srcs = ["select_test.cpp"],
+    deps = [
+        "//libs/compiler",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "group_by_test",
+    srcs = ["group_by_test.cpp"],
+    deps = [
+        "//libs/compiler",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "having_test",
+    srcs = ["having_test.cpp"],
+    deps = [
+        "//libs/compiler",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "dedup_test",
+    srcs = ["dedup_test.cpp"],
+    deps = [
+        "//libs/compiler",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
