@@ -1,1 +1,8 @@
-# Placeholder
+cc_library(
+    name = "catalog",
+    srcs = glob(["src/**/*.cpp"]),
+    hdrs = glob(["include/**/*.h"]),
+    strip_include_prefix = "include",
+    visibility = ["//visibility:public"],
+    deps = ["//libs/api"],
+)
