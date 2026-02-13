@@ -5,6 +5,8 @@
 #include <stdexcept>
 #include <string>
 
+#include "rtbot_sql/compiler/function_compiler.h"
+
 namespace rtbot_sql::compiler {
 
 namespace {
@@ -244,6 +246,11 @@ ExprResult compile_expression(const parser::ast::Expr& expr,
     // Unary math functions (ABS, FLOOR, CEIL, etc.)
     auto rtbot_type = math_func_to_rtbot(func.name);
     if (rtbot_type.empty()) {
+      // Delegate to aggregate/windowed function compiler
+      if (is_aggregate_or_windowed(func.name)) {
+        return compile_function(func.name, func.args, input_endpoint, scope,
+                                builder);
+      }
       throw std::runtime_error("unknown function: " + func.name);
     }
     if (func.args.size() != 1) {
