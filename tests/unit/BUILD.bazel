@@ -1,1 +1,26 @@
-# Placeholder
+cc_test(
+    name = "parser_test",
+    srcs = ["parser_test.cpp"],
+    deps = [
+        "//libs/parser",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "types_test",
+    srcs = ["types_test.cpp"],
+    deps = [
+        "//libs/api",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "catalog_test",
+    srcs = ["catalog_test.cpp"],
+    deps = [
+        "//libs/catalog",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
