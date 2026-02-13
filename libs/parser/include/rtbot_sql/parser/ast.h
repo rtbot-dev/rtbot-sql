@@ -96,6 +96,7 @@ struct SelectStmt {
   std::optional<Expr> where_clause;
   std::vector<Expr> group_by;
   std::optional<Expr> having;
+  std::optional<int> limit;
 };
 
 struct ColumnDefAST {
