@@ -24,3 +24,30 @@ cc_test(
         "@com_google_googletest//:gtest_main",
     ],
 )
+
+cc_test(
+    name = "scope_test",
+    srcs = ["scope_test.cpp"],
+    deps = [
+        "//libs/analyzer",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "expression_test",
+    srcs = ["expression_test.cpp"],
+    deps = [
+        "//libs/compiler",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "where_test",
+    srcs = ["where_test.cpp"],
+    deps = [
+        "//libs/compiler",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
