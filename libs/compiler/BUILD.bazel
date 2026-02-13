@@ -8,5 +8,6 @@ cc_library(
         "//libs/analyzer",
         "//libs/api",
         "//libs/parser",
+        "@json-cpp//:lib",
     ],
 )

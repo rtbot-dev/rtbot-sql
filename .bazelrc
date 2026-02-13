@@ -1,3 +1,7 @@
+# Output to dist/ instead of bazel-bin/, bazel-out/, etc.
+build --symlink_prefix=dist/
+
+# C++17
 build --cxxopt=-std=c++17
 build --host_cxxopt=-std=c++17
 
@@ -11,3 +15,8 @@ build --repo_env=CC=clang
 
 # Test output
 test --test_output=errors
+
+# Debug config: stream test output, no caching
+test:debug --test_output=streamed
+test:debug --nocache_test_results
+test:debug --test_strategy=exclusive

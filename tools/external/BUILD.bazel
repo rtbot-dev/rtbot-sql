@@ -1,0 +1,2 @@
+# This directory contains BUILD files for external dependencies.
+# This BUILD file makes it a valid Bazel package.

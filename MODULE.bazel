@@ -23,6 +23,26 @@ http_archive(
     urls = ["https://github.com/pganalyze/libpg_query/archive/refs/tags/17-6.2.2.tar.gz"],
 )
 
+# --- nlohmann/json (JSON parsing for AST conversion) ---
+
+http_archive(
+    name = "json-cpp",
+    build_file = "//tools/external:json-cpp.BUILD",
+    sha256 = "95651d7d1fcf2e5c3163c3d37df6d6b3e9e5027299e6bd050d157322ceda9ac9",
+    strip_prefix = "json-3.11.2",
+    url = "https://github.com/nlohmann/json/archive/refs/tags/v3.11.2.zip",
+)
+
+# --- cxxopts (CLI argument parsing) ---
+
+http_archive(
+    name = "cxxopts",
+    build_file = "//tools/external:cxxopts.BUILD",
+    sha256 = "25b644a2bfa9c6704d723be51b026bc02420dfdee1277a49bfe5df3f19b0eaa4",
+    strip_prefix = "cxxopts-3.1.1",
+    url = "https://github.com/jarro2783/cxxopts/archive/refs/tags/v3.1.1.zip",
+)
+
 # --- rtbot dependency ---
 # Will be added once rtbot has a MODULE.bazel or via a module extension
 # (similar to platform's rtbot_ext.bzl). For now the compiler library

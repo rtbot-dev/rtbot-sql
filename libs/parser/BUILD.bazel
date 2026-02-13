@@ -4,5 +4,8 @@ cc_library(
     hdrs = glob(["include/**/*.h"]),
     strip_include_prefix = "include",
     visibility = ["//visibility:public"],
-    deps = ["@libpg_query"],
+    deps = [
+        "@json-cpp//:lib",
+        "@libpg_query",
+    ],
 )
