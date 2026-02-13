@@ -73,8 +73,7 @@ SelectResult compile_select_projection(
 
   // Optimization: all plain ColumnRefs → VectorProject
   if (all_column_refs(select_list)) {
-    std::map<std::string, double> params;
-    params["numIndices"] = static_cast<double>(select_list.size());
+    std::vector<int> indices;
     FieldMap field_map;
 
     for (size_t i = 0; i < select_list.size(); ++i) {
@@ -85,15 +84,15 @@ SelectResult compile_select_projection(
         throw std::runtime_error(*err);
       }
       auto& binding = std::get<analyzer::ColumnBinding>(result);
-      params["index_" + std::to_string(i)] =
-          static_cast<double>(binding.index);
+      indices.push_back(binding.index);
 
       std::string alias = select_list[i].alias.value_or(col.column_name);
       field_map[alias] = static_cast<int>(i);
     }
 
     auto proj_id = builder.next_id("proj");
-    builder.add_operator(proj_id, "VectorProject", params);
+    builder.add_operator(proj_id, "VectorProject", {}, {}, {},
+                         {{"indices", indices}});
     builder.connect(input_endpoint, {proj_id, "i1"});
     return {{proj_id, "o1"}, field_map};
   }

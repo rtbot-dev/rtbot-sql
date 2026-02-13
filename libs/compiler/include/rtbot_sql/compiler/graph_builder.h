@@ -17,6 +17,8 @@ struct OperatorDef {
   std::string type;
   std::map<std::string, double> params;
   std::map<std::string, std::string> string_params;
+  std::map<std::string, std::vector<double>> double_array_params;
+  std::map<std::string, std::vector<int>> int_array_params;
 };
 
 struct Connection {
@@ -38,9 +40,12 @@ class GraphBuilder {
  public:
   std::string next_id(const std::string& prefix);
 
-  void add_operator(const std::string& id, const std::string& type,
-                    const std::map<std::string, double>& params = {},
-                    const std::map<std::string, std::string>& string_params = {});
+  void add_operator(
+      const std::string& id, const std::string& type,
+      const std::map<std::string, double>& params = {},
+      const std::map<std::string, std::string>& string_params = {},
+      const std::map<std::string, std::vector<double>>& double_array_params = {},
+      const std::map<std::string, std::vector<int>>& int_array_params = {});
 
   void connect(const Endpoint& from, const Endpoint& to);
 
