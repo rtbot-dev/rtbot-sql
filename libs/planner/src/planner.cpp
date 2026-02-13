@@ -1,0 +1,133 @@
+#include "rtbot_sql/planner/planner.h"
+
+#include <stdexcept>
+#include <string>
+
+#include "rtbot_sql/planner/classifier.h"
+
+namespace rtbot_sql::planner {
+
+namespace {
+
+// Resolve the schema for a source entity.
+StreamSchema resolve_schema(const std::string& source,
+                            const catalog::Catalog& catalog) {
+  auto stream = catalog.lookup_stream(source);
+  if (stream.has_value()) return *stream;
+
+  auto view = catalog.lookup_view(source);
+  if (view.has_value()) {
+    // Construct a StreamSchema from the view's field_map.
+    StreamSchema schema;
+    schema.name = view->name;
+    for (const auto& [name, idx] : view->field_map) {
+      schema.columns.push_back({name, idx});
+    }
+    return schema;
+  }
+
+  auto table = catalog.lookup_table(source);
+  if (table.has_value()) return {table->name, table->columns};
+
+  throw std::runtime_error("cannot resolve schema for: " + source);
+}
+
+// Default alias for an expression.
+std::string default_alias(const parser::ast::Expr& expr, int index) {
+  if (auto* col = std::get_if<parser::ast::ColumnRef>(&expr)) {
+    return col->column_name;
+  }
+  return "expr_" + std::to_string(index);
+}
+
+}  // namespace
+
+SelectPlan plan_select(const parser::ast::SelectStmt& stmt,
+                       const catalog::Catalog& catalog) {
+  SelectPlan plan;
+  plan.tier = classify_select(stmt, catalog);
+
+  switch (plan.tier) {
+    case SelectTier::TIER1_READ: {
+      plan.read_stream = stmt.from_table;
+      plan.limit = stmt.limit.value_or(-1);
+
+      // Check for key filter (WHERE key = X on keyed views)
+      if (stmt.where_clause.has_value()) {
+        auto view = catalog.lookup_view(stmt.from_table);
+        if (view.has_value() && view->view_type == ViewType::KEYED) {
+          for (const auto& [name, idx] : view->field_map) {
+            if (idx == view->key_index) {
+              auto* cmp_ptr = std::get_if<
+                  std::unique_ptr<parser::ast::ComparisonExpr>>(
+                  &*stmt.where_clause);
+              if (cmp_ptr) {
+                const auto& cmp = **cmp_ptr;
+                if (cmp.op == "=") {
+                  auto* left_col =
+                      std::get_if<parser::ast::ColumnRef>(&cmp.left);
+                  auto* right_const =
+                      std::get_if<parser::ast::Constant>(&cmp.right);
+                  if (left_col && right_const &&
+                      left_col->column_name == name) {
+                    plan.key_filter = right_const->value;
+                  }
+                  auto* left_const =
+                      std::get_if<parser::ast::Constant>(&cmp.left);
+                  auto* right_col =
+                      std::get_if<parser::ast::ColumnRef>(&cmp.right);
+                  if (left_const && right_col &&
+                      right_col->column_name == name) {
+                    plan.key_filter = left_const->value;
+                  }
+                }
+              }
+              break;
+            }
+          }
+        }
+      }
+      break;
+    }
+
+    case SelectTier::TIER2_SCAN: {
+      plan.scan_stream = stmt.from_table;
+      auto schema = resolve_schema(stmt.from_table, catalog);
+
+      // Compile WHERE predicate
+      if (stmt.where_clause.has_value()) {
+        plan.where_predicate =
+            compile_for_eval(*stmt.where_clause, schema);
+      }
+
+      // Compile SELECT expressions
+      if (stmt.select_list.empty()) {
+        // SELECT * — identity, no compiled exprs needed
+        for (const auto& col : schema.columns) {
+          plan.field_map[col.name] = col.index;
+        }
+      } else {
+        for (size_t i = 0; i < stmt.select_list.size(); ++i) {
+          const auto& item = stmt.select_list[i];
+          plan.select_exprs.push_back(
+              compile_for_eval(item.expr, schema));
+          std::string alias =
+              item.alias.value_or(default_alias(item.expr, static_cast<int>(i)));
+          plan.field_map[alias] = static_cast<int>(i);
+        }
+      }
+
+      plan.limit = stmt.limit.value_or(-1);
+      break;
+    }
+
+    case SelectTier::TIER3_EPHEMERAL: {
+      plan.needs_compilation = true;
+      break;
+    }
+  }
+
+  return plan;
+}
+
+}  // namespace rtbot_sql::planner

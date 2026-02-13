@@ -1,1 +1,13 @@
-# Placeholder
+cc_library(
+    name = "planner",
+    srcs = glob(["src/**/*.cpp"]),
+    hdrs = glob(["include/**/*.h"]),
+    strip_include_prefix = "include",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//libs/api",
+        "//libs/catalog",
+        "//libs/compiler",
+        "//libs/parser",
+    ],
+)
