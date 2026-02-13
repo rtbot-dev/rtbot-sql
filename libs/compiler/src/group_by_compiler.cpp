@@ -1,0 +1,301 @@
+#include "rtbot_sql/compiler/group_by_compiler.h"
+
+#include <algorithm>
+#include <stdexcept>
+#include <string>
+
+#include "rtbot_sql/compiler/expr_cache.h"
+#include "rtbot_sql/compiler/expression_compiler.h"
+
+namespace rtbot_sql::compiler {
+
+namespace {
+
+// Check if a SelectItem is the GROUP BY key column.
+bool is_group_by_key(const parser::ast::SelectItem& item,
+                     const parser::ast::Expr& group_by_expr,
+                     const analyzer::Scope& scope) {
+  auto* item_col = std::get_if<parser::ast::ColumnRef>(&item.expr);
+  auto* key_col = std::get_if<parser::ast::ColumnRef>(&group_by_expr);
+  if (!item_col || !key_col) return false;
+
+  auto item_res = scope.resolve(*item_col);
+  auto key_res = scope.resolve(*key_col);
+  auto* item_bind = std::get_if<analyzer::ColumnBinding>(&item_res);
+  auto* key_bind = std::get_if<analyzer::ColumnBinding>(&key_res);
+  if (!item_bind || !key_bind) return false;
+
+  return item_bind->index == key_bind->index;
+}
+
+// Generate a default alias for an expression.
+std::string default_alias(const parser::ast::Expr& expr) {
+  if (auto* col = std::get_if<parser::ast::ColumnRef>(&expr)) {
+    return col->column_name;
+  }
+  if (auto* func_ptr =
+          std::get_if<std::unique_ptr<parser::ast::FuncCall>>(&expr)) {
+    const auto& func = **func_ptr;
+    std::string name = func.name;
+    std::transform(name.begin(), name.end(), name.begin(), ::tolower);
+    if (!func.args.empty()) {
+      if (auto* col =
+              std::get_if<parser::ast::ColumnRef>(&func.args[0])) {
+        return name + "_" + col->column_name;
+      }
+    }
+    return name;
+  }
+  return "expr";
+}
+
+// Ensure an ExprResult is an Endpoint, materializing constants if needed.
+Endpoint ensure_endpoint(ExprResult result, const Endpoint& input_endpoint,
+                         GraphBuilder& builder) {
+  if (auto* ep = std::get_if<Endpoint>(&result)) {
+    return *ep;
+  }
+  auto& cm = std::get<ConstantMarker>(result);
+  auto id = builder.next_id("const");
+  builder.add_operator(id, "ConstantNumber", {{"value", cm.value}});
+  builder.connect(input_endpoint, {id, "i1"});
+  return {id, "o1"};
+}
+
+// Cache-aware expression compilation.
+ExprResult compile_expression_cached(const parser::ast::Expr& expr,
+                                     const Endpoint& input_endpoint,
+                                     const analyzer::Scope& scope,
+                                     GraphBuilder& builder,
+                                     ExprCache& cache) {
+  const Endpoint* cached = cache.lookup(expr);
+  if (cached) return *cached;
+
+  auto result = compile_expression(expr, input_endpoint, scope, builder);
+
+  if (auto* ep = std::get_if<Endpoint>(&result)) {
+    cache.store(expr, *ep);
+  }
+
+  return result;
+}
+
+// Map comparison op to RTBot operator type.
+std::string comparison_to_rtbot(const std::string& op) {
+  if (op == ">") return "CompareGT";
+  if (op == "<") return "CompareLT";
+  if (op == ">=") return "CompareGTE";
+  if (op == "<=") return "CompareLTE";
+  if (op == "=") return "CompareEQ";
+  if (op == "!=") return "CompareNEQ";
+  throw std::runtime_error("unknown comparison operator: " + op);
+}
+
+// Flip comparison direction (for constant on left side).
+std::string flip_comparison(const std::string& op) {
+  if (op == ">") return "<";
+  if (op == "<") return ">";
+  if (op == ">=") return "<=";
+  if (op == "<=") return ">=";
+  return op;  // = and != are symmetric
+}
+
+// Cache-aware HAVING predicate compilation.
+Endpoint compile_having_predicate(const parser::ast::Expr& expr,
+                                  const Endpoint& input_endpoint,
+                                  const analyzer::Scope& scope,
+                                  GraphBuilder& builder,
+                                  ExprCache& cache) {
+  using namespace parser::ast;
+
+  // ComparisonExpr: e.g. COUNT(*) > 5
+  if (auto* cmp_ptr = std::get_if<std::unique_ptr<ComparisonExpr>>(&expr)) {
+    const auto& cmp = **cmp_ptr;
+
+    auto left = compile_expression_cached(cmp.left, input_endpoint, scope,
+                                          builder, cache);
+    auto right = compile_expression_cached(cmp.right, input_endpoint, scope,
+                                           builder, cache);
+
+    auto* left_const = std::get_if<ConstantMarker>(&left);
+    auto* right_const = std::get_if<ConstantMarker>(&right);
+
+    if (left_const && right_const) {
+      throw std::runtime_error(
+          "comparison of two constants is not supported in HAVING");
+    }
+
+    // stream OP constant
+    if (right_const) {
+      auto& stream_ep = std::get<Endpoint>(left);
+      auto id = builder.next_id("cmp");
+      builder.add_operator(id, comparison_to_rtbot(cmp.op),
+                           {{"value", right_const->value}});
+      builder.connect(stream_ep, {id, "i1"});
+      return {id, "o1"};
+    }
+
+    // constant OP stream → flip
+    if (left_const) {
+      auto& stream_ep = std::get<Endpoint>(right);
+      auto id = builder.next_id("cmp");
+      builder.add_operator(id, comparison_to_rtbot(flip_comparison(cmp.op)),
+                           {{"value", left_const->value}});
+      builder.connect(stream_ep, {id, "i1"});
+      return {id, "o1"};
+    }
+
+    throw std::runtime_error(
+        "comparison of two stream expressions not yet supported in HAVING");
+  }
+
+  // LogicalExpr: AND/OR
+  if (auto* log_ptr = std::get_if<std::unique_ptr<LogicalExpr>>(&expr)) {
+    const auto& log = **log_ptr;
+    auto left_ep = compile_having_predicate(log.left, input_endpoint, scope,
+                                            builder, cache);
+    auto right_ep = compile_having_predicate(log.right, input_endpoint, scope,
+                                             builder, cache);
+
+    std::string upper_op = log.op;
+    std::transform(upper_op.begin(), upper_op.end(), upper_op.begin(),
+                   ::toupper);
+
+    std::string rtbot_type;
+    if (upper_op == "AND")
+      rtbot_type = "LogicalAnd";
+    else if (upper_op == "OR")
+      rtbot_type = "LogicalOr";
+    else
+      throw std::runtime_error("unknown logical operator: " + log.op);
+
+    auto id = builder.next_id(rtbot_type == "LogicalAnd" ? "and" : "or");
+    builder.add_operator(id, rtbot_type, {{"numPorts", 2}});
+    builder.connect(left_ep, {id, "i1"});
+    builder.connect(right_ep, {id, "i2"});
+    return {id, "o1"};
+  }
+
+  throw std::runtime_error("unsupported HAVING predicate expression type");
+}
+
+}  // namespace
+
+SelectResult compile_group_by(
+    const std::vector<parser::ast::SelectItem>& select_list,
+    const std::vector<parser::ast::Expr>& group_by,
+    const std::optional<parser::ast::Expr>& having,
+    const Endpoint& input_endpoint,
+    const analyzer::Scope& scope,
+    GraphBuilder& builder) {
+  using namespace parser::ast;
+
+  // --- Step 1: Identify key column ---
+  if (group_by.empty()) {
+    throw std::runtime_error("GROUP BY requires at least one column");
+  }
+  if (group_by.size() > 1) {
+    throw std::runtime_error(
+        "composite GROUP BY keys not yet supported (use single column)");
+  }
+
+  auto* key_col = std::get_if<ColumnRef>(&group_by[0]);
+  if (!key_col) {
+    throw std::runtime_error("GROUP BY expression must be a column reference");
+  }
+
+  auto key_result = scope.resolve(*key_col);
+  if (auto* err = std::get_if<std::string>(&key_result)) {
+    throw std::runtime_error(*err);
+  }
+  auto& key_binding = std::get<analyzer::ColumnBinding>(key_result);
+  int key_index = key_binding.index;
+  std::string key_name = key_col->column_name;
+
+  // --- Step 2: Build prototype sub-graph ---
+  GraphBuilder proto_builder;
+  ExprCache cache;
+
+  proto_builder.add_operator("proto_in", "Input");
+  Endpoint proto_input_ep{"proto_in", "o1"};
+
+  // Compile each non-key SELECT item inside the prototype
+  std::vector<Endpoint> proto_endpoints;
+  std::vector<std::string> field_names;
+  field_names.push_back(key_name);  // key at index 0
+
+  for (const auto& item : select_list) {
+    if (is_group_by_key(item, group_by[0], scope)) {
+      continue;
+    }
+
+    auto result = compile_expression_cached(item.expr, proto_input_ep, scope,
+                                            proto_builder, cache);
+    auto ep =
+        ensure_endpoint(std::move(result), proto_input_ep, proto_builder);
+    proto_endpoints.push_back(ep);
+
+    std::string alias = item.alias.value_or(default_alias(item.expr));
+    field_names.push_back(alias);
+  }
+
+  // Compose prototype outputs
+  Endpoint proto_output_ep;
+  if (proto_endpoints.size() == 1) {
+    proto_output_ep = proto_endpoints[0];
+  } else {
+    auto compose_id = proto_builder.next_id("compose");
+    proto_builder.add_operator(
+        compose_id, "VectorCompose",
+        {{"numPorts", static_cast<double>(proto_endpoints.size())}});
+    for (size_t i = 0; i < proto_endpoints.size(); ++i) {
+      proto_builder.connect(proto_endpoints[i],
+                            {compose_id, "i" + std::to_string(i + 1)});
+    }
+    proto_output_ep = {compose_id, "o1"};
+  }
+
+  // --- Step 3: HAVING (if present) ---
+  if (having.has_value()) {
+    auto bool_ep = compile_having_predicate(*having, proto_input_ep, scope,
+                                            proto_builder, cache);
+
+    auto demux_id = proto_builder.next_id("demux");
+    proto_builder.add_operator(demux_id, "Demultiplexer", {{"numPorts", 1}});
+    proto_builder.connect(bool_ep, {demux_id, "c1"});
+    proto_builder.connect(proto_output_ep, {demux_id, "i1"});
+    proto_output_ep = {demux_id, "o1"};
+  }
+
+  // --- Step 4: Add Output to prototype ---
+  proto_builder.add_operator("proto_out", "Output");
+  proto_builder.connect(proto_output_ep, {"proto_out", "i1"});
+
+  // --- Step 5: Wrap as PrototypeDef ---
+  auto proto_id = builder.next_id("proto");
+  PrototypeDef proto_def;
+  proto_def.id = proto_id;
+  proto_def.entry_id = "proto_in";
+  proto_def.output_id = "proto_out";
+  proto_def.operators = proto_builder.operators();
+  proto_def.connections = proto_builder.connections();
+
+  builder.add_prototype(proto_def);
+
+  // --- Step 6: Add KeyedPipeline to outer graph ---
+  auto keyed_id = builder.next_id("keyed");
+  builder.add_operator(keyed_id, "KeyedPipeline",
+                       {{"key_index", static_cast<double>(key_index)}},
+                       {{"prototype", proto_id}});
+  builder.connect(input_endpoint, {keyed_id, "i1"});
+
+  // --- Step 7: Build field map ---
+  FieldMap field_map;
+  for (size_t i = 0; i < field_names.size(); ++i) {
+    field_map[field_names[i]] = static_cast<int>(i);
+  }
+
+  return {{keyed_id, "o1"}, field_map};
+}
+
+}  // namespace rtbot_sql::compiler
