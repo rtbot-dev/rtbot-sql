@@ -23,6 +23,9 @@ enum class StmtType {
 struct BinaryExpr;
 struct ComparisonExpr;
 struct FuncCall;
+struct LogicalExpr;
+struct NotExpr;
+struct BetweenExpr;
 
 struct ColumnRef {
   std::string table_alias;
@@ -43,7 +46,10 @@ using Expr = std::variant<
     ArrayLiteral,
     std::unique_ptr<BinaryExpr>,
     std::unique_ptr<ComparisonExpr>,
-    std::unique_ptr<FuncCall>>;
+    std::unique_ptr<FuncCall>,
+    std::unique_ptr<LogicalExpr>,
+    std::unique_ptr<NotExpr>,
+    std::unique_ptr<BetweenExpr>>;
 
 struct BinaryExpr {
   std::string op;  // +, -, *, /
@@ -60,6 +66,22 @@ struct ComparisonExpr {
 struct FuncCall {
   std::string name;
   std::vector<Expr> args;
+};
+
+struct LogicalExpr {
+  std::string op;  // AND, OR
+  Expr left;
+  Expr right;
+};
+
+struct NotExpr {
+  Expr operand;
+};
+
+struct BetweenExpr {
+  Expr expr;
+  Expr low;
+  Expr high;
 };
 
 struct SelectItem {
