@@ -1,8 +1,24 @@
 cc_library(
     name = "api",
-    hdrs = glob(["include/**/*.h"]),
+    hdrs = glob(["include/rtbot_sql/api/types.h", "include/rtbot_sql/version.h"]),
     strip_include_prefix = "include",
     visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "api_compiler",
+    hdrs = ["include/rtbot_sql/api/compiler.h"],
+    srcs = ["src/compiler.cpp"],
+    strip_include_prefix = "include",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":api",
+        "//libs/analyzer",
+        "//libs/catalog",
+        "//libs/compiler",
+        "//libs/parser",
+        "//libs/planner",
+    ],
 )
 
 cc_test(

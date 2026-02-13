@@ -1,1 +1,20 @@
-# Placeholder
+cc_library(
+    name = "rtbot-sql-cli-lib",
+    srcs = ["src/args.cpp"],
+    hdrs = ["include/args.h"],
+    includes = ["include"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "@cxxopts//:lib",
+    ],
+)
+
+cc_binary(
+    name = "rtbot-sql",
+    srcs = ["src/main.cpp"],
+    deps = [
+        ":rtbot-sql-cli-lib",
+        "//libs/api:api_compiler",
+        "@json-cpp//:lib",
+    ],
+)
