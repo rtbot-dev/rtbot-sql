@@ -5,6 +5,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "rtbot_sql/compiler/expr_cache.h"
 #include "rtbot_sql/compiler/function_compiler.h"
 
 namespace rtbot_sql::compiler {
@@ -156,8 +157,24 @@ Endpoint compile_sync_op(const std::string& op, const Endpoint& left_ep,
 ExprResult compile_expression(const parser::ast::Expr& expr,
                               const Endpoint& input_endpoint,
                               const analyzer::Scope& scope,
-                              GraphBuilder& builder) {
+                              GraphBuilder& builder,
+                              ExprCache* cache) {
   using namespace parser::ast;
+
+  // Cache lookup
+  if (cache) {
+    const Endpoint* cached = cache->lookup(expr);
+    if (cached) return *cached;
+  }
+
+  // Helper to store result in cache if it's an Endpoint
+  auto maybe_cache = [&](const parser::ast::Expr& e, ExprResult& r) {
+    if (cache) {
+      if (auto* ep = std::get_if<Endpoint>(&r)) {
+        cache->store(e, *ep);
+      }
+    }
+  };
 
   // ColumnRef → VectorExtract
   if (auto* col = std::get_if<ColumnRef>(&expr)) {
@@ -170,7 +187,9 @@ ExprResult compile_expression(const parser::ast::Expr& expr,
     builder.add_operator(id, "VectorExtract",
                          {{"index", static_cast<double>(binding.index)}});
     builder.connect(input_endpoint, {id, "i1"});
-    return Endpoint{id, "o1"};
+    ExprResult r = Endpoint{id, "o1"};
+    maybe_cache(expr, r);
+    return r;
   }
 
   // Constant → ConstantMarker (deferred)
@@ -181,8 +200,8 @@ ExprResult compile_expression(const parser::ast::Expr& expr,
   // BinaryExpr → scalar or sync arithmetic
   if (auto* bin_ptr = std::get_if<std::unique_ptr<BinaryExpr>>(&expr)) {
     const auto& bin = **bin_ptr;
-    auto left = compile_expression(bin.left, input_endpoint, scope, builder);
-    auto right = compile_expression(bin.right, input_endpoint, scope, builder);
+    auto left = compile_expression(bin.left, input_endpoint, scope, builder, cache);
+    auto right = compile_expression(bin.right, input_endpoint, scope, builder, cache);
 
     auto* left_const = std::get_if<ConstantMarker>(&left);
     auto* right_const = std::get_if<ConstantMarker>(&right);
@@ -195,20 +214,26 @@ ExprResult compile_expression(const parser::ast::Expr& expr,
 
     // Stream OP constant
     if (right_const) {
-      return compile_scalar_op(bin.op, std::get<Endpoint>(left),
-                               right_const->value, builder);
+      ExprResult r = compile_scalar_op(bin.op, std::get<Endpoint>(left),
+                                       right_const->value, builder);
+      maybe_cache(expr, r);
+      return r;
     }
 
     // Constant OP stream
     if (left_const) {
-      return compile_scalar_op_reversed(bin.op, std::get<Endpoint>(right),
-                                        left_const->value, input_endpoint,
-                                        builder);
+      ExprResult r = compile_scalar_op_reversed(bin.op, std::get<Endpoint>(right),
+                                                left_const->value, input_endpoint,
+                                                builder);
+      maybe_cache(expr, r);
+      return r;
     }
 
     // Both streams
-    return compile_sync_op(bin.op, std::get<Endpoint>(left),
-                           std::get<Endpoint>(right), builder);
+    ExprResult r = compile_sync_op(bin.op, std::get<Endpoint>(left),
+                                   std::get<Endpoint>(right), builder);
+    maybe_cache(expr, r);
+    return r;
   }
 
   // FuncCall → math function operators
@@ -224,9 +249,9 @@ ExprResult compile_expression(const parser::ast::Expr& expr,
         throw std::runtime_error("POWER requires exactly 2 arguments");
       }
       auto base = compile_expression(func.args[0], input_endpoint, scope,
-                                     builder);
+                                     builder, cache);
       auto exp_result = compile_expression(func.args[1], input_endpoint, scope,
-                                           builder);
+                                           builder, cache);
       auto* exp_const = std::get_if<ConstantMarker>(&exp_result);
       if (!exp_const) {
         throw std::runtime_error("POWER exponent must be a constant");
@@ -240,7 +265,9 @@ ExprResult compile_expression(const parser::ast::Expr& expr,
       auto id = builder.next_id("power");
       builder.add_operator(id, "Power", {{"value", exp_const->value}});
       builder.connect(std::get<Endpoint>(base), {id, "i1"});
-      return Endpoint{id, "o1"};
+      ExprResult r = Endpoint{id, "o1"};
+      maybe_cache(expr, r);
+      return r;
     }
 
     // Unary math functions (ABS, FLOOR, CEIL, etc.)
@@ -248,8 +275,10 @@ ExprResult compile_expression(const parser::ast::Expr& expr,
     if (rtbot_type.empty()) {
       // Delegate to aggregate/windowed function compiler
       if (is_aggregate_or_windowed(func.name)) {
-        return compile_function(func.name, func.args, input_endpoint, scope,
-                                builder);
+        ExprResult r = compile_function(func.name, func.args, input_endpoint,
+                                        scope, builder, cache);
+        maybe_cache(expr, r);
+        return r;
       }
       throw std::runtime_error("unknown function: " + func.name);
     }
@@ -257,7 +286,7 @@ ExprResult compile_expression(const parser::ast::Expr& expr,
       throw std::runtime_error(func.name + " requires exactly 1 argument");
     }
 
-    auto arg = compile_expression(func.args[0], input_endpoint, scope, builder);
+    auto arg = compile_expression(func.args[0], input_endpoint, scope, builder, cache);
 
     // Constant argument → fold
     if (auto* arg_const = std::get_if<ConstantMarker>(&arg)) {
@@ -267,7 +296,9 @@ ExprResult compile_expression(const parser::ast::Expr& expr,
     auto id = builder.next_id(rtbot_type);
     builder.add_operator(id, rtbot_type);
     builder.connect(std::get<Endpoint>(arg), {id, "i1"});
-    return Endpoint{id, "o1"};
+    ExprResult r = Endpoint{id, "o1"};
+    maybe_cache(expr, r);
+    return r;
   }
 
   throw std::runtime_error("unsupported expression type");

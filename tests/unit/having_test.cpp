@@ -68,7 +68,7 @@ TEST_F(HavingTest, HavingWithSharedCount) {
   // Count operator should appear exactly ONCE (shared)
   int count_ops = 0;
   for (const auto& op : proto.operators) {
-    if (op.type == "Count") count_ops++;
+    if (op.type == "CountNumber") count_ops++;
   }
   EXPECT_EQ(count_ops, 1);
 

@@ -88,9 +88,9 @@ TEST_F(SelectTest, PureColumnRefsUseVectorProject) {
   ASSERT_EQ(builder.operators().size(), 1u);
   auto& proj = builder.operators()[0];
   EXPECT_EQ(proj.type, "VectorProject");
-  EXPECT_EQ(proj.params.at("numIndices"), 2.0);
-  EXPECT_EQ(proj.params.at("index_0"), 0.0);  // instrument_id
-  EXPECT_EQ(proj.params.at("index_1"), 1.0);  // price
+  ASSERT_EQ(proj.int_array_params.at("indices").size(), 2u);
+  EXPECT_EQ(proj.int_array_params.at("indices")[0], 0);  // instrument_id
+  EXPECT_EQ(proj.int_array_params.at("indices")[1], 1);  // price
   EXPECT_EQ(ep.operator_id, proj.id);
   EXPECT_EQ(ep.port, "o1");
 
@@ -151,7 +151,7 @@ TEST_F(SelectTest, AggregateFunctionsWithVectorCompose) {
   bool has_cumsum = false, has_count = false, has_compose = false;
   for (const auto& op : builder.operators()) {
     if (op.type == "CumulativeSum") has_cumsum = true;
-    if (op.type == "Count") has_count = true;
+    if (op.type == "CountNumber") has_count = true;
     if (op.type == "VectorCompose") has_compose = true;
   }
   EXPECT_TRUE(has_cumsum);

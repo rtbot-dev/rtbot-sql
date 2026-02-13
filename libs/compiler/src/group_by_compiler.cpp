@@ -62,22 +62,13 @@ Endpoint ensure_endpoint(ExprResult result, const Endpoint& input_endpoint,
   return {id, "o1"};
 }
 
-// Cache-aware expression compilation.
+// Cache-aware expression compilation (delegates to compile_expression with cache).
 ExprResult compile_expression_cached(const parser::ast::Expr& expr,
                                      const Endpoint& input_endpoint,
                                      const analyzer::Scope& scope,
                                      GraphBuilder& builder,
                                      ExprCache& cache) {
-  const Endpoint* cached = cache.lookup(expr);
-  if (cached) return *cached;
-
-  auto result = compile_expression(expr, input_endpoint, scope, builder);
-
-  if (auto* ep = std::get_if<Endpoint>(&result)) {
-    cache.store(expr, *ep);
-  }
-
-  return result;
+  return compile_expression(expr, input_endpoint, scope, builder, &cache);
 }
 
 // Map comparison op to RTBot operator type.

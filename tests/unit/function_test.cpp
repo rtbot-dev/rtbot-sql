@@ -77,14 +77,14 @@ TEST_F(FunctionTest, SumProducesCumulativeSum) {
   expect_conn(builder, ext.id, "o1", sum.id, "i1");
 }
 
-// COUNT(*) → Count
+// COUNT(*) → CountNumber
 TEST_F(FunctionTest, CountProducesCount) {
   std::vector<Expr> args;  // empty — COUNT(*)
   auto ep = compile_function("COUNT", args, input, scope, builder);
 
   ASSERT_EQ(builder.operators().size(), 1u);
   auto& cnt = builder.operators()[0];
-  EXPECT_EQ(cnt.type, "Count");
+  EXPECT_EQ(cnt.type, "CountNumber");
   EXPECT_EQ(ep.operator_id, cnt.id);
   EXPECT_EQ(ep.port, "o1");
 
@@ -106,7 +106,7 @@ TEST_F(FunctionTest, AvgProducesDiamondGraph) {
   EXPECT_EQ(ext.type, "VectorExtract");
   EXPECT_EQ(ext.params.at("index"), 1.0);
   EXPECT_EQ(sum.type, "CumulativeSum");
-  EXPECT_EQ(cnt.type, "Count");
+  EXPECT_EQ(cnt.type, "CountNumber");
   EXPECT_EQ(div.type, "Division");
   EXPECT_EQ(div.params.at("numPorts"), 2.0);
   EXPECT_EQ(ep.operator_id, div.id);
@@ -132,7 +132,7 @@ TEST_F(FunctionTest, MovingAverageProducesMovingAverage) {
   EXPECT_EQ(ext.type, "VectorExtract");
   EXPECT_EQ(ext.params.at("index"), 1.0);
   EXPECT_EQ(ma.type, "MovingAverage");
-  EXPECT_EQ(ma.params.at("window"), 20.0);
+  EXPECT_EQ(ma.params.at("window_size"), 20.0);
   EXPECT_EQ(ep.operator_id, ma.id);
 
   ASSERT_EQ(builder.connections().size(), 2u);
@@ -172,7 +172,7 @@ TEST_F(FunctionTest, StddevProducesStandardDeviation) {
   auto& sd = builder.operators()[1];
   EXPECT_EQ(ext.type, "VectorExtract");
   EXPECT_EQ(sd.type, "StandardDeviation");
-  EXPECT_EQ(sd.params.at("window"), 20.0);
+  EXPECT_EQ(sd.params.at("window_size"), 20.0);
   EXPECT_EQ(ep.operator_id, sd.id);
 
   ASSERT_EQ(builder.connections().size(), 2u);

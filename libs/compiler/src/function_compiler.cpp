@@ -4,6 +4,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "rtbot_sql/compiler/expr_cache.h"
 #include "rtbot_sql/compiler/expression_compiler.h"
 
 namespace rtbot_sql::compiler {
@@ -47,6 +48,7 @@ bool is_aggregate_or_windowed(const std::string& name) {
   return upper == "SUM" || upper == "COUNT" || upper == "AVG" ||
          upper == "MOVING_AVERAGE" || upper == "MOVING_SUM" ||
          upper == "MOVING_COUNT" || upper == "MOVING_STD" ||
+         upper == "STDDEV" ||
          upper == "FIR" || upper == "IIR" ||
          upper == "RESAMPLE" || upper == "PEAK_DETECT";
 }
@@ -55,7 +57,8 @@ Endpoint compile_function(const std::string& name,
                           const std::vector<parser::ast::Expr>& args,
                           const Endpoint& input_endpoint,
                           const analyzer::Scope& scope,
-                          GraphBuilder& builder) {
+                          GraphBuilder& builder,
+                          ExprCache* cache) {
   std::string upper = name;
   std::transform(upper.begin(), upper.end(), upper.begin(), ::toupper);
 
@@ -66,7 +69,7 @@ Endpoint compile_function(const std::string& name,
       throw std::runtime_error("SUM requires exactly 1 argument");
     }
     auto expr_ep = ensure_endpoint(
-        compile_expression(args[0], input_endpoint, scope, builder),
+        compile_expression(args[0], input_endpoint, scope, builder, cache),
         input_endpoint, builder);
     auto sum_id = builder.next_id("cumsum");
     builder.add_operator(sum_id, "CumulativeSum");
@@ -80,7 +83,7 @@ Endpoint compile_function(const std::string& name,
           "COUNT(*) takes no arguments (use COUNT(*), not COUNT(expr))");
     }
     auto cnt_id = builder.next_id("count");
-    builder.add_operator(cnt_id, "Count");
+    builder.add_operator(cnt_id, "CountNumber");
     builder.connect(input_endpoint, {cnt_id, "i1"});
     return {cnt_id, "o1"};
   }
@@ -90,14 +93,14 @@ Endpoint compile_function(const std::string& name,
       throw std::runtime_error("AVG requires exactly 1 argument");
     }
     auto expr_ep = ensure_endpoint(
-        compile_expression(args[0], input_endpoint, scope, builder),
+        compile_expression(args[0], input_endpoint, scope, builder, cache),
         input_endpoint, builder);
     auto sum_id = builder.next_id("cumsum");
     builder.add_operator(sum_id, "CumulativeSum");
     builder.connect(expr_ep, {sum_id, "i1"});
 
     auto cnt_id = builder.next_id("count");
-    builder.add_operator(cnt_id, "Count");
+    builder.add_operator(cnt_id, "CountNumber");
     builder.connect(input_endpoint, {cnt_id, "i1"});
 
     auto div_id = builder.next_id("div");
@@ -116,11 +119,11 @@ Endpoint compile_function(const std::string& name,
     }
     int window = require_constant_int("MOVING_AVERAGE", args[1], "window_size");
     auto expr_ep = ensure_endpoint(
-        compile_expression(args[0], input_endpoint, scope, builder),
+        compile_expression(args[0], input_endpoint, scope, builder, cache),
         input_endpoint, builder);
     auto ma_id = builder.next_id("mavg");
     builder.add_operator(ma_id, "MovingAverage",
-                         {{"window", static_cast<double>(window)}});
+                         {{"window_size", static_cast<double>(window)}});
     builder.connect(expr_ep, {ma_id, "i1"});
     return {ma_id, "o1"};
   }
@@ -132,7 +135,7 @@ Endpoint compile_function(const std::string& name,
     }
     int window = require_constant_int("MOVING_SUM", args[1], "window_size");
     auto expr_ep = ensure_endpoint(
-        compile_expression(args[0], input_endpoint, scope, builder),
+        compile_expression(args[0], input_endpoint, scope, builder, cache),
         input_endpoint, builder);
     auto ms_id = builder.next_id("msum");
     builder.add_operator(ms_id, "MovingSum",
@@ -166,11 +169,28 @@ Endpoint compile_function(const std::string& name,
     }
     int window = require_constant_int("MOVING_STD", args[1], "window_size");
     auto expr_ep = ensure_endpoint(
-        compile_expression(args[0], input_endpoint, scope, builder),
+        compile_expression(args[0], input_endpoint, scope, builder, cache),
         input_endpoint, builder);
     auto sd_id = builder.next_id("stddev");
     builder.add_operator(sd_id, "StandardDeviation",
-                         {{"window", static_cast<double>(window)}});
+                         {{"window_size", static_cast<double>(window)}});
+    builder.connect(expr_ep, {sd_id, "i1"});
+    return {sd_id, "o1"};
+  }
+
+  // STDDEV is an alias for MOVING_STD
+  if (upper == "STDDEV") {
+    if (args.size() != 2) {
+      throw std::runtime_error(
+          "STDDEV requires 2 arguments: (expr, window_size)");
+    }
+    int window = require_constant_int("STDDEV", args[1], "window_size");
+    auto expr_ep = ensure_endpoint(
+        compile_expression(args[0], input_endpoint, scope, builder, cache),
+        input_endpoint, builder);
+    auto sd_id = builder.next_id("stddev");
+    builder.add_operator(sd_id, "StandardDeviation",
+                         {{"window_size", static_cast<double>(window)}});
     builder.connect(expr_ep, {sd_id, "i1"});
     return {sd_id, "o1"};
   }
@@ -187,15 +207,12 @@ Endpoint compile_function(const std::string& name,
       throw std::runtime_error("FIR: second argument must be an array literal");
     }
     auto expr_ep = ensure_endpoint(
-        compile_expression(args[0], input_endpoint, scope, builder),
+        compile_expression(args[0], input_endpoint, scope, builder, cache),
         input_endpoint, builder);
     auto fir_id = builder.next_id("fir");
-    std::map<std::string, double> params;
-    params["numCoeffs"] = static_cast<double>(arr->values.size());
-    for (size_t i = 0; i < arr->values.size(); ++i) {
-      params["coeff_" + std::to_string(i)] = arr->values[i];
-    }
-    builder.add_operator(fir_id, "FiniteImpulseResponse", params);
+    std::vector<double> coeffs(arr->values.begin(), arr->values.end());
+    builder.add_operator(fir_id, "FiniteImpulseResponse", {}, {},
+                         {{"coeff", coeffs}});
     builder.connect(expr_ep, {fir_id, "i1"});
     return {fir_id, "o1"};
   }
@@ -212,19 +229,13 @@ Endpoint compile_function(const std::string& name,
           "IIR: second and third arguments must be array literals");
     }
     auto expr_ep = ensure_endpoint(
-        compile_expression(args[0], input_endpoint, scope, builder),
+        compile_expression(args[0], input_endpoint, scope, builder, cache),
         input_endpoint, builder);
     auto iir_id = builder.next_id("iir");
-    std::map<std::string, double> params;
-    params["numA"] = static_cast<double>(a_arr->values.size());
-    params["numB"] = static_cast<double>(b_arr->values.size());
-    for (size_t i = 0; i < a_arr->values.size(); ++i) {
-      params["a_" + std::to_string(i)] = a_arr->values[i];
-    }
-    for (size_t i = 0; i < b_arr->values.size(); ++i) {
-      params["b_" + std::to_string(i)] = b_arr->values[i];
-    }
-    builder.add_operator(iir_id, "InfiniteImpulseResponse", params);
+    std::vector<double> a_coeffs(a_arr->values.begin(), a_arr->values.end());
+    std::vector<double> b_coeffs(b_arr->values.begin(), b_arr->values.end());
+    builder.add_operator(iir_id, "InfiniteImpulseResponse", {}, {},
+                         {{"a_coeffs", a_coeffs}, {"b_coeffs", b_coeffs}});
     builder.connect(expr_ep, {iir_id, "i1"});
     return {iir_id, "o1"};
   }
@@ -236,7 +247,7 @@ Endpoint compile_function(const std::string& name,
     }
     int interval = require_constant_int("RESAMPLE", args[1], "interval");
     auto expr_ep = ensure_endpoint(
-        compile_expression(args[0], input_endpoint, scope, builder),
+        compile_expression(args[0], input_endpoint, scope, builder, cache),
         input_endpoint, builder);
     auto rs_id = builder.next_id("resample");
     builder.add_operator(rs_id, "ResamplerConstant",
@@ -252,11 +263,11 @@ Endpoint compile_function(const std::string& name,
     }
     int window = require_constant_int("PEAK_DETECT", args[1], "window_size");
     auto expr_ep = ensure_endpoint(
-        compile_expression(args[0], input_endpoint, scope, builder),
+        compile_expression(args[0], input_endpoint, scope, builder, cache),
         input_endpoint, builder);
     auto pd_id = builder.next_id("peakdet");
     builder.add_operator(pd_id, "PeakDetector",
-                         {{"window", static_cast<double>(window)}});
+                         {{"window_size", static_cast<double>(window)}});
     builder.connect(expr_ep, {pd_id, "i1"});
     return {pd_id, "o1"};
   }

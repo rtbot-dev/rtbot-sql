@@ -16,12 +16,16 @@ struct ConstantMarker {
 
 using ExprResult = std::variant<Endpoint, ConstantMarker>;
 
+class ExprCache;  // forward declaration
+
 // Compile an expression AST node into operator graph nodes.
 // Returns either an Endpoint (stream output) or a ConstantMarker (deferred).
+// When cache is non-null, sub-expression de-duplication is enabled.
 // Throws std::runtime_error on compilation errors.
 ExprResult compile_expression(const parser::ast::Expr& expr,
                               const Endpoint& input_endpoint,
                               const analyzer::Scope& scope,
-                              GraphBuilder& builder);
+                              GraphBuilder& builder,
+                              ExprCache* cache = nullptr);
 
 }  // namespace rtbot_sql::compiler
