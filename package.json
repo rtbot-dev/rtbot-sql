@@ -1,0 +1,16 @@
+{
+  "name": "@rtbot-dev/rtbot-sql",
+  "version": "0.1.0",
+  "private": true,
+  "devDependencies": {
+    "@types/jest": "^29.5.14",
+    "jest": "^29.7.0",
+    "jest-cli": "^29.7.0",
+    "jest-junit": "^16.0.0",
+    "ts-jest": "^29.1.1",
+    "typescript": "5.3.3"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": []
+  }
+}

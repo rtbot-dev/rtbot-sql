@@ -43,6 +43,65 @@ http_archive(
     url = "https://github.com/jarro2783/cxxopts/archive/refs/tags/v3.1.1.zip",
 )
 
+# --- Emscripten SDK (WASM compilation) ---
+
+emsdk_version = "4.0.15"
+
+bazel_dep(name = "emsdk", version = emsdk_version)
+git_override(
+    module_name = "emsdk",
+    remote = "https://github.com/emscripten-core/emsdk.git",
+    strip_prefix = "bazel",
+    tag = emsdk_version,
+)
+
+emscripten_deps = use_extension("@emsdk//:emscripten_deps.bzl", "emscripten_deps")
+use_repo(
+    emscripten_deps,
+    "emscripten_bin_linux",
+    "emscripten_bin_linux_arm64",
+    "emscripten_bin_mac",
+    "emscripten_bin_mac_arm64",
+    "emscripten_bin_win",
+)
+
+emscripten_cache = use_extension("@emsdk//:emscripten_cache.bzl", "emscripten_cache")
+use_repo(emscripten_cache, "emscripten_cache")
+
+register_toolchains(
+    "@emsdk//emscripten_toolchain:cc-toolchain-wasm-emscripten_linux",
+    "@emsdk//emscripten_toolchain:cc-toolchain-wasm-emscripten_linux_arm64",
+    "@emsdk//emscripten_toolchain:cc-toolchain-wasm-emscripten_mac",
+    "@emsdk//emscripten_toolchain:cc-toolchain-wasm-emscripten_mac_arm64",
+    "@emsdk//emscripten_toolchain:cc-toolchain-wasm-emscripten_win",
+)
+
+# --- JS/TS toolchain ---
+
+bazel_dep(name = "aspect_rules_js", version = "2.1.0")
+bazel_dep(name = "aspect_rules_ts", version = "3.1.0")
+bazel_dep(name = "aspect_rules_jest", version = "0.22.0")
+bazel_dep(name = "aspect_rules_swc", version = "2.0.1")
+bazel_dep(name = "aspect_bazel_lib", version = "2.21.1")
+
+rules_ts_ext = use_extension("@aspect_rules_ts//ts:extensions.bzl", "ext")
+rules_ts_ext.deps(
+    name = "rtbot_sql_npm_typescript",
+    ts_version_from = "//:package.json",
+)
+use_repo(
+    rules_ts_ext,
+    npm_typescript = "rtbot_sql_npm_typescript",
+)
+
+npm = use_extension("@aspect_rules_js//npm:extensions.bzl", "npm")
+npm.npm_translate_lock(
+    name = "rtbot_sql_npm",
+    pnpm_lock = "//:pnpm-lock.yaml",
+    verify_node_modules_ignored = "//:.bazelignore",
+)
+use_repo(npm, "rtbot_sql_npm")
+
 # --- rtbot dependency ---
 # Will be added once rtbot has a MODULE.bazel or via a module extension
 # (similar to platform's rtbot_ext.bzl). For now the compiler library

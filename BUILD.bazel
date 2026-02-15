@@ -1,1 +1,12 @@
 # Root BUILD file for rtbot-sql
+
+load("@rtbot_sql_npm//:defs.bzl", "npm_link_all_packages")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "package.json",
+    "pnpm-lock.yaml",
+])
+
+npm_link_all_packages(name = "node_modules")
