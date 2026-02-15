@@ -1,0 +1,8 @@
+{
+  "name": "@rtbot-dev/sql",
+  "version": "0.1.0",
+  "private": true,
+  "main": "index.js",
+  "module": "index.js",
+  "types": "index.d.ts"
+}
