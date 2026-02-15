@@ -1,0 +1,33 @@
+load("@aspect_rules_ts//ts:defs.bzl", "ts_config", "ts_project")
+load("@aspect_rules_jest//jest:defs.bzl", "jest_test")
+
+ts_config(
+    name = "tsconfig",
+    src = "tsconfig.bazel.json",
+)
+
+ts_project(
+    name = "ts_test",
+    srcs = glob(["**/*.ts"]),
+    composite = True,
+    declaration = True,
+    tsconfig = ":tsconfig",
+    deps = [
+        "//runtimes/browser:ts",
+        "//:node_modules/@types/jest",
+    ],
+)
+
+jest_test(
+    name = "test",
+    config = "jest.config.js",
+    data = [
+        ":ts_test",
+        "//runtimes/browser:ts",
+        "//runtimes/browser:rtbot-sql-wasm",
+        "//:node_modules/@types/jest",
+        "//:node_modules/jest",
+        "//:node_modules/ts-jest",
+    ],
+    node_modules = "//:node_modules",
+)
