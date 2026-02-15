@@ -67,7 +67,8 @@ TEST_F(GroupByTest, BasicGroupByWithSum) {
   EXPECT_EQ(proto.output_id, "proto_out");
 
   // Prototype contains: Input, VectorExtract, CumulativeSum, Output
-  // No VectorCompose (single non-key output)
+  // VectorCompose is always present (even for single non-key output,
+  // because proto_out expects vector_number port type)
   bool has_input = false, has_ext = false, has_cumsum = false,
        has_output = false;
   bool has_compose = false;
@@ -79,13 +80,16 @@ TEST_F(GroupByTest, BasicGroupByWithSum) {
     }
     if (op.type == "CumulativeSum") has_cumsum = true;
     if (op.type == "Output") has_output = true;
-    if (op.type == "VectorCompose") has_compose = true;
+    if (op.type == "VectorCompose") {
+      has_compose = true;
+      EXPECT_EQ(op.params.at("numPorts"), 1.0);
+    }
   }
   EXPECT_TRUE(has_input);
   EXPECT_TRUE(has_ext);
   EXPECT_TRUE(has_cumsum);
   EXPECT_TRUE(has_output);
-  EXPECT_FALSE(has_compose);  // single output, no compose
+  EXPECT_TRUE(has_compose);  // always compose, even for single output
 
   // Field map
   EXPECT_EQ(field_map.at("instrument_id"), 0);

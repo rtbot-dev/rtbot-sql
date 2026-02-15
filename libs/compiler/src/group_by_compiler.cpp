@@ -230,21 +230,17 @@ SelectResult compile_group_by(
     field_names.push_back(alias);
   }
 
-  // Compose prototype outputs
-  Endpoint proto_output_ep;
-  if (proto_endpoints.size() == 1) {
-    proto_output_ep = proto_endpoints[0];
-  } else {
-    auto compose_id = proto_builder.next_id("compose");
-    proto_builder.add_operator(
-        compose_id, "VectorCompose",
-        {{"numPorts", static_cast<double>(proto_endpoints.size())}});
-    for (size_t i = 0; i < proto_endpoints.size(); ++i) {
-      proto_builder.connect(proto_endpoints[i],
-                            {compose_id, "i" + std::to_string(i + 1)});
-    }
-    proto_output_ep = {compose_id, "o1"};
+  // Compose prototype outputs into a vector (even for a single item,
+  // because proto_out expects vector_number port type)
+  auto compose_id = proto_builder.next_id("compose");
+  proto_builder.add_operator(
+      compose_id, "VectorCompose",
+      {{"numPorts", static_cast<double>(proto_endpoints.size())}});
+  for (size_t i = 0; i < proto_endpoints.size(); ++i) {
+    proto_builder.connect(proto_endpoints[i],
+                          {compose_id, "i" + std::to_string(i + 1)});
   }
+  Endpoint proto_output_ep = {compose_id, "o1"};
 
   // --- Step 3: HAVING (if present) ---
   if (having.has_value()) {
