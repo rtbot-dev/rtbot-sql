@@ -15,10 +15,13 @@ BASE_LINKOPTS = [
     "-sNO_DISABLE_EXCEPTION_CATCHING",
 ]
 
+# Excluded from //... builds — requires emscripten toolchain;
+# only built transitively via :rtbot-sql-wasm (wasm_cc_binary).
 cc_binary(
     name = "bindings-cpp-wasm",
     srcs = ["bindings.cpp"],
     linkopts = BASE_LINKOPTS,
+    tags = ["manual"],
     deps = [
         "//libs/api:api_compiler",
         "//libs/parser",
