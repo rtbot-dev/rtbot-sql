@@ -1,1 +1,89 @@
-# Placeholder
+load("@emsdk//emscripten_toolchain:wasm_rules.bzl", "wasm_cc_binary")
+load("@aspect_rules_js//npm:defs.bzl", "npm_package")
+load("@aspect_rules_ts//ts:defs.bzl", "ts_config", "ts_project")
+
+package(default_visibility = ["//visibility:public"])
+
+# --- WASM build ---
+
+BASE_LINKOPTS = [
+    "-O3",
+    "-lembind",
+    "-sMODULARIZE",
+    "-sALLOW_MEMORY_GROWTH",
+    "-sWASM_BIGINT",
+    "-sNO_DISABLE_EXCEPTION_CATCHING",
+]
+
+cc_binary(
+    name = "bindings-cpp-wasm",
+    srcs = ["bindings.cpp"],
+    linkopts = BASE_LINKOPTS,
+    deps = [
+        "//libs/api:api_compiler",
+        "//libs/parser",
+        "@json-cpp//:lib",
+    ],
+)
+
+wasm_cc_binary(
+    name = "rtbot-sql-wasm",
+    cc_target = ":bindings-cpp-wasm",
+)
+
+# --- TypeScript declarations for the WASM module ---
+
+genrule(
+    name = "wasm_declarations",
+    outs = ["src/rtbot_sql_wasm.d.ts"],
+    cmd = """
+    cat > $@ <<'DECL'
+export interface RtBotSqlWasmModule {
+  compileSqlJson(sql: string, catalogJson: string): string;
+  validateSql(sql: string): string;
+}
+declare function factory(): Promise<RtBotSqlWasmModule>;
+export default factory;
+DECL
+    """,
+)
+
+# --- TypeScript config ---
+
+ts_config(
+    name = "tsconfig",
+    src = "tsconfig.bazel.json",
+)
+
+# --- TypeScript library ---
+
+ts_project(
+    name = "ts",
+    srcs = glob(
+        ["src/**/*.ts"],
+        exclude = ["**/*.test.ts"],
+    ) + [":wasm_declarations"],
+    composite = True,
+    declaration = True,
+    root_dir = "src",
+    tsconfig = ":tsconfig",
+    deps = [
+        "//:node_modules/@types/jest",
+    ],
+)
+
+# --- npm package ---
+
+npm_package(
+    name = "js",
+    srcs = [
+        ":ts",
+        ":rtbot-sql-wasm",
+        "package.json",
+    ],
+    include_external_repositories = ["**"],
+    package = "@rtbot-dev/sql",
+    replace_prefixes = {
+        "rtbot-sql-wasm": "wasm",
+    },
+)
