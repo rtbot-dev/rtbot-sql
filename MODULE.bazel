@@ -103,9 +103,5 @@ npm.npm_translate_lock(
 use_repo(npm, "rtbot_sql_npm")
 
 # --- rtbot dependency ---
-# Will be added once rtbot has a MODULE.bazel or via a module extension
-# (similar to platform's rtbot_ext.bzl). For now the compiler library
-# has no rtbot dependency — operator JSON is plain strings.
-#
-# bazel_dep(name = "rtbot", version = "...")
-# local_path_override(module_name = "rtbot", path = "../rtbot")
+bazel_dep(name = "rtbot", version = "0.0.0")
+local_path_override(module_name = "rtbot", path = "../rtbot")
