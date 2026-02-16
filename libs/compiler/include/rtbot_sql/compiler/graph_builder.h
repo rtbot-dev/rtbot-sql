@@ -53,6 +53,10 @@ class GraphBuilder {
 
   std::string to_json() const;
 
+  // Validate the graph structure and return a list of error strings.
+  // Returns empty vector if the graph is valid.
+  std::vector<std::string> validate() const;
+
   // Accessors for testing
   const std::vector<OperatorDef>& operators() const { return operators_; }
   const std::vector<Connection>& connections() const { return connections_; }

@@ -118,6 +118,16 @@ CompilationResult compile_select_to_program(
   builder.add_operator("output_0", "Output");
   builder.connect(current, {"output_0", "i1"});
 
+  // Validate the generated graph before serializing
+  auto validation_errors = builder.validate();
+  if (!validation_errors.empty()) {
+    CompilationResult err_result{};
+    for (const auto& msg : validation_errors) {
+      err_result.errors.push_back({"graph validation: " + msg, -1, -1});
+    }
+    return err_result;
+  }
+
   result.program_json = builder.to_json();
   result.field_map = field_map;
   result.source_streams = {stmt.from_table};
