@@ -1,5 +1,5 @@
 load("@rules_cc//cc:defs.bzl", "cc_binary")
-load("@rules_python//python:defs.bzl", "py_library")
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -40,4 +40,11 @@ py_library(
     srcs = glob(["rtbot_sql/**/*.py"]),
     data = [":native_module_in_package"],
     imports = ["."],
+)
+
+py_test(
+    name = "runtime_test",
+    srcs = ["test/rtbot_sql_test.py"],
+    main = "test/rtbot_sql_test.py",
+    deps = [":rtbot_sql"],
 )
