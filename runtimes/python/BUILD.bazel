@@ -1,1 +1,43 @@
-# Placeholder
+load("@rules_cc//cc:defs.bzl", "cc_binary")
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+cc_binary(
+    name = "_rtbot_sql_native.so",
+    srcs = ["sql_bindings.cpp"],
+    copts = select({
+        "@pybind11//:msvc_compiler": [],
+        "//conditions:default": [
+            "-fexceptions",
+            "-fvisibility=hidden",
+        ],
+    }),
+    linkopts = select({
+        "@pybind11//:msvc_compiler": [],
+        "@pybind11//:osx": [],
+        "//conditions:default": ["-Wl,-Bsymbolic"],
+    }),
+    linkshared = 1,
+    deps = [
+        "//libs/api:api_compiler",
+        "@rtbot//libs/api:rtbot-api",
+        "@pybind11",
+        "@python_3_11//:python_headers",
+        "@python_3_11//:libpython",
+    ],
+)
+
+genrule(
+    name = "native_module_in_package",
+    srcs = [":_rtbot_sql_native.so"],
+    outs = ["rtbot_sql/_rtbot_sql_native.so"],
+    cmd = "cp $(location :_rtbot_sql_native.so) $@",
+)
+
+py_library(
+    name = "rtbot_sql",
+    srcs = glob(["rtbot_sql/**/*.py"]),
+    data = [":native_module_in_package"],
+    imports = ["."],
+)
