@@ -1,6 +1,9 @@
 # Output to dist/ instead of bazel-bin/, bazel-out/, etc.
 build --symlink_prefix=dist/
 
+# Workspace status: derive version metadata from git tags/commit
+build --workspace_status_command=./tools/workspace_status.sh
+
 # C++17
 build --cxxopt=-std=c++17
 build --host_cxxopt=-std=c++17

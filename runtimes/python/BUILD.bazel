@@ -1,7 +1,48 @@
 load("@rules_cc//cc:defs.bzl", "cc_binary")
 load("@rules_python//python:defs.bzl", "py_library", "py_test")
+load("@rules_python//python:packaging.bzl", "py_package", "py_wheel")
 
 package(default_visibility = ["//visibility:public"])
+
+config_setting(
+    name = "macos_arm64",
+    constraint_values = [
+        "@platforms//os:macos",
+        "@platforms//cpu:arm64",
+    ],
+)
+
+config_setting(
+    name = "macos_x86_64",
+    constraint_values = [
+        "@platforms//os:macos",
+        "@platforms//cpu:x86_64",
+    ],
+)
+
+config_setting(
+    name = "linux_arm64",
+    constraint_values = [
+        "@platforms//os:linux",
+        "@platforms//cpu:arm64",
+    ],
+)
+
+config_setting(
+    name = "linux_x86_64",
+    constraint_values = [
+        "@platforms//os:linux",
+        "@platforms//cpu:x86_64",
+    ],
+)
+
+config_setting(
+    name = "windows_x86_64",
+    constraint_values = [
+        "@platforms//os:windows",
+        "@platforms//cpu:x86_64",
+    ],
+)
 
 cc_binary(
     name = "_rtbot_sql_native.so",
@@ -40,6 +81,37 @@ py_library(
     srcs = glob(["rtbot_sql/**/*.py"]),
     data = [":native_module_in_package"],
     imports = ["."],
+)
+
+py_package(
+    name = "rtbot_sql_pkg",
+    deps = [":rtbot_sql"],
+)
+
+py_wheel(
+    name = "rtbot_sql_wheel",
+    abi = "cp311",
+    distribution = "rtbot-sql",
+    platform = select({
+        ":macos_arm64": "macosx_11_0_arm64",
+        ":macos_x86_64": "macosx_10_14_x86_64",
+        ":linux_arm64": "manylinux2014_aarch64",
+        ":linux_x86_64": "manylinux2014_x86_64",
+        ":windows_x86_64": "win_amd64",
+        "//conditions:default": "any",
+    }),
+    python_tag = "cp311",
+    strip_path_prefixes = ["runtimes/python"],
+    version = "{STABLE_RTBOT_SQL_VERSION}",
+    stamp = 1,
+    deps = [":rtbot_sql_pkg"],
+)
+
+genrule(
+    name = "rtbot_sql_whl",
+    srcs = [":rtbot_sql_wheel.dist"],
+    outs = ["rtbot_sql.whl"],
+    cmd = "cp $(location :rtbot_sql_wheel.dist)/*.whl $@",
 )
 
 py_test(
