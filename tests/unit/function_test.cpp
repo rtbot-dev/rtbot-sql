@@ -77,19 +77,23 @@ TEST_F(FunctionTest, SumProducesCumulativeSum) {
   expect_conn(builder, ext.id, "o1", sum.id, "i1");
 }
 
-// COUNT(*) → CountNumber
+// COUNT(*) → VectorExtract(0) [clock] + CountNumber
 TEST_F(FunctionTest, CountProducesCount) {
   std::vector<Expr> args;  // empty — COUNT(*)
   auto ep = compile_function("COUNT", args, input, scope, builder);
 
-  ASSERT_EQ(builder.operators().size(), 1u);
-  auto& cnt = builder.operators()[0];
+  ASSERT_EQ(builder.operators().size(), 2u);
+  auto& clock = builder.operators()[0];
+  auto& cnt = builder.operators()[1];
+  EXPECT_EQ(clock.type, "VectorExtract");
+  EXPECT_EQ(clock.params.at("index"), 0.0);
   EXPECT_EQ(cnt.type, "CountNumber");
   EXPECT_EQ(ep.operator_id, cnt.id);
   EXPECT_EQ(ep.port, "o1");
 
-  ASSERT_EQ(builder.connections().size(), 1u);
-  expect_conn(builder, "input_0", "o1", cnt.id, "i1");
+  ASSERT_EQ(builder.connections().size(), 2u);
+  expect_conn(builder, "input_0", "o1", clock.id, "i1");
+  expect_conn(builder, clock.id, "o1", cnt.id, "i1");
 }
 
 // AVG(price) → VectorExtract + CumulativeSum + Count + Division
@@ -114,7 +118,7 @@ TEST_F(FunctionTest, AvgProducesDiamondGraph) {
   ASSERT_EQ(builder.connections().size(), 5u);
   expect_conn(builder, "input_0", "o1", ext.id, "i1");
   expect_conn(builder, ext.id, "o1", sum.id, "i1");
-  expect_conn(builder, "input_0", "o1", cnt.id, "i1");
+  expect_conn(builder, ext.id, "o1", cnt.id, "i1");
   expect_conn(builder, sum.id, "o1", div.id, "i1");
   expect_conn(builder, cnt.id, "o1", div.id, "i2");
 }
@@ -140,23 +144,27 @@ TEST_F(FunctionTest, MovingAverageProducesMovingAverage) {
   expect_conn(builder, ext.id, "o1", ma.id, "i1");
 }
 
-// MOVING_COUNT(50) → ConstantNumber(1) + MovingSum(50)
+// MOVING_COUNT(50) → VectorExtract(0) [clock] + ConstantNumber(1) + MovingSum(50)
 TEST_F(FunctionTest, MovingCountProducesConstantAndMovingSum) {
   std::vector<Expr> args;
   args.push_back(num(50));
   auto ep = compile_function("MOVING_COUNT", args, input, scope, builder);
 
-  ASSERT_EQ(builder.operators().size(), 2u);
-  auto& cnst = builder.operators()[0];
-  auto& msum = builder.operators()[1];
+  ASSERT_EQ(builder.operators().size(), 3u);
+  auto& clock = builder.operators()[0];
+  auto& cnst = builder.operators()[1];
+  auto& msum = builder.operators()[2];
+  EXPECT_EQ(clock.type, "VectorExtract");
+  EXPECT_EQ(clock.params.at("index"), 0.0);
   EXPECT_EQ(cnst.type, "ConstantNumber");
   EXPECT_EQ(cnst.params.at("value"), 1.0);
   EXPECT_EQ(msum.type, "MovingSum");
-  EXPECT_EQ(msum.params.at("window"), 50.0);
+  EXPECT_EQ(msum.params.at("window_size"), 50.0);
   EXPECT_EQ(ep.operator_id, msum.id);
 
-  ASSERT_EQ(builder.connections().size(), 2u);
-  expect_conn(builder, "input_0", "o1", cnst.id, "i1");
+  ASSERT_EQ(builder.connections().size(), 3u);
+  expect_conn(builder, "input_0", "o1", clock.id, "i1");
+  expect_conn(builder, clock.id, "o1", cnst.id, "i1");
   expect_conn(builder, cnst.id, "o1", msum.id, "i1");
 }
 
@@ -242,7 +250,7 @@ TEST_F(FunctionTest, MovingSumProducesMovingSum) {
   auto& ms = builder.operators()[1];
   EXPECT_EQ(ext.type, "VectorExtract");
   EXPECT_EQ(ms.type, "MovingSum");
-  EXPECT_EQ(ms.params.at("window"), 10.0);
+  EXPECT_EQ(ms.params.at("window_size"), 10.0);
   EXPECT_EQ(ep.operator_id, ms.id);
 }
 

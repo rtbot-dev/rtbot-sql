@@ -11,16 +11,29 @@ namespace rtbot_sql::compiler {
 
 namespace {
 
+// Convert a VectorNumber endpoint into a Number endpoint by extracting
+// index 0. Used as a "clock" signal for operators that need NumberData
+// but only have access to the raw VectorNumber input stream.
+Endpoint scalar_clock(const Endpoint& vec_input, GraphBuilder& builder) {
+  auto id = builder.next_id("clock");
+  builder.add_operator(id, "VectorExtract", {{"index", 0.0}});
+  builder.connect(vec_input, {id, "i1"});
+  return {id, "o1"};
+}
+
 // Ensure an ExprResult is an Endpoint, materializing constants if needed.
+// The input_endpoint is expected to be a VectorNumber stream; a scalar
+// clock is derived from it so that ConstantNumber receives NumberData.
 Endpoint ensure_endpoint(ExprResult result, const Endpoint& input_endpoint,
                          GraphBuilder& builder) {
   if (auto* ep = std::get_if<Endpoint>(&result)) {
     return *ep;
   }
   auto& cm = std::get<ConstantMarker>(result);
+  auto clock_ep = scalar_clock(input_endpoint, builder);
   auto id = builder.next_id("const");
   builder.add_operator(id, "ConstantNumber", {{"value", cm.value}});
-  builder.connect(input_endpoint, {id, "i1"});
+  builder.connect(clock_ep, {id, "i1"});
   return {id, "o1"};
 }
 
@@ -82,9 +95,10 @@ Endpoint compile_function(const std::string& name,
       throw std::runtime_error(
           "COUNT(*) takes no arguments (use COUNT(*), not COUNT(expr))");
     }
+    auto clock_ep = scalar_clock(input_endpoint, builder);
     auto cnt_id = builder.next_id("count");
     builder.add_operator(cnt_id, "CountNumber");
-    builder.connect(input_endpoint, {cnt_id, "i1"});
+    builder.connect(clock_ep, {cnt_id, "i1"});
     return {cnt_id, "o1"};
   }
 
@@ -101,7 +115,7 @@ Endpoint compile_function(const std::string& name,
 
     auto cnt_id = builder.next_id("count");
     builder.add_operator(cnt_id, "CountNumber");
-    builder.connect(input_endpoint, {cnt_id, "i1"});
+    builder.connect(expr_ep, {cnt_id, "i1"});
 
     auto div_id = builder.next_id("div");
     builder.add_operator(div_id, "Division", {{"numPorts", 2}});
@@ -139,7 +153,7 @@ Endpoint compile_function(const std::string& name,
         input_endpoint, builder);
     auto ms_id = builder.next_id("msum");
     builder.add_operator(ms_id, "MovingSum",
-                         {{"window", static_cast<double>(window)}});
+                         {{"window_size", static_cast<double>(window)}});
     builder.connect(expr_ep, {ms_id, "i1"});
     return {ms_id, "o1"};
   }
@@ -150,14 +164,15 @@ Endpoint compile_function(const std::string& name,
           "MOVING_COUNT requires 1 argument: (window_size)");
     }
     int window = require_constant_int("MOVING_COUNT", args[0], "window_size");
-    // ConstantNumber(1) → MovingSum(N)
+    // scalar_clock → ConstantNumber(1) → MovingSum(N)
+    auto clock_ep = scalar_clock(input_endpoint, builder);
     auto const_id = builder.next_id("const");
     builder.add_operator(const_id, "ConstantNumber", {{"value", 1.0}});
-    builder.connect(input_endpoint, {const_id, "i1"});
+    builder.connect(clock_ep, {const_id, "i1"});
 
     auto ms_id = builder.next_id("msum");
     builder.add_operator(ms_id, "MovingSum",
-                         {{"window", static_cast<double>(window)}});
+                         {{"window_size", static_cast<double>(window)}});
     builder.connect({const_id, "o1"}, {ms_id, "i1"});
     return {ms_id, "o1"};
   }

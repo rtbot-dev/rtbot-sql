@@ -200,7 +200,8 @@ Endpoint compile_where(const parser::ast::Expr& where_clause,
   auto bool_ep = compile_predicate(where_clause, input_endpoint, scope, builder);
 
   auto demux_id = builder.next_id("demux");
-  builder.add_operator(demux_id, "Demultiplexer", {{"numPorts", 1}});
+  builder.add_operator(demux_id, "Demultiplexer", {{"numPorts", 1}},
+                       {{"portType", "vector_number"}});
   builder.connect(bool_ep, {demux_id, "c1"});
   builder.connect(input_endpoint, {demux_id, "i1"});
   return {demux_id, "o1"};

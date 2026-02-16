@@ -49,6 +49,14 @@ std::string default_alias(const parser::ast::Expr& expr) {
   return "expr";
 }
 
+// Convert a VectorNumber endpoint into a Number endpoint for clocking.
+Endpoint scalar_clock(const Endpoint& vec_input, GraphBuilder& builder) {
+  auto id = builder.next_id("clock");
+  builder.add_operator(id, "VectorExtract", {{"index", 0.0}});
+  builder.connect(vec_input, {id, "i1"});
+  return {id, "o1"};
+}
+
 // Ensure an ExprResult is an Endpoint, materializing constants if needed.
 Endpoint ensure_endpoint(ExprResult result, const Endpoint& input_endpoint,
                          GraphBuilder& builder) {
@@ -56,9 +64,10 @@ Endpoint ensure_endpoint(ExprResult result, const Endpoint& input_endpoint,
     return *ep;
   }
   auto& cm = std::get<ConstantMarker>(result);
+  auto clock_ep = scalar_clock(input_endpoint, builder);
   auto id = builder.next_id("const");
   builder.add_operator(id, "ConstantNumber", {{"value", cm.value}});
-  builder.connect(input_endpoint, {id, "i1"});
+  builder.connect(clock_ep, {id, "i1"});
   return {id, "o1"};
 }
 
@@ -248,7 +257,8 @@ SelectResult compile_group_by(
                                             proto_builder, cache);
 
     auto demux_id = proto_builder.next_id("demux");
-    proto_builder.add_operator(demux_id, "Demultiplexer", {{"numPorts", 1}});
+    proto_builder.add_operator(demux_id, "Demultiplexer", {{"numPorts", 1}},
+                               {{"portType", "vector_number"}});
     proto_builder.connect(bool_ep, {demux_id, "c1"});
     proto_builder.connect(proto_output_ep, {demux_id, "i1"});
     proto_output_ep = {demux_id, "o1"};
