@@ -241,8 +241,10 @@ CompilationResult handle_drop(const parser::ast::DropStmt& stmt) {
   result.statement_type = StatementType::DROP;
   result.drop_entity_name = stmt.name;
 
-  if (stmt.entity_type == "STREAM" || stmt.entity_type == "TABLE")
+  if (stmt.entity_type == "STREAM")
     result.drop_entity_type = EntityType::STREAM;
+  else if (stmt.entity_type == "TABLE")
+    result.drop_entity_type = EntityType::TABLE;
   else if (stmt.entity_type == "VIEW")
     result.drop_entity_type = EntityType::VIEW;
   else if (stmt.entity_type == "MATERIALIZED_VIEW")
