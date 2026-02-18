@@ -83,6 +83,7 @@ struct CompilationResult {
   ViewType view_type;
   int key_index;
   SelectTier select_tier;
+  int select_limit = -1;  // SQL LIMIT value (-1 = no limit)
   std::vector<double> insert_payload;
   StreamSchema stream_schema;
   std::string entity_name;

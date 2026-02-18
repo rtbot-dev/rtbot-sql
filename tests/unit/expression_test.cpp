@@ -39,6 +39,25 @@ Expr func2(const std::string& name, Expr arg1, Expr arg2) {
   return f;
 }
 
+Expr cmp(const std::string& op, Expr left, Expr right) {
+  auto e = std::make_unique<ComparisonExpr>();
+  e->op = op;
+  e->left = std::move(left);
+  e->right = std::move(right);
+  return e;
+}
+
+// Build: CASE WHEN cond THEN then_expr ELSE else_expr END
+Expr case_when(Expr cond, Expr then_expr, Expr else_expr) {
+  auto e = std::make_unique<CaseExpr>();
+  CaseWhenClause clause;
+  clause.condition = std::move(cond);
+  clause.result = std::move(then_expr);
+  e->when_clauses.push_back(std::move(clause));
+  e->else_result = std::move(else_expr);
+  return e;
+}
+
 // Helper to assert a specific connection exists
 void expect_conn(const GraphBuilder& b, const std::string& from_id,
                  const std::string& from_port, const std::string& to_id,
@@ -315,6 +334,60 @@ TEST_F(ExpressionTest, ConstantDivColumnProducesDivisionSync) {
   expect_conn(builder, "input_0", "o1", cnum.id, "i1");
   expect_conn(builder, cnum.id, "o1", div.id, "i1");
   expect_conn(builder, ext.id, "o1", div.id, "i2");
+}
+
+// CASE WHEN price > 100 THEN price ELSE 0 END
+// → CompareGT(100) as condition, VectorExtract for price, ConstantNumber(0)
+//   + LogicalNand(1) for NOT → Multiplexer(2)
+TEST_F(ExpressionTest, CaseWhenSingleBranchProducesMultiplexer) {
+  auto expr = case_when(
+      cmp(">", col("price"), num(100.0)),  // WHEN price > 100
+      col("price"),                         // THEN price
+      num(0.0)                             // ELSE 0
+  );
+  auto result = compile_expression(std::move(expr), input, scope, builder);
+  ASSERT_TRUE(std::holds_alternative<Endpoint>(result));
+  auto& ep = std::get<Endpoint>(result);
+
+  // The Multiplexer must be the last operator
+  bool has_mux = false;
+  bool has_nand = false;
+  for (const auto& op : builder.operators()) {
+    if (op.type == "Multiplexer") {
+      has_mux = true;
+      EXPECT_EQ(op.params.at("numPorts"), 2.0);
+      EXPECT_EQ(ep.operator_id, op.id);
+    }
+    if (op.type == "LogicalNand") {
+      has_nand = true;
+      EXPECT_EQ(op.params.at("numPorts"), 1.0);
+    }
+  }
+  EXPECT_TRUE(has_mux);
+  EXPECT_TRUE(has_nand);
+}
+
+// CASE WHEN price > 100 THEN price END (no ELSE — Multiplexer with 1 port)
+TEST_F(ExpressionTest, CaseWhenNoElseProducesMultiplexerOnePort) {
+  auto e = std::make_unique<CaseExpr>();
+  CaseWhenClause clause;
+  clause.condition = cmp(">", col("price"), num(100.0));
+  clause.result = col("price");
+  e->when_clauses.push_back(std::move(clause));
+  // No else_result
+  Expr expr = std::move(e);
+
+  auto result = compile_expression(std::move(expr), input, scope, builder);
+  ASSERT_TRUE(std::holds_alternative<Endpoint>(result));
+
+  bool has_mux = false;
+  for (const auto& op : builder.operators()) {
+    if (op.type == "Multiplexer") {
+      has_mux = true;
+      EXPECT_EQ(op.params.at("numPorts"), 1.0);
+    }
+  }
+  EXPECT_TRUE(has_mux);
 }
 
 }  // namespace

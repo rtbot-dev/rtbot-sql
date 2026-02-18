@@ -7,6 +7,7 @@
 
 #include "rtbot_sql/compiler/expr_cache.h"
 #include "rtbot_sql/compiler/function_compiler.h"
+#include "rtbot_sql/compiler/where_compiler.h"
 
 namespace rtbot_sql::compiler {
 
@@ -44,6 +45,24 @@ double fold_math(const std::string& rtbot_type, double v) {
   if (rtbot_type == "Tan") return std::tan(v);
   if (rtbot_type == "Sign") return (v > 0) ? 1.0 : (v < 0) ? -1.0 : 0.0;
   return v;
+}
+
+// Ensure an ExprResult is an Endpoint, materializing constants with a clock.
+static Endpoint ensure_endpoint_local(ExprResult result,
+                                      const Endpoint& input_endpoint,
+                                      GraphBuilder& builder) {
+  if (auto* ep = std::get_if<Endpoint>(&result)) {
+    return *ep;
+  }
+  auto& cm = std::get<ConstantMarker>(result);
+  // Derive a scalar clock from the VectorNumber input stream
+  auto clock_id = builder.next_id("clock");
+  builder.add_operator(clock_id, "VectorExtract", {{"index", 0.0}});
+  builder.connect(input_endpoint, {clock_id, "i1"});
+  auto const_id = builder.next_id("const");
+  builder.add_operator(const_id, "ConstantNumber", {{"value", cm.value}});
+  builder.connect({clock_id, "o1"}, {const_id, "i1"});
+  return {const_id, "o1"};
 }
 
 double fold_binary(const std::string& op, double l, double r) {
@@ -297,6 +316,83 @@ ExprResult compile_expression(const parser::ast::Expr& expr,
     builder.add_operator(id, rtbot_type);
     builder.connect(std::get<Endpoint>(arg), {id, "i1"});
     ExprResult r = Endpoint{id, "o1"};
+    maybe_cache(expr, r);
+    return r;
+  }
+
+  // CaseExpr: CASE WHEN cond1 THEN expr1 ... ELSE expr_default END
+  // Compiled as Multiplexer(N ports) with mutually-exclusive boolean controls.
+  if (auto* case_ptr = std::get_if<std::unique_ptr<parser::ast::CaseExpr>>(&expr)) {
+    const auto& ce = **case_ptr;
+    if (ce.when_clauses.empty()) {
+      throw std::runtime_error("CASE expression has no WHEN clauses");
+    }
+
+    // Compile each WHEN condition → boolean endpoint.
+    std::vector<Endpoint> cond_eps;
+    for (const auto& clause : ce.when_clauses) {
+      cond_eps.push_back(compile_predicate(clause.condition, input_endpoint, scope, builder));
+    }
+
+    // Compile each THEN result → number endpoint.
+    std::vector<Endpoint> result_eps;
+    for (const auto& clause : ce.when_clauses) {
+      auto r = compile_expression(clause.result, input_endpoint, scope, builder, cache);
+      result_eps.push_back(ensure_endpoint_local(std::move(r), input_endpoint, builder));
+    }
+
+    // Build mutually-exclusive conditions using LogicalNand(1) for NOT and LogicalAnd(2):
+    //   exclusive[0] = cond0
+    //   exclusive[i] = NOT(cond0) AND ... AND NOT(cond_{i-1}) AND cond_i
+    //   exclusive[else] = NOT(cond0) AND ... AND NOT(cond_{N-1})
+    std::vector<Endpoint> exclusive_eps;
+    Endpoint not_all_prev;  // NOT(cond0) AND ... AND NOT(cond_{i-1})
+
+    for (size_t i = 0; i < cond_eps.size(); i++) {
+      if (i == 0) {
+        exclusive_eps.push_back(cond_eps[0]);
+        // NOT(cond0) via LogicalNand(1)
+        auto nand_id = builder.next_id("not");
+        builder.add_operator(nand_id, "LogicalNand", {{"numPorts", 1.0}});
+        builder.connect(cond_eps[0], {nand_id, "i1"});
+        not_all_prev = {nand_id, "o1"};
+      } else {
+        // exclusive[i] = not_all_prev AND cond_i
+        auto and_id = builder.next_id("and");
+        builder.add_operator(and_id, "LogicalAnd", {{"numPorts", 2.0}});
+        builder.connect(not_all_prev, {and_id, "i1"});
+        builder.connect(cond_eps[i], {and_id, "i2"});
+        exclusive_eps.push_back({and_id, "o1"});
+
+        // Update not_all_prev = not_all_prev AND NOT(cond_i)
+        auto nand_id = builder.next_id("not");
+        builder.add_operator(nand_id, "LogicalNand", {{"numPorts", 1.0}});
+        builder.connect(cond_eps[i], {nand_id, "i1"});
+
+        auto new_and_id = builder.next_id("and");
+        builder.add_operator(new_and_id, "LogicalAnd", {{"numPorts", 2.0}});
+        builder.connect(not_all_prev, {new_and_id, "i1"});
+        builder.connect({nand_id, "o1"}, {new_and_id, "i2"});
+        not_all_prev = {new_and_id, "o1"};
+      }
+    }
+
+    // ELSE branch (if present)
+    if (ce.else_result.has_value()) {
+      exclusive_eps.push_back(not_all_prev);  // else fires when no WHEN matched
+      auto r = compile_expression(*ce.else_result, input_endpoint, scope, builder, cache);
+      result_eps.push_back(ensure_endpoint_local(std::move(r), input_endpoint, builder));
+    }
+
+    auto mux_id = builder.next_id("mux");
+    builder.add_operator(mux_id, "Multiplexer",
+                         {{"numPorts", static_cast<double>(result_eps.size())}});
+    for (size_t i = 0; i < result_eps.size(); i++) {
+      builder.connect(exclusive_eps[i], {mux_id, "c" + std::to_string(i + 1)});
+      builder.connect(result_eps[i], {mux_id, "i" + std::to_string(i + 1)});
+    }
+
+    ExprResult r = Endpoint{mux_id, "o1"};
     maybe_cache(expr, r);
     return r;
   }

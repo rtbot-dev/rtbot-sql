@@ -79,9 +79,24 @@ Endpoint compile_comparison(const parser::ast::ComparisonExpr& cmp,
     return {id, "o1"};
   }
 
-  // Both streams — not supported in Phase 1
-  throw std::runtime_error(
-      "comparison of two stream expressions not yet supported");
+  // Both streams → CompareSyncXX (synchronize by timestamp)
+  {
+    auto& left_ep = std::get<Endpoint>(left);
+    auto& right_ep = std::get<Endpoint>(right);
+    std::string rtbot_type;
+    if (cmp.op == ">") rtbot_type = "CompareSyncGT";
+    else if (cmp.op == "<") rtbot_type = "CompareSyncLT";
+    else if (cmp.op == ">=") rtbot_type = "CompareSyncGTE";
+    else if (cmp.op == "<=") rtbot_type = "CompareSyncLTE";
+    else if (cmp.op == "=") rtbot_type = "CompareSyncEQ";
+    else if (cmp.op == "!=") rtbot_type = "CompareSyncNEQ";
+    else throw std::runtime_error("unknown comparison operator: " + cmp.op);
+    auto id = builder.next_id("cmp_sync");
+    builder.add_operator(id, rtbot_type);
+    builder.connect(left_ep, {id, "i1"});
+    builder.connect(right_ep, {id, "i2"});
+    return {id, "o1"};
+  }
 }
 
 }  // namespace

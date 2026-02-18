@@ -133,5 +133,72 @@ TEST_F(HavingTest, HavingWithSharedSum) {
   EXPECT_TRUE(has_demux);
 }
 
+// Test 6: SELECT instrument_id, SUM(quantity) AS total
+//         FROM trades GROUP BY instrument_id
+//         HAVING MOVING_COUNT(5) > 3
+// → outer pre-filter: VectorExtract(key) → MovingKeyCount(5) → CompareGT(3) → Demux
+//   then KeyedPipeline (no HAVING inside prototype)
+TEST_F(HavingTest, VelocityPatternBuildsOuterPrefilter) {
+  std::vector<SelectItem> select_list;
+  select_list.push_back(item(col("instrument_id")));
+  std::vector<Expr> sum_args;
+  sum_args.push_back(col("quantity"));
+  select_list.push_back(item(func_expr("SUM", std::move(sum_args)), "total"));
+
+  std::vector<Expr> group_by;
+  group_by.push_back(col("instrument_id"));
+
+  // HAVING MOVING_COUNT(5) > 3
+  std::vector<Expr> mc_args;
+  mc_args.push_back(num(5));
+  Expr having = cmp(">", func_expr("MOVING_COUNT", std::move(mc_args)), num(3));
+
+  auto [ep, field_map] =
+      compile_group_by(select_list, group_by, std::move(having), input, scope,
+                       builder);
+
+  // No Demultiplexer inside the prototype (velocity HAVING goes to outer graph)
+  ASSERT_EQ(builder.prototypes().size(), 1u);
+  const auto& proto = builder.prototypes()[0];
+  for (const auto& op : proto.operators) {
+    EXPECT_NE(op.type, "Demultiplexer") << "Demux should not be inside prototype";
+  }
+
+  // Outer graph must contain: VectorExtract, MovingKeyCount, CompareGT, Demultiplexer
+  bool has_extract = false, has_mkc = false, has_cmp = false, has_demux = false;
+  for (const auto& op : builder.operators()) {
+    if (op.type == "VectorExtract") has_extract = true;
+    if (op.type == "MovingKeyCount") {
+      has_mkc = true;
+      EXPECT_EQ(op.params.at("window_size"), 5.0);
+    }
+    if (op.type == "CompareGT") {
+      has_cmp = true;
+      EXPECT_EQ(op.params.at("value"), 3.0);
+    }
+    if (op.type == "Demultiplexer") has_demux = true;
+  }
+  EXPECT_TRUE(has_extract);
+  EXPECT_TRUE(has_mkc);
+  EXPECT_TRUE(has_cmp);
+  EXPECT_TRUE(has_demux);
+
+  // KeyedPipeline receives filtered stream (from Demux, not raw input)
+  bool kp_fed_by_demux = false;
+  for (const auto& c : builder.connections()) {
+    std::string demux_id;
+    for (const auto& op : builder.operators()) {
+      if (op.type == "Demultiplexer") demux_id = op.id;
+    }
+    if (c.from_id == demux_id && c.from_port == "o1") {
+      kp_fed_by_demux = true;
+    }
+  }
+  EXPECT_TRUE(kp_fed_by_demux);
+
+  EXPECT_EQ(field_map.at("instrument_id"), 0);
+  EXPECT_EQ(field_map.at("total"), 1);
+}
+
 }  // namespace
 }  // namespace rtbot_sql::compiler

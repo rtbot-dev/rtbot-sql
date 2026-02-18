@@ -259,5 +259,44 @@ TEST_F(WhereTest, PredicateWithoutDemux) {
   expect_conn(builder, ext.id, "o1", cmpop.id, "i1");
 }
 
+// WHERE price > quantity → two VectorExtract + CompareSyncGT + Demultiplexer
+TEST_F(WhereTest, SameStreamComparisonGT) {
+  auto result =
+      compile_where(cmp(">", col("price"), col("quantity")), input, scope, builder);
+
+  ASSERT_EQ(builder.operators().size(), 4u);
+  auto& ext_p = builder.operators()[0];
+  auto& ext_q = builder.operators()[1];
+  auto& cmpop = builder.operators()[2];
+  auto& demux = builder.operators()[3];
+  EXPECT_EQ(ext_p.type, "VectorExtract");
+  EXPECT_EQ(ext_p.params.at("index"), 1.0);
+  EXPECT_EQ(ext_q.type, "VectorExtract");
+  EXPECT_EQ(ext_q.params.at("index"), 2.0);
+  EXPECT_EQ(cmpop.type, "CompareSyncGT");
+  EXPECT_EQ(demux.type, "Demultiplexer");
+  EXPECT_EQ(result.operator_id, demux.id);
+
+  ASSERT_EQ(builder.connections().size(), 6u);
+  expect_conn(builder, "input_0", "o1", ext_p.id, "i1");
+  expect_conn(builder, "input_0", "o1", ext_q.id, "i1");
+  expect_conn(builder, ext_p.id, "o1", cmpop.id, "i1");
+  expect_conn(builder, ext_q.id, "o1", cmpop.id, "i2");
+  expect_conn(builder, cmpop.id, "o1", demux.id, "c1");
+  expect_conn(builder, "input_0", "o1", demux.id, "i1");
+}
+
+// WHERE price <= quantity (stream OP stream, ≤)
+TEST_F(WhereTest, SameStreamComparisonLTE) {
+  auto ep = compile_predicate(cmp("<=", col("price"), col("quantity")),
+                              input, scope, builder);
+
+  bool has_sync_lte = false;
+  for (const auto& op : builder.operators()) {
+    if (op.type == "CompareSyncLTE") has_sync_lte = true;
+  }
+  EXPECT_TRUE(has_sync_lte);
+}
+
 }  // namespace
 }  // namespace rtbot_sql::compiler

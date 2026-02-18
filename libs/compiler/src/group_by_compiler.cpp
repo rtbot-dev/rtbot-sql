@@ -100,6 +100,67 @@ std::string flip_comparison(const std::string& op) {
   return op;  // = and != are symmetric
 }
 
+// Detect HAVING MOVING_COUNT(N) OP threshold pattern.
+// Returns {window_size, threshold, rtbot_compare_type} if matched, nullopt otherwise.
+struct VelocityPattern {
+  int window_size;
+  double threshold;
+  std::string rtbot_type;  // "CompareGT", "CompareGTE", etc.
+};
+
+std::optional<VelocityPattern> detect_velocity_pattern(
+    const parser::ast::Expr& having_expr) {
+  using namespace parser::ast;
+
+  auto* cmp_ptr = std::get_if<std::unique_ptr<ComparisonExpr>>(&having_expr);
+  if (!cmp_ptr) return std::nullopt;
+  const auto& cmp = **cmp_ptr;
+
+  // Check: MOVING_COUNT(N) OP constant
+  auto extract = [](const Expr& e) -> std::optional<int> {
+    auto* fp = std::get_if<std::unique_ptr<FuncCall>>(&e);
+    if (!fp) return std::nullopt;
+    const auto& f = **fp;
+    std::string upper = f.name;
+    std::transform(upper.begin(), upper.end(), upper.begin(), ::toupper);
+    if (upper != "MOVING_COUNT" || f.args.size() != 1) return std::nullopt;
+    auto* c = std::get_if<Constant>(&f.args[0]);
+    if (!c || c->value <= 0 || c->value != static_cast<int>(c->value))
+      return std::nullopt;
+    return static_cast<int>(c->value);
+  };
+
+  auto mc_left = extract(cmp.left);
+  auto* right_const = std::get_if<Constant>(&cmp.right);
+
+  if (mc_left.has_value() && right_const) {
+    // MOVING_COUNT(N) OP threshold
+    static const std::map<std::string, std::string> op_map = {
+        {">", "CompareGT"}, {"<", "CompareLT"},
+        {">=", "CompareGTE"}, {"<=", "CompareLTE"},
+        {"=", "CompareEQ"}, {"!=", "CompareNEQ"}};
+    auto it = op_map.find(cmp.op);
+    if (it == op_map.end()) return std::nullopt;
+    return VelocityPattern{*mc_left, right_const->value, it->second};
+  }
+
+  auto mc_right = extract(cmp.right);
+  auto* left_const = std::get_if<Constant>(&cmp.left);
+
+  if (mc_right.has_value() && left_const) {
+    // constant OP MOVING_COUNT(N) — flip direction
+    static const std::map<std::string, std::string> flipped_map = {
+        {">", "CompareLT"}, {"<", "CompareGT"},
+        {">=", "CompareLTE"}, {"<=", "CompareGTE"},
+        {"=", "CompareEQ"}, {"!=", "CompareNEQ"}};
+    auto it = flipped_map.find(cmp.op);
+    if (it == flipped_map.end()) return std::nullopt;
+    return VelocityPattern{*mc_right, left_const->value, it->second};
+  }
+
+  return std::nullopt;
+}
+
 // Cache-aware HAVING predicate compilation.
 Endpoint compile_having_predicate(const parser::ast::Expr& expr,
                                   const Endpoint& input_endpoint,
@@ -252,16 +313,22 @@ SelectResult compile_group_by(
   Endpoint proto_output_ep = {compose_id, "o1"};
 
   // --- Step 3: HAVING (if present) ---
+  // Velocity patterns (MOVING_COUNT(N) OP threshold) are handled as an outer
+  // pre-filter before KeyedPipeline, not inside the prototype.
+  std::optional<VelocityPattern> velocity_pat;
   if (having.has_value()) {
-    auto bool_ep = compile_having_predicate(*having, proto_input_ep, scope,
-                                            proto_builder, cache);
-
-    auto demux_id = proto_builder.next_id("demux");
-    proto_builder.add_operator(demux_id, "Demultiplexer", {{"numPorts", 1}},
-                               {{"portType", "vector_number"}});
-    proto_builder.connect(bool_ep, {demux_id, "c1"});
-    proto_builder.connect(proto_output_ep, {demux_id, "i1"});
-    proto_output_ep = {demux_id, "o1"};
+    velocity_pat = detect_velocity_pattern(*having);
+    if (!velocity_pat.has_value()) {
+      // General HAVING: compile predicate inside prototype and gate output.
+      auto bool_ep = compile_having_predicate(*having, proto_input_ep, scope,
+                                              proto_builder, cache);
+      auto demux_id = proto_builder.next_id("demux");
+      proto_builder.add_operator(demux_id, "Demultiplexer", {{"numPorts", 1}},
+                                 {{"portType", "vector_number"}});
+      proto_builder.connect(bool_ep, {demux_id, "c1"});
+      proto_builder.connect(proto_output_ep, {demux_id, "i1"});
+      proto_output_ep = {demux_id, "o1"};
+    }
   }
 
   // --- Step 4: Add Output to prototype ---
@@ -280,11 +347,41 @@ SelectResult compile_group_by(
   builder.add_prototype(proto_def);
 
   // --- Step 6: Add KeyedPipeline to outer graph ---
+  // For velocity patterns, insert a pre-filter chain in the outer graph:
+  //   VectorExtract(key_index) → MovingKeyCount(N) → Compare(threshold)
+  //     → Demux.c1 ; input_endpoint → Demux.i1 ; Demux.o1 → KeyedPipeline
+  Endpoint keyed_input = input_endpoint;
+  if (velocity_pat.has_value()) {
+    const auto& vp = *velocity_pat;
+
+    auto extract_id = builder.next_id("extract");
+    builder.add_operator(extract_id, "VectorExtract",
+                         {{"index", static_cast<double>(key_index)}});
+    builder.connect(input_endpoint, {extract_id, "i1"});
+
+    auto mkc_id = builder.next_id("mkc");
+    builder.add_operator(mkc_id, "MovingKeyCount",
+                         {{"window_size", static_cast<double>(vp.window_size)}});
+    builder.connect({extract_id, "o1"}, {mkc_id, "i1"});
+
+    auto cmp_id = builder.next_id("cmp");
+    builder.add_operator(cmp_id, vp.rtbot_type, {{"value", vp.threshold}});
+    builder.connect({mkc_id, "o1"}, {cmp_id, "i1"});
+
+    auto demux_id = builder.next_id("demux");
+    builder.add_operator(demux_id, "Demultiplexer", {{"numPorts", 1}},
+                         {{"portType", "vector_number"}});
+    builder.connect({cmp_id, "o1"}, {demux_id, "c1"});
+    builder.connect(input_endpoint, {demux_id, "i1"});
+
+    keyed_input = {demux_id, "o1"};
+  }
+
   auto keyed_id = builder.next_id("keyed");
   builder.add_operator(keyed_id, "KeyedPipeline",
                        {{"key_index", static_cast<double>(key_index)}},
                        {{"prototype", proto_id}});
-  builder.connect(input_endpoint, {keyed_id, "i1"});
+  builder.connect(keyed_input, {keyed_id, "i1"});
 
   // --- Step 7: Build field map ---
   FieldMap field_map;

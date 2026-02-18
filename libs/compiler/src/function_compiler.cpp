@@ -61,7 +61,7 @@ bool is_aggregate_or_windowed(const std::string& name) {
   return upper == "SUM" || upper == "COUNT" || upper == "AVG" ||
          upper == "MOVING_AVERAGE" || upper == "MOVING_SUM" ||
          upper == "MOVING_COUNT" || upper == "MOVING_STD" ||
-         upper == "STDDEV" ||
+         upper == "STDDEV" || upper == "MOVING_MIN" || upper == "MOVING_MAX" ||
          upper == "FIR" || upper == "IIR" ||
          upper == "RESAMPLE" || upper == "PEAK_DETECT";
 }
@@ -208,6 +208,36 @@ Endpoint compile_function(const std::string& name,
                          {{"window_size", static_cast<double>(window)}});
     builder.connect(expr_ep, {sd_id, "i1"});
     return {sd_id, "o1"};
+  }
+
+  // --- All-time extremum trackers ---
+
+  if (upper == "MOVING_MIN") {
+    if (args.size() != 1) {
+      throw std::runtime_error(
+          "MOVING_MIN requires 1 argument: (expr)");
+    }
+    auto expr_ep = ensure_endpoint(
+        compile_expression(args[0], input_endpoint, scope, builder, cache),
+        input_endpoint, builder);
+    auto mn_id = builder.next_id("mintrk");
+    builder.add_operator(mn_id, "MinTracker");
+    builder.connect(expr_ep, {mn_id, "i1"});
+    return {mn_id, "o1"};
+  }
+
+  if (upper == "MOVING_MAX") {
+    if (args.size() != 1) {
+      throw std::runtime_error(
+          "MOVING_MAX requires 1 argument: (expr)");
+    }
+    auto expr_ep = ensure_endpoint(
+        compile_expression(args[0], input_endpoint, scope, builder, cache),
+        input_endpoint, builder);
+    auto mx_id = builder.next_id("maxtrk");
+    builder.add_operator(mx_id, "MaxTracker");
+    builder.connect(expr_ep, {mx_id, "i1"});
+    return {mx_id, "o1"};
   }
 
   // --- DSP functions (stubs — generate operators, detailed testing in Phase 2) ---

@@ -138,12 +138,31 @@ ast::Expr convert_bool_expr(const json& node) {
   return result;
 }
 
+ast::Expr convert_case_expr(const json& node) {
+  auto e = std::make_unique<ast::CaseExpr>();
+
+  for (const auto& arg : node["args"]) {
+    const auto& when = arg["CaseWhen"];
+    ast::CaseWhenClause clause;
+    clause.condition = convert_expr(when["expr"]);
+    clause.result = convert_expr(when["result"]);
+    e->when_clauses.push_back(std::move(clause));
+  }
+
+  if (node.contains("defresult") && !node["defresult"].is_null()) {
+    e->else_result = convert_expr(node["defresult"]);
+  }
+
+  return e;
+}
+
 ast::Expr convert_expr(const json& node) {
   if (node.contains("ColumnRef")) return convert_column_ref(node["ColumnRef"]);
   if (node.contains("A_Const")) return convert_a_const(node["A_Const"]);
   if (node.contains("A_Expr")) return convert_a_expr(node["A_Expr"]);
   if (node.contains("FuncCall")) return convert_func_call(node["FuncCall"]);
   if (node.contains("BoolExpr")) return convert_bool_expr(node["BoolExpr"]);
+  if (node.contains("CaseExpr")) return convert_case_expr(node["CaseExpr"]);
 
   throw std::runtime_error("unsupported expression node type");
 }

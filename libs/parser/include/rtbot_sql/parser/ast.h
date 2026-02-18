@@ -26,6 +26,7 @@ struct FuncCall;
 struct LogicalExpr;
 struct NotExpr;
 struct BetweenExpr;
+struct CaseExpr;
 
 struct ColumnRef {
   std::string table_alias;
@@ -49,7 +50,8 @@ using Expr = std::variant<
     std::unique_ptr<FuncCall>,
     std::unique_ptr<LogicalExpr>,
     std::unique_ptr<NotExpr>,
-    std::unique_ptr<BetweenExpr>>;
+    std::unique_ptr<BetweenExpr>,
+    std::unique_ptr<CaseExpr>>;
 
 struct BinaryExpr {
   std::string op;  // +, -, *, /
@@ -82,6 +84,16 @@ struct BetweenExpr {
   Expr expr;
   Expr low;
   Expr high;
+};
+
+struct CaseWhenClause {
+  Expr condition;
+  Expr result;
+};
+
+struct CaseExpr {
+  std::vector<CaseWhenClause> when_clauses;
+  std::optional<Expr> else_result;
 };
 
 struct SelectItem {

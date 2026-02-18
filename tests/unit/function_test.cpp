@@ -254,5 +254,60 @@ TEST_F(FunctionTest, MovingSumProducesMovingSum) {
   EXPECT_EQ(ep.operator_id, ms.id);
 }
 
+// MOVING_MIN(price) → VectorExtract + MinTracker
+TEST_F(FunctionTest, MovingMinProducesMinTracker) {
+  std::vector<Expr> args;
+  args.push_back(col("price"));
+  auto ep = compile_function("MOVING_MIN", args, input, scope, builder);
+
+  ASSERT_EQ(builder.operators().size(), 2u);
+  auto& ext = builder.operators()[0];
+  auto& mn = builder.operators()[1];
+  EXPECT_EQ(ext.type, "VectorExtract");
+  EXPECT_EQ(ext.params.at("index"), 1.0);
+  EXPECT_EQ(mn.type, "MinTracker");
+  EXPECT_EQ(ep.operator_id, mn.id);
+  EXPECT_EQ(ep.port, "o1");
+
+  ASSERT_EQ(builder.connections().size(), 2u);
+  expect_conn(builder, "input_0", "o1", ext.id, "i1");
+  expect_conn(builder, ext.id, "o1", mn.id, "i1");
+}
+
+// MOVING_MAX(price) → VectorExtract + MaxTracker
+TEST_F(FunctionTest, MovingMaxProducesMaxTracker) {
+  std::vector<Expr> args;
+  args.push_back(col("price"));
+  auto ep = compile_function("MOVING_MAX", args, input, scope, builder);
+
+  ASSERT_EQ(builder.operators().size(), 2u);
+  auto& ext = builder.operators()[0];
+  auto& mx = builder.operators()[1];
+  EXPECT_EQ(ext.type, "VectorExtract");
+  EXPECT_EQ(ext.params.at("index"), 1.0);
+  EXPECT_EQ(mx.type, "MaxTracker");
+  EXPECT_EQ(ep.operator_id, mx.id);
+  EXPECT_EQ(ep.port, "o1");
+
+  ASSERT_EQ(builder.connections().size(), 2u);
+  expect_conn(builder, "input_0", "o1", ext.id, "i1");
+  expect_conn(builder, ext.id, "o1", mx.id, "i1");
+}
+
+// MOVING_MIN/MOVING_MAX wrong argument count → error
+TEST_F(FunctionTest, MovingMinWrongArgCountThrows) {
+  std::vector<Expr> args;  // empty
+  EXPECT_THROW(compile_function("MOVING_MIN", args, input, scope, builder),
+               std::runtime_error);
+}
+
+TEST_F(FunctionTest, MovingMaxWrongArgCountThrows) {
+  std::vector<Expr> args;
+  args.push_back(col("price"));
+  args.push_back(num(5));  // extra arg
+  EXPECT_THROW(compile_function("MOVING_MAX", args, input, scope, builder),
+               std::runtime_error);
+}
+
 }  // namespace
 }  // namespace rtbot_sql::compiler
