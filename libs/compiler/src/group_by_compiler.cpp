@@ -248,18 +248,151 @@ SelectResult compile_group_by(
     const std::optional<parser::ast::Expr>& having,
     const Endpoint& input_endpoint,
     const analyzer::Scope& scope,
-    GraphBuilder& builder) {
+    GraphBuilder& builder,
+    int num_input_cols) {
   using namespace parser::ast;
 
-  // --- Step 1: Identify key column ---
+  // --- Step 1: Identify key column(s) ---
   if (group_by.empty()) {
     throw std::runtime_error("GROUP BY requires at least one column");
   }
+
+  // --- Composite GROUP BY (2+ keys) ---
   if (group_by.size() > 1) {
-    throw std::runtime_error(
-        "composite GROUP BY keys not yet supported (use single column)");
+    if (num_input_cols <= 0) {
+      throw std::runtime_error(
+          "composite GROUP BY requires stream column count (internal error)");
+    }
+
+    // Resolve all key columns
+    struct KeyInfo { int index; std::string name; };
+    std::vector<KeyInfo> keys;
+    for (const auto& key_expr : group_by) {
+      auto* kc = std::get_if<ColumnRef>(&key_expr);
+      if (!kc) throw std::runtime_error("GROUP BY expression must be a column reference");
+      auto res = scope.resolve(*kc);
+      if (auto* err = std::get_if<std::string>(&res)) throw std::runtime_error(*err);
+      auto& b = std::get<analyzer::ColumnBinding>(res);
+      keys.push_back({b.index, kc->column_name});
+    }
+
+    // In outer graph: extract each original column from input, compute hash,
+    // and compose augmented vector [col0, col1, ..., colN-1, hash].
+    static const double PRIME = 1000003.0;
+
+    std::vector<std::string> extract_ids;
+    extract_ids.reserve(num_input_cols);
+    for (int c = 0; c < num_input_cols; ++c) {
+      auto eid = builder.next_id("extract");
+      builder.add_operator(eid, "VectorExtract", {{"index", static_cast<double>(c)}});
+      builder.connect(input_endpoint, {eid, "i1"});
+      extract_ids.push_back(eid);
+    }
+
+    // Compute hash = PRIME * key0 + key1 (+ ... for more keys via chaining)
+    std::string hash_ep_id = extract_ids[keys[0].index];
+    for (size_t ki = 1; ki < keys.size(); ++ki) {
+      auto lin_id = builder.next_id("linear");
+      builder.add_operator(lin_id, "Linear", {},
+                           {}, {{"coefficients", {PRIME, 1.0}}});
+      builder.connect({hash_ep_id, "o1"}, {lin_id, "i1"});
+      builder.connect({extract_ids[keys[ki].index], "o1"}, {lin_id, "i2"});
+      hash_ep_id = lin_id;
+    }
+
+    // Compose augmented vector: [original cols..., hash]
+    int compose_n = num_input_cols + 1;
+    auto compose_id = builder.next_id("augment");
+    builder.add_operator(compose_id, "VectorCompose",
+                         {{"numPorts", static_cast<double>(compose_n)}});
+    for (int c = 0; c < num_input_cols; ++c) {
+      builder.connect({extract_ids[c], "o1"}, {compose_id, "i" + std::to_string(c + 1)});
+    }
+    builder.connect({hash_ep_id, "o1"}, {compose_id, "i" + std::to_string(compose_n)});
+    int hash_key_index = num_input_cols;  // last index in augmented vector
+
+    // Prototype: receives augmented vector, original indices unchanged
+    GraphBuilder proto_builder;
+    ExprCache cache;
+    proto_builder.add_operator("proto_in", "Input");
+    Endpoint proto_input_ep{"proto_in", "o1"};
+
+    // Include both key columns explicitly in the prototype output
+    std::vector<Endpoint> proto_endpoints;
+    std::vector<std::string> field_names;
+    for (const auto& ki : keys) {
+      auto ve_id = proto_builder.next_id("extract");
+      proto_builder.add_operator(ve_id, "VectorExtract",
+                                 {{"index", static_cast<double>(ki.index)}});
+      proto_builder.connect(proto_input_ep, {ve_id, "i1"});
+      proto_endpoints.push_back({ve_id, "o1"});
+      field_names.push_back(ki.name);
+    }
+
+    // Compile non-key SELECT items
+    for (const auto& item : select_list) {
+      bool is_key = false;
+      for (const auto& gbe : group_by) {
+        if (is_group_by_key(item, gbe, scope)) { is_key = true; break; }
+      }
+      if (is_key) continue;
+
+      auto result = compile_expression_cached(item.expr, proto_input_ep, scope,
+                                              proto_builder, cache);
+      auto ep = ensure_endpoint(std::move(result), proto_input_ep, proto_builder);
+      proto_endpoints.push_back(ep);
+      field_names.push_back(item.alias.value_or(default_alias(item.expr)));
+    }
+
+    // Compose prototype outputs
+    auto pcompose_id = proto_builder.next_id("compose");
+    proto_builder.add_operator(
+        pcompose_id, "VectorCompose",
+        {{"numPorts", static_cast<double>(proto_endpoints.size())}});
+    for (size_t i = 0; i < proto_endpoints.size(); ++i) {
+      proto_builder.connect(proto_endpoints[i],
+                            {pcompose_id, "i" + std::to_string(i + 1)});
+    }
+    Endpoint proto_output_ep = {pcompose_id, "o1"};
+
+    // HAVING (not supported for composite GROUP BY in this phase)
+    if (having.has_value()) {
+      throw std::runtime_error(
+          "HAVING with composite GROUP BY not yet supported");
+    }
+
+    proto_builder.add_operator("proto_out", "Output");
+    proto_builder.connect(proto_output_ep, {"proto_out", "i1"});
+
+    auto proto_id = builder.next_id("proto");
+    PrototypeDef proto_def;
+    proto_def.id = proto_id;
+    proto_def.entry_id = "proto_in";
+    proto_def.output_id = "proto_out";
+    proto_def.operators = proto_builder.operators();
+    proto_def.connections = proto_builder.connections();
+    builder.add_prototype(proto_def);
+
+    auto keyed_id = builder.next_id("keyed");
+    builder.add_operator(keyed_id, "KeyedPipeline",
+                         {{"key_index", static_cast<double>(hash_key_index)}},
+                         {{"prototype", proto_id}});
+    builder.connect({compose_id, "o1"}, {keyed_id, "i1"});
+
+    // Field map: key columns first (KeyedPipeline prepends its key, but since
+    // we include keys explicitly in the prototype, keys appear at their natural
+    // positions in the prototype output. KeyedPipeline prepends its hash key at
+    // index 0, shifting all prototype outputs by 1.
+    // field_map: hash_key=0, key0=1, key1=2, agg0=3, ...
+    FieldMap field_map;
+    for (size_t i = 0; i < field_names.size(); ++i) {
+      field_map[field_names[i]] = static_cast<int>(i + 1);  // +1 for hash key prepended
+    }
+
+    return {{keyed_id, "o1"}, field_map};
   }
 
+  // --- Single-key GROUP BY ---
   auto* key_col = std::get_if<ColumnRef>(&group_by[0]);
   if (!key_col) {
     throw std::runtime_error("GROUP BY expression must be a column reference");

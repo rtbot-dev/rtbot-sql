@@ -48,7 +48,8 @@ const PrototypeDef* GraphBuilder::find_prototype(
 namespace {
 
 static const std::set<std::string> int_params = {
-    "index", "numPorts", "window", "window_size", "interval", "key_index"};
+    "index", "numPorts", "window", "window_size", "interval", "key_index",
+    "numInputPorts", "k", "score_index"};
 
 json operator_to_json(const OperatorDef& op) {
   json j;
@@ -56,10 +57,19 @@ json operator_to_json(const OperatorDef& op) {
   j["type"] = op.type;
 
   if (op.type == "Input" || op.type == "Output") {
-    j["portTypes"] = json::array({"vector_number"});
+    int num_ports = 1;
+    if (op.type == "Input") {
+      auto it = op.params.find("numInputPorts");
+      if (it != op.params.end()) num_ports = static_cast<int>(it->second);
+    }
+    json ports = json::array();
+    for (int i = 0; i < num_ports; ++i) ports.push_back("vector_number");
+    j["portTypes"] = ports;
   }
 
   for (const auto& [key, val] : op.params) {
+    // numInputPorts is consumed by portTypes generation, not emitted separately
+    if (op.type == "Input" && key == "numInputPorts") continue;
     if (int_params.count(key)) {
       j[key] = static_cast<int>(val);
     } else {
@@ -112,6 +122,13 @@ static OperatorDef operator_from_json(const json& j) {
   OperatorDef op;
   op.id   = j.at("id").get<std::string>();
   op.type = j.at("type").get<std::string>();
+
+  // Reconstruct numInputPorts for multi-port Input operators so that
+  // to_json() can regenerate the correct portTypes array.
+  if (op.type == "Input" && j.contains("portTypes")) {
+    int n = static_cast<int>(j["portTypes"].size());
+    if (n > 1) op.params["numInputPorts"] = static_cast<double>(n);
+  }
 
   static const std::set<std::string> skip = {
       "id", "type", "portTypes", "prototype"};
@@ -204,8 +221,11 @@ static PortSig output_sig(const OperatorDef& op) {
       t == "Floor" || t == "Ceil" || t == "Round" ||
       t == "Identity" || t == "TimeShift" || t == "Variable" ||
       t == "Replace" || t == "MovingKeyCount" ||
-      t == "MinTracker" || t == "MaxTracker")
+      t == "MinTracker" || t == "MaxTracker" || t == "WindowMinMax")
     return {DataType::NUMBER};
+
+  // TopK outputs VectorNumber (snapshot of K entries)
+  if (t == "TopK") return {DataType::VECTOR_NUMBER};
 
   // Operators that output Boolean
   if (t == "CompareGT" || t == "CompareLT" || t == "CompareGTE" ||
@@ -215,6 +235,15 @@ static PortSig output_sig(const OperatorDef& op) {
       t == "LogicalAnd" || t == "LogicalOr" || t == "LogicalXor" ||
       t == "LogicalNand" || t == "LogicalNor" || t == "LogicalImplication")
     return {DataType::BOOLEAN};
+
+  // KeyedVariable: output type depends on mode ("exists" → BOOLEAN, "lookup" → NUMBER)
+  if (t == "KeyedVariable") {
+    auto it = op.string_params.find("mode");
+    if (it != op.string_params.end() && it->second == "lookup") {
+      return {DataType::NUMBER};
+    }
+    return {DataType::BOOLEAN};  // "exists" mode (default)
+  }
 
   // Demultiplexer / Multiplexer: output type depends on portType param
   if (t == "Demultiplexer" || t == "Multiplexer") {
@@ -232,6 +261,15 @@ static PortSig output_sig(const OperatorDef& op) {
 
 static PortSig input_sig(const OperatorDef& op, const std::string& port) {
   const auto& t = op.type;
+
+  // KeyedVariable has non-standard port types:
+  //   i1 (data port): VectorNumber [key, value] changelog
+  //   c1 (control 0): Number — key to look up
+  //   c2 (control 1): Number — heartbeat
+  if (t == "KeyedVariable") {
+    if (port == "i1") return {DataType::VECTOR_NUMBER};
+    return {DataType::NUMBER};  // c1 and c2
+  }
 
   // Control ports always expect Boolean
   if (!port.empty() && port[0] == 'c')
@@ -259,8 +297,11 @@ static PortSig input_sig(const OperatorDef& op, const std::string& port) {
       t == "Floor" || t == "Ceil" || t == "Round" ||
       t == "Identity" || t == "TimeShift" || t == "Variable" ||
       t == "Replace" || t == "MovingKeyCount" ||
-      t == "MinTracker" || t == "MaxTracker")
+      t == "MinTracker" || t == "MaxTracker" || t == "WindowMinMax")
     return {DataType::NUMBER};
+
+  // TopK accepts VectorNumber on data port
+  if (t == "TopK") return {DataType::VECTOR_NUMBER};
 
   // Compare operators (scalar) accept Number
   if (t == "CompareGT" || t == "CompareLT" || t == "CompareGTE" ||

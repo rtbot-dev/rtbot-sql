@@ -254,10 +254,11 @@ TEST_F(FunctionTest, MovingSumProducesMovingSum) {
   EXPECT_EQ(ep.operator_id, ms.id);
 }
 
-// MOVING_MIN(price) → VectorExtract + MinTracker
-TEST_F(FunctionTest, MovingMinProducesMinTracker) {
+// MOVING_MIN(price, 10) → VectorExtract + WindowMinMax(min)
+TEST_F(FunctionTest, MovingMinProducesWindowMinMax) {
   std::vector<Expr> args;
   args.push_back(col("price"));
+  args.push_back(num(10));
   auto ep = compile_function("MOVING_MIN", args, input, scope, builder);
 
   ASSERT_EQ(builder.operators().size(), 2u);
@@ -265,7 +266,9 @@ TEST_F(FunctionTest, MovingMinProducesMinTracker) {
   auto& mn = builder.operators()[1];
   EXPECT_EQ(ext.type, "VectorExtract");
   EXPECT_EQ(ext.params.at("index"), 1.0);
-  EXPECT_EQ(mn.type, "MinTracker");
+  EXPECT_EQ(mn.type, "WindowMinMax");
+  EXPECT_EQ(mn.params.at("window_size"), 10.0);
+  EXPECT_EQ(mn.string_params.at("mode"), "min");
   EXPECT_EQ(ep.operator_id, mn.id);
   EXPECT_EQ(ep.port, "o1");
 
@@ -274,10 +277,11 @@ TEST_F(FunctionTest, MovingMinProducesMinTracker) {
   expect_conn(builder, ext.id, "o1", mn.id, "i1");
 }
 
-// MOVING_MAX(price) → VectorExtract + MaxTracker
-TEST_F(FunctionTest, MovingMaxProducesMaxTracker) {
+// MOVING_MAX(price, 5) → VectorExtract + WindowMinMax(max)
+TEST_F(FunctionTest, MovingMaxProducesWindowMinMax) {
   std::vector<Expr> args;
   args.push_back(col("price"));
+  args.push_back(num(5));
   auto ep = compile_function("MOVING_MAX", args, input, scope, builder);
 
   ASSERT_EQ(builder.operators().size(), 2u);
@@ -285,7 +289,9 @@ TEST_F(FunctionTest, MovingMaxProducesMaxTracker) {
   auto& mx = builder.operators()[1];
   EXPECT_EQ(ext.type, "VectorExtract");
   EXPECT_EQ(ext.params.at("index"), 1.0);
-  EXPECT_EQ(mx.type, "MaxTracker");
+  EXPECT_EQ(mx.type, "WindowMinMax");
+  EXPECT_EQ(mx.params.at("window_size"), 5.0);
+  EXPECT_EQ(mx.string_params.at("mode"), "max");
   EXPECT_EQ(ep.operator_id, mx.id);
   EXPECT_EQ(ep.port, "o1");
 
@@ -296,15 +302,13 @@ TEST_F(FunctionTest, MovingMaxProducesMaxTracker) {
 
 // MOVING_MIN/MOVING_MAX wrong argument count → error
 TEST_F(FunctionTest, MovingMinWrongArgCountThrows) {
-  std::vector<Expr> args;  // empty
+  std::vector<Expr> args;  // empty — missing both expr and window_size
   EXPECT_THROW(compile_function("MOVING_MIN", args, input, scope, builder),
                std::runtime_error);
 }
 
 TEST_F(FunctionTest, MovingMaxWrongArgCountThrows) {
-  std::vector<Expr> args;
-  args.push_back(col("price"));
-  args.push_back(num(5));  // extra arg
+  std::vector<Expr> args;  // empty — missing both expr and window_size
   EXPECT_THROW(compile_function("MOVING_MAX", args, input, scope, builder),
                std::runtime_error);
 }

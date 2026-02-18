@@ -187,5 +187,107 @@ TEST_F(GroupByTest, NonAggregatedColumnPassthrough) {
   EXPECT_EQ(field_map.at("ma_price"), 2);
 }
 
+// ---------------------------------------------------------------------------
+// Test 4: Composite GROUP BY (2 keys) produces Linear hash + KeyedPipeline
+// SELECT instrument_id, exchange_id, SUM(quantity) AS total
+// FROM trades GROUP BY instrument_id, exchange_id
+// ---------------------------------------------------------------------------
+
+TEST_F(GroupByTest, CompositeGroupByTwoKeys) {
+  // Use schema with 4 columns: instrument_id(0), price(1), quantity(2), account_id(3)
+  // Re-purpose account_id as exchange_id for this test.
+  std::vector<SelectItem> select_list;
+  select_list.push_back(item(col("instrument_id")));
+  select_list.push_back(item(col("account_id")));  // treated as exchange_id key
+  std::vector<Expr> sum_args;
+  sum_args.push_back(col("quantity"));
+  select_list.push_back(item(func_expr("SUM", std::move(sum_args)), "total"));
+
+  std::vector<Expr> group_by;
+  group_by.push_back(col("instrument_id"));
+  group_by.push_back(col("account_id"));
+
+  auto [ep, field_map] =
+      compile_group_by(select_list, group_by, std::nullopt, input, scope,
+                       builder, 4 /*num_input_cols*/);
+
+  // Outer graph must have: VectorExtract×4, Linear (hash), VectorCompose
+  // (augment), KeyedPipeline.
+  bool has_linear = false;
+  bool has_keyed = false;
+  bool has_augment_compose = false;
+  for (const auto& op : builder.operators()) {
+    if (op.type == "Linear") has_linear = true;
+    if (op.type == "KeyedPipeline") has_keyed = true;
+    if (op.type == "VectorCompose") has_augment_compose = true;
+  }
+  EXPECT_TRUE(has_linear) << "Expected Linear (hash) operator in outer graph";
+  EXPECT_TRUE(has_keyed) << "Expected KeyedPipeline in outer graph";
+  EXPECT_TRUE(has_augment_compose) << "Expected VectorCompose in outer graph";
+
+  // One prototype wrapping the per-key aggregation.
+  ASSERT_EQ(builder.prototypes().size(), 1u);
+
+  // Field map: both key columns + aggregate (KeyedPipeline prepends hash key
+  // at index 0, so prototype outputs start at 1).
+  EXPECT_EQ(field_map.at("instrument_id"), 1);
+  EXPECT_EQ(field_map.at("account_id"), 2);
+  EXPECT_EQ(field_map.at("total"), 3);
+}
+
+// ---------------------------------------------------------------------------
+// Test 5: MOVING_MIN(price, 10) and MOVING_MAX(price, 5) inside GROUP BY
+// ---------------------------------------------------------------------------
+
+TEST_F(GroupByTest, MovingMinMaxInsideGroupBy) {
+  std::vector<SelectItem> select_list;
+  select_list.push_back(item(col("instrument_id")));
+
+  std::vector<Expr> min_args;
+  min_args.push_back(col("price"));
+  min_args.push_back(num(10));
+  select_list.push_back(
+      item(func_expr("MOVING_MIN", std::move(min_args)), "min_price"));
+
+  std::vector<Expr> max_args;
+  max_args.push_back(col("price"));
+  max_args.push_back(num(5));
+  select_list.push_back(
+      item(func_expr("MOVING_MAX", std::move(max_args)), "max_price"));
+
+  std::vector<Expr> group_by;
+  group_by.push_back(col("instrument_id"));
+
+  auto [ep, field_map] =
+      compile_group_by(select_list, group_by, std::nullopt, input, scope,
+                       builder);
+
+  ASSERT_EQ(builder.prototypes().size(), 1u);
+  const auto& proto = builder.prototypes()[0];
+
+  bool has_wmin = false;
+  bool has_wmax = false;
+  for (const auto& op : proto.operators) {
+    if (op.type == "WindowMinMax") {
+      if (op.string_params.count("mode") &&
+          op.string_params.at("mode") == "min") {
+        has_wmin = true;
+        EXPECT_EQ(op.params.at("window_size"), 10.0);
+      }
+      if (op.string_params.count("mode") &&
+          op.string_params.at("mode") == "max") {
+        has_wmax = true;
+        EXPECT_EQ(op.params.at("window_size"), 5.0);
+      }
+    }
+  }
+  EXPECT_TRUE(has_wmin) << "Expected WindowMinMax(min) in prototype";
+  EXPECT_TRUE(has_wmax) << "Expected WindowMinMax(max) in prototype";
+
+  EXPECT_EQ(field_map.at("instrument_id"), 0);
+  EXPECT_EQ(field_map.at("min_price"), 1);
+  EXPECT_EQ(field_map.at("max_price"), 2);
+}
+
 }  // namespace
 }  // namespace rtbot_sql::compiler

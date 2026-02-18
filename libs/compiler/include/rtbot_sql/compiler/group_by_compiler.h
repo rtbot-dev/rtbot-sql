@@ -11,14 +11,16 @@
 namespace rtbot_sql::compiler {
 
 // Compile a GROUP BY query into a KeyedPipeline + Prototype structure.
-// The field map has the key column at index 0, followed by non-key items.
-// Single GROUP BY column only (composite keys deferred to Phase 4).
+// The field map has the key column(s) at the start, followed by non-key items.
+// num_input_cols: number of columns in the input stream (required for composite
+// GROUP BY to augment the vector with a hash key; 0 = single-key only mode).
 SelectResult compile_group_by(
     const std::vector<parser::ast::SelectItem>& select_list,
     const std::vector<parser::ast::Expr>& group_by,
     const std::optional<parser::ast::Expr>& having,
     const Endpoint& input_endpoint,
     const analyzer::Scope& scope,
-    GraphBuilder& builder);
+    GraphBuilder& builder,
+    int num_input_cols = 0);
 
 }  // namespace rtbot_sql::compiler

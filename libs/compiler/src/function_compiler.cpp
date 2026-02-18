@@ -210,34 +210,40 @@ Endpoint compile_function(const std::string& name,
     return {sd_id, "o1"};
   }
 
-  // --- All-time extremum trackers ---
+  // --- Windowed min/max ---
 
   if (upper == "MOVING_MIN") {
-    if (args.size() != 1) {
+    if (args.size() != 2) {
       throw std::runtime_error(
-          "MOVING_MIN requires 1 argument: (expr)");
+          "MOVING_MIN requires 2 arguments: (expr, window_size)");
     }
+    int window = require_constant_int("MOVING_MIN", args[1], "window_size");
     auto expr_ep = ensure_endpoint(
         compile_expression(args[0], input_endpoint, scope, builder, cache),
         input_endpoint, builder);
-    auto mn_id = builder.next_id("mintrk");
-    builder.add_operator(mn_id, "MinTracker");
-    builder.connect(expr_ep, {mn_id, "i1"});
-    return {mn_id, "o1"};
+    auto id = builder.next_id("wmin");
+    builder.add_operator(id, "WindowMinMax",
+                         {{"window_size", static_cast<double>(window)}},
+                         {{"mode", "min"}});
+    builder.connect(expr_ep, {id, "i1"});
+    return {id, "o1"};
   }
 
   if (upper == "MOVING_MAX") {
-    if (args.size() != 1) {
+    if (args.size() != 2) {
       throw std::runtime_error(
-          "MOVING_MAX requires 1 argument: (expr)");
+          "MOVING_MAX requires 2 arguments: (expr, window_size)");
     }
+    int window = require_constant_int("MOVING_MAX", args[1], "window_size");
     auto expr_ep = ensure_endpoint(
         compile_expression(args[0], input_endpoint, scope, builder, cache),
         input_endpoint, builder);
-    auto mx_id = builder.next_id("maxtrk");
-    builder.add_operator(mx_id, "MaxTracker");
-    builder.connect(expr_ep, {mx_id, "i1"});
-    return {mx_id, "o1"};
+    auto id = builder.next_id("wmax");
+    builder.add_operator(id, "WindowMinMax",
+                         {{"window_size", static_cast<double>(window)}},
+                         {{"mode", "max"}});
+    builder.connect(expr_ep, {id, "i1"});
+    return {id, "o1"};
   }
 
   // --- DSP functions (stubs — generate operators, detailed testing in Phase 2) ---
