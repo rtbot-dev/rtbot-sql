@@ -104,6 +104,59 @@ json prototype_to_json(const PrototypeDef& proto) {
   return j;
 }
 
+// ---------------------------------------------------------------------------
+// JSON → OperatorDef / PrototypeDef deserialization helpers
+// ---------------------------------------------------------------------------
+
+static OperatorDef operator_from_json(const json& j) {
+  OperatorDef op;
+  op.id   = j.at("id").get<std::string>();
+  op.type = j.at("type").get<std::string>();
+
+  static const std::set<std::string> skip = {
+      "id", "type", "portTypes", "prototype"};
+
+  for (auto it = j.begin(); it != j.end(); ++it) {
+    if (skip.count(it.key())) continue;
+    const auto& val = it.value();
+    if (val.is_number()) {
+      op.params[it.key()] = val.get<double>();
+    } else if (val.is_string()) {
+      op.string_params[it.key()] = val.get<std::string>();
+    } else if (val.is_array() && !val.empty()) {
+      if (val[0].is_number_integer()) {
+        std::vector<int> vs;
+        for (const auto& v : val) vs.push_back(v.get<int>());
+        op.int_array_params[it.key()] = vs;
+      } else {
+        std::vector<double> vs;
+        for (const auto& v : val) vs.push_back(v.get<double>());
+        op.double_array_params[it.key()] = vs;
+      }
+    }
+  }
+  return op;
+}
+
+static PrototypeDef prototype_from_json(const std::string& proto_id,
+                                        const json& j) {
+  PrototypeDef proto;
+  proto.id        = proto_id;
+  proto.entry_id  = j.at("entry").at("operator").get<std::string>();
+  proto.output_id = j.at("output").at("operator").get<std::string>();
+
+  for (const auto& op_j : j.at("operators")) {
+    proto.operators.push_back(operator_from_json(op_j));
+  }
+  for (const auto& c_j : j.at("connections")) {
+    proto.connections.push_back({c_j.at("from").get<std::string>(),
+                                 c_j.at("fromPort").get<std::string>(),
+                                 c_j.at("to").get<std::string>(),
+                                 c_j.at("toPort").get<std::string>()});
+  }
+  return proto;
+}
+
 }  // namespace
 
 // --- Port type system for validation ---
@@ -150,12 +203,15 @@ static PortSig output_sig(const OperatorDef& op) {
       t == "Log" || t == "Log10" || t == "Abs" || t == "Sign" ||
       t == "Floor" || t == "Ceil" || t == "Round" ||
       t == "Identity" || t == "TimeShift" || t == "Variable" ||
-      t == "Replace")
+      t == "Replace" || t == "MovingKeyCount" ||
+      t == "MinTracker" || t == "MaxTracker")
     return {DataType::NUMBER};
 
   // Operators that output Boolean
   if (t == "CompareGT" || t == "CompareLT" || t == "CompareGTE" ||
       t == "CompareLTE" || t == "CompareEQ" || t == "CompareNEQ" ||
+      t == "CompareSyncGT" || t == "CompareSyncLT" || t == "CompareSyncGTE" ||
+      t == "CompareSyncLTE" || t == "CompareSyncEQ" || t == "CompareSyncNEQ" ||
       t == "LogicalAnd" || t == "LogicalOr" || t == "LogicalXor" ||
       t == "LogicalNand" || t == "LogicalNor" || t == "LogicalImplication")
     return {DataType::BOOLEAN};
@@ -202,12 +258,18 @@ static PortSig input_sig(const OperatorDef& op, const std::string& port) {
       t == "Log" || t == "Log10" || t == "Abs" || t == "Sign" ||
       t == "Floor" || t == "Ceil" || t == "Round" ||
       t == "Identity" || t == "TimeShift" || t == "Variable" ||
-      t == "Replace")
+      t == "Replace" || t == "MovingKeyCount" ||
+      t == "MinTracker" || t == "MaxTracker")
     return {DataType::NUMBER};
 
-  // Compare operators accept Number
+  // Compare operators (scalar) accept Number
   if (t == "CompareGT" || t == "CompareLT" || t == "CompareGTE" ||
       t == "CompareLTE" || t == "CompareEQ" || t == "CompareNEQ")
+    return {DataType::NUMBER};
+
+  // CompareSync operators accept Number on both data ports
+  if (t == "CompareSyncGT" || t == "CompareSyncLT" || t == "CompareSyncGTE" ||
+      t == "CompareSyncLTE" || t == "CompareSyncEQ" || t == "CompareSyncNEQ")
     return {DataType::NUMBER};
 
   // Logical operators accept Boolean
@@ -267,15 +329,19 @@ static void validate_graph(const std::vector<OperatorDef>& ops,
     }
     else if (op.type == "VectorCompose") require_param(op, "numPorts");
     else if (op.type == "MovingAverage" || op.type == "MovingSum" ||
-             op.type == "StandardDeviation" || op.type == "PeakDetector")
+             op.type == "StandardDeviation" || op.type == "PeakDetector" ||
+             op.type == "MovingKeyCount")
       require_param(op, "window_size");
     else if (op.type == "CompareGT" || op.type == "CompareLT" ||
              op.type == "CompareGTE" || op.type == "CompareLTE" ||
              op.type == "CompareEQ" || op.type == "CompareNEQ")
       require_param(op, "value");
+    // CompareSyncEQ/NEQ tolerance is optional (defaults to 0) — no required params
     else if (op.type == "Division" || op.type == "Multiplication" ||
              op.type == "Addition" || op.type == "Subtraction" ||
-             op.type == "LogicalAnd" || op.type == "LogicalOr")
+             op.type == "LogicalAnd" || op.type == "LogicalOr" ||
+             op.type == "LogicalNand" || op.type == "LogicalNor" ||
+             op.type == "LogicalXor" || op.type == "LogicalImplication")
       require_param(op, "numPorts");
     else if (op.type == "Demultiplexer" || op.type == "Multiplexer")
       require_param(op, "numPorts");
@@ -384,6 +450,73 @@ std::string GraphBuilder::to_json() const {
   }
 
   return program.dump(2);
+}
+
+// static
+std::pair<GraphBuilder, Endpoint> GraphBuilder::from_json_for_augmentation(
+    const std::string& json_str) {
+  auto j = json::parse(json_str);
+
+  // Find the Output operator id and the endpoint that feeds it.
+  std::string output_id;
+  for (const auto& op_j : j.at("operators")) {
+    if (op_j.at("type").get<std::string>() == "Output") {
+      output_id = op_j.at("id").get<std::string>();
+    }
+  }
+  if (output_id.empty()) {
+    throw std::runtime_error("from_json_for_augmentation: no Output operator");
+  }
+
+  Endpoint pre_output;
+  for (const auto& c_j : j.at("connections")) {
+    if (c_j.at("to").get<std::string>() == output_id) {
+      pre_output = {c_j.at("from").get<std::string>(),
+                    c_j.at("fromPort").get<std::string>()};
+    }
+  }
+
+  GraphBuilder builder;
+  int max_counter = 0;
+
+  // Load all operators; handle KeyedPipeline prototype inline.
+  for (const auto& op_j : j.at("operators")) {
+    std::string id = op_j.at("id").get<std::string>();
+
+    // Infer a safe starting value for id_counter_ to avoid conflicts.
+    auto underscore = id.rfind('_');
+    if (underscore != std::string::npos) {
+      try {
+        int num = std::stoi(id.substr(underscore + 1));
+        if (num >= max_counter) max_counter = num + 1;
+      } catch (...) {}
+    }
+
+    OperatorDef op = operator_from_json(op_j);
+
+    if (op.type == "KeyedPipeline" && op_j.contains("prototype")) {
+      std::string proto_id = "proto_" + std::to_string(max_counter++);
+      op.string_params["prototype"] = proto_id;
+      builder.prototypes_.push_back(
+          prototype_from_json(proto_id, op_j.at("prototype")));
+    }
+
+    builder.operators_.push_back(std::move(op));
+  }
+
+  // Load all connections except the one going to Output.
+  for (const auto& c_j : j.at("connections")) {
+    if (c_j.at("to").get<std::string>() == output_id) continue;
+    builder.connections_.push_back({c_j.at("from").get<std::string>(),
+                                    c_j.at("fromPort").get<std::string>(),
+                                    c_j.at("to").get<std::string>(),
+                                    c_j.at("toPort").get<std::string>()});
+  }
+
+  // Leave a gap so new operators added during augmentation don't collide.
+  builder.id_counter_ = max_counter + 100;
+
+  return {std::move(builder), pre_output};
 }
 
 }  // namespace rtbot_sql::compiler

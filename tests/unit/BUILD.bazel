@@ -123,3 +123,13 @@ cc_test(
         "@com_google_googletest//:gtest_main",
     ],
 )
+
+cc_test(
+    name = "view_test",
+    srcs = ["view_test.cpp"],
+    deps = [
+        "//libs/api:api_compiler",
+        "//libs/compiler",
+        "@com_google_googletest//:gtest_main",
+    ],
+)

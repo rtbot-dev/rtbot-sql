@@ -184,6 +184,11 @@ CompilationResult handle_insert(const parser::ast::InsertStmt& stmt) {
   return result;
 }
 
+// Forward declaration — defined below after handle_create_mat_view.
+CompilationResult handle_select_from_view(const parser::ast::SelectStmt& stmt,
+                                          const ViewMeta& view_meta,
+                                          const CatalogSnapshot& catalog);
+
 // Handle SELECT.
 CompilationResult handle_select(const parser::ast::SelectStmt& stmt,
                                 const CatalogSnapshot& catalog) {
@@ -196,17 +201,30 @@ CompilationResult handle_select(const parser::ast::SelectStmt& stmt,
     result.select_tier = tier;
 
     if (tier == SelectTier::TIER3_EPHEMERAL) {
+      // SELECT FROM VIEW: augment the stored graph instead of compiling fresh.
+      auto entity_type = cat.resolve_entity(stmt.from_table);
+      if (entity_type == EntityType::VIEW) {
+        auto view_meta_opt = cat.lookup_view(stmt.from_table);
+        if (!view_meta_opt.has_value()) {
+          return make_error("VIEW '" + stmt.from_table +
+                            "' not found in catalog");
+        }
+        return handle_select_from_view(stmt, *view_meta_opt, catalog);
+      }
+
       auto compiled = compile_select_to_program(stmt, catalog);
       result.program_json = compiled.program_json;
       result.field_map = compiled.field_map;
       result.source_streams = compiled.source_streams;
       result.view_type = compiled.view_type;
       result.key_index = compiled.key_index;
+      result.select_limit = stmt.limit.value_or(-1);
     } else {
       // Tier 1/2: populate basic plan info
       auto plan = planner::plan_select(stmt, cat);
       result.field_map = plan.field_map;
       result.source_streams = {stmt.from_table};
+      result.select_limit = plan.limit;
     }
   } catch (const std::runtime_error& e) {
     return make_error(e.what());
@@ -235,8 +253,94 @@ CompilationResult handle_create_mat_view(
   return result;
 }
 
-// Handle DROP.
-CompilationResult handle_drop(const parser::ast::DropStmt& stmt) {
+// Handle SELECT FROM VIEW: load stored graph, augment, return Tier 3 result.
+CompilationResult handle_select_from_view(const parser::ast::SelectStmt& stmt,
+                                          const ViewMeta& view_meta,
+                                          const CatalogSnapshot& catalog) {
+  // SELECT FROM VIEW always requires LIMIT (no unbounded ephemeral replays).
+  if (!stmt.limit.has_value()) {
+    return make_error("SELECT FROM VIEW '" + stmt.from_table +
+                      "' requires LIMIT or WHERE time bounds");
+  }
+
+  // Load the VIEW's stored graph, dropping the Output connection.
+  auto [builder, pre_output_ep] =
+      compiler::GraphBuilder::from_json_for_augmentation(view_meta.program_json);
+
+  // Build scope from the VIEW's field_map (reusing the existing helper).
+  auto scope = build_scope(stmt.from_table, catalog);
+
+  compiler::Endpoint current = pre_output_ep;
+
+  // Apply additional WHERE clause (if any).
+  if (stmt.where_clause.has_value()) {
+    current =
+        compiler::compile_where(*stmt.where_clause, current, scope, builder);
+  }
+
+  // Apply SELECT projection (if not SELECT *).
+  compiler::FieldMap field_map = view_meta.field_map;
+  if (!stmt.select_list.empty()) {
+    auto [ep, fm] = compiler::compile_select_projection(
+        stmt.select_list, current, scope, builder);
+    current = ep;
+    field_map = fm;
+  }
+
+  // Re-wire Output operator.
+  std::string output_id;
+  for (const auto& op : builder.operators()) {
+    if (op.type == "Output") {
+      output_id = op.id;
+      break;
+    }
+  }
+  builder.connect(current, {output_id, "i1"});
+
+  // Validate the augmented graph.
+  auto validation_errors = builder.validate();
+  if (!validation_errors.empty()) {
+    CompilationResult err{};
+    for (const auto& msg : validation_errors) {
+      err.errors.push_back({"graph validation: " + msg, -1, -1});
+    }
+    return err;
+  }
+
+  CompilationResult result{};
+  result.statement_type = StatementType::SELECT;
+  result.select_tier = SelectTier::TIER3_EPHEMERAL;
+  result.program_json = builder.to_json();
+  result.field_map = field_map;
+  result.source_streams = view_meta.source_streams;
+  result.select_limit = *stmt.limit;
+  return result;
+}
+
+// Handle DROP with dependency checking.
+CompilationResult handle_drop(const parser::ast::DropStmt& stmt,
+                              const CatalogSnapshot& catalog) {
+  // Check whether any registered view depends on the entity being dropped.
+  std::vector<std::string> dependents;
+  for (const auto& [view_name, view_meta] : catalog.views) {
+    if (view_name == stmt.name) continue;
+    for (const auto& src : view_meta.source_streams) {
+      if (src == stmt.name) {
+        dependents.push_back(view_name);
+        break;
+      }
+    }
+  }
+  if (!dependents.empty()) {
+    std::string dep_list;
+    for (size_t i = 0; i < dependents.size(); ++i) {
+      if (i > 0) dep_list += ", ";
+      dep_list += dependents[i];
+    }
+    return make_error("Cannot drop '" + stmt.name +
+                      "': referenced by: " + dep_list);
+  }
+
   CompilationResult result{};
   result.statement_type = StatementType::DROP;
   result.drop_entity_name = stmt.name;
@@ -308,12 +412,87 @@ CompilationResult compile_sql(const std::string& sql,
       return handle_insert(*s);
     }
     if (auto* s = std::get_if<parser::ast::DropStmt>(&stmt)) {
-      return handle_drop(*s);
+      return handle_drop(*s, catalog);
     }
     return make_error("unsupported statement type");
   } catch (const std::exception& e) {
     return make_error(e.what());
   }
+}
+
+Tier2FilterResult apply_tier2_filter(
+    const std::string& sql, const CatalogSnapshot& catalog,
+    const std::vector<std::vector<double>>& input_rows, int limit) {
+  Tier2FilterResult out;
+
+  // Parse and identify the statement
+  auto json_result = pg_query_parse(sql.c_str());
+  if (json_result.error) {
+    pg_query_free_parse_result(json_result);
+    out.rows = input_rows;
+    return out;
+  }
+
+  parser::ast::Statement stmt;
+  try {
+    stmt = parser::convert_parse_tree(json_result.parse_tree);
+  } catch (...) {
+    pg_query_free_parse_result(json_result);
+    out.rows = input_rows;
+    return out;
+  }
+  pg_query_free_parse_result(json_result);
+
+  auto* select = std::get_if<parser::ast::SelectStmt>(&stmt);
+  if (!select) {
+    out.rows = input_rows;
+    return out;
+  }
+
+  // Build the execution plan
+  auto cat = snapshot_to_catalog(catalog);
+  planner::SelectPlan plan;
+  try {
+    plan = planner::plan_select(*select, cat);
+  } catch (...) {
+    out.rows = input_rows;
+    return out;
+  }
+
+  out.field_map = plan.field_map;
+
+  if (plan.tier != SelectTier::TIER2_SCAN) {
+    // Not Tier 2 — return rows unchanged
+    out.rows = input_rows;
+    return out;
+  }
+
+  int effective_limit = (limit > 0) ? limit : plan.limit;
+
+  for (const auto& row : input_rows) {
+    // Apply WHERE predicate
+    if (plan.where_predicate) {
+      if (!planner::evaluate_where(*plan.where_predicate, row)) {
+        continue;
+      }
+    }
+
+    // Apply SELECT projection
+    if (!plan.select_exprs.empty()) {
+      out.rows.push_back(
+          planner::evaluate_select(plan.select_exprs, row));
+    } else {
+      out.rows.push_back(row);
+    }
+
+    // Check limit
+    if (effective_limit > 0 &&
+        static_cast<int>(out.rows.size()) >= effective_limit) {
+      break;
+    }
+  }
+
+  return out;
 }
 
 }  // namespace rtbot_sql::api

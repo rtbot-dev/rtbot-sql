@@ -57,6 +57,14 @@ class GraphBuilder {
   // Returns empty vector if the graph is valid.
   std::vector<std::string> validate() const;
 
+  // Parse a stored program JSON back into a builder ready for augmentation.
+  // All operators (including Output) are loaded, but the connection TO the
+  // Output operator's input port is dropped.  Returns the endpoint that was
+  // connected to Output so callers can insert additional processing before
+  // re-wiring to Output themselves.
+  static std::pair<GraphBuilder, Endpoint> from_json_for_augmentation(
+      const std::string& json_str);
+
   // Accessors for testing
   const std::vector<OperatorDef>& operators() const { return operators_; }
   const std::vector<Connection>& connections() const { return connections_; }
