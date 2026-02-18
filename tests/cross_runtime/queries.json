@@ -1,0 +1,182 @@
+[
+  {
+    "name": "simple_select_limit",
+    "setup": [
+      "CREATE TABLE trades (instrument_id DOUBLE PRECISION, price DOUBLE PRECISION, quantity DOUBLE PRECISION)",
+      "INSERT INTO trades VALUES (1, 150.0, 200)",
+      "INSERT INTO trades VALUES (2, 80.0, 500)",
+      "INSERT INTO trades VALUES (1, 155.0, 100)"
+    ],
+    "query": "SELECT * FROM trades LIMIT 3",
+    "expected": {
+      "field_map": {"instrument_id": 0, "price": 1, "quantity": 2},
+      "rows": [
+        [1.0, 150.0, 200.0],
+        [2.0, 80.0, 500.0],
+        [1.0, 155.0, 100.0]
+      ]
+    }
+  },
+  {
+    "name": "select_limit_truncates",
+    "setup": [
+      "CREATE TABLE data (x DOUBLE PRECISION, y DOUBLE PRECISION)",
+      "INSERT INTO data VALUES (1, 10)",
+      "INSERT INTO data VALUES (2, 20)",
+      "INSERT INTO data VALUES (3, 30)",
+      "INSERT INTO data VALUES (4, 40)"
+    ],
+    "query": "SELECT * FROM data LIMIT 2",
+    "expected": {
+      "field_map": {"x": 0, "y": 1},
+      "rows": [
+        [3.0, 30.0],
+        [4.0, 40.0]
+      ]
+    }
+  },
+  {
+    "name": "where_filter",
+    "setup": [
+      "CREATE TABLE trades (instrument_id DOUBLE PRECISION, price DOUBLE PRECISION, quantity DOUBLE PRECISION)",
+      "INSERT INTO trades VALUES (1, 150.0, 200)",
+      "INSERT INTO trades VALUES (2, 25.0, 500)",
+      "INSERT INTO trades VALUES (1, 155.0, 100)"
+    ],
+    "query": "SELECT instrument_id, price FROM trades WHERE price > 100 LIMIT 10",
+    "expected": {
+      "field_map": {"instrument_id": 0, "price": 1},
+      "rows": [
+        [1.0, 150.0],
+        [1.0, 155.0]
+      ]
+    }
+  },
+  {
+    "name": "where_filter_and",
+    "setup": [
+      "CREATE TABLE trades (instrument_id DOUBLE PRECISION, price DOUBLE PRECISION, quantity DOUBLE PRECISION)",
+      "INSERT INTO trades VALUES (1, 150.0, 200)",
+      "INSERT INTO trades VALUES (2, 120.0, 500)",
+      "INSERT INTO trades VALUES (1, 155.0, 100)",
+      "INSERT INTO trades VALUES (3, 50.0, 800)"
+    ],
+    "query": "SELECT * FROM trades WHERE price > 100 AND quantity > 150 LIMIT 10",
+    "expected": {
+      "field_map": {"instrument_id": 0, "price": 1, "quantity": 2},
+      "rows": [
+        [1.0, 150.0, 200.0],
+        [2.0, 120.0, 500.0]
+      ]
+    }
+  },
+  {
+    "name": "expression_in_select",
+    "setup": [
+      "CREATE TABLE trades (instrument_id DOUBLE PRECISION, price DOUBLE PRECISION, quantity DOUBLE PRECISION)",
+      "INSERT INTO trades VALUES (1, 150.0, 200)",
+      "INSERT INTO trades VALUES (2, 80.0, 500)"
+    ],
+    "query": "SELECT instrument_id, price * quantity AS trade_value FROM trades LIMIT 2",
+    "expected": {
+      "field_map": {"instrument_id": 0, "trade_value": 1},
+      "rows": [
+        [1.0, 30000.0],
+        [2.0, 40000.0]
+      ]
+    }
+  },
+  {
+    "name": "group_by_sum_count",
+    "materialized_view": "CREATE MATERIALIZED VIEW stats AS SELECT instrument_id, SUM(quantity) AS total_qty, COUNT(*) AS cnt FROM trades GROUP BY instrument_id",
+    "setup": [
+      "CREATE TABLE trades (instrument_id DOUBLE PRECISION, price DOUBLE PRECISION, quantity DOUBLE PRECISION)",
+      "INSERT INTO trades VALUES (1, 150.0, 200)",
+      "INSERT INTO trades VALUES (2, 80.0, 500)",
+      "INSERT INTO trades VALUES (1, 155.0, 100)",
+      "INSERT INTO trades VALUES (2, 85.0, 400)"
+    ],
+    "query": "SELECT * FROM stats",
+    "expected": {
+      "field_map": {"instrument_id": 0, "total_qty": 1, "cnt": 2},
+      "rows_unordered": [
+        [1.0, 300.0, 2.0],
+        [2.0, 900.0, 2.0]
+      ]
+    }
+  },
+  {
+    "name": "group_by_avg",
+    "materialized_view": "CREATE MATERIALIZED VIEW avg_prices AS SELECT instrument_id, AVG(price) AS avg_price FROM trades GROUP BY instrument_id",
+    "setup": [
+      "CREATE TABLE trades (instrument_id DOUBLE PRECISION, price DOUBLE PRECISION)",
+      "INSERT INTO trades VALUES (1, 100.0)",
+      "INSERT INTO trades VALUES (1, 200.0)",
+      "INSERT INTO trades VALUES (2, 50.0)"
+    ],
+    "query": "SELECT * FROM avg_prices",
+    "expected": {
+      "field_map": {"instrument_id": 0, "avg_price": 1},
+      "rows_unordered": [
+        [1.0, 150.0],
+        [2.0, 50.0]
+      ]
+    }
+  },
+  {
+    "name": "insert_and_read_back",
+    "setup": [
+      "CREATE TABLE sensor (value DOUBLE PRECISION)",
+      "INSERT INTO sensor VALUES (42)"
+    ],
+    "query": "SELECT * FROM sensor LIMIT 1",
+    "expected": {
+      "field_map": {"value": 0},
+      "rows": [
+        [42.0]
+      ]
+    }
+  },
+  {
+    "name": "compilation_determinism",
+    "description": "Same SQL + catalog produces identical program JSON on all runtimes",
+    "compile_only": true,
+    "setup": [
+      "CREATE TABLE trades (instrument_id DOUBLE PRECISION, price DOUBLE PRECISION, quantity DOUBLE PRECISION)"
+    ],
+    "queries": [
+      "SELECT instrument_id, SUM(quantity) FROM trades GROUP BY instrument_id",
+      "SELECT * FROM trades WHERE price > 100 LIMIT 10",
+      "CREATE MATERIALIZED VIEW mv AS SELECT instrument_id, price FROM trades WHERE price > 100"
+    ]
+  },
+  {
+    "name": "error_unknown_column",
+    "setup": [
+      "CREATE TABLE trades (instrument_id DOUBLE PRECISION, price DOUBLE PRECISION)"
+    ],
+    "query": "SELECT foo FROM trades LIMIT 5",
+    "expected_error": true
+  },
+  {
+    "name": "error_unknown_table",
+    "setup": [],
+    "query": "SELECT * FROM nonexistent LIMIT 5",
+    "expected_error": true
+  },
+  {
+    "name": "error_syntax",
+    "setup": [],
+    "query": "SELECTT * FROMM x",
+    "expected_error": true
+  },
+  {
+    "name": "drop_stream",
+    "setup": [
+      "CREATE TABLE metrics (value DOUBLE PRECISION)",
+      "INSERT INTO metrics VALUES (10)"
+    ],
+    "drop": "DROP TABLE metrics",
+    "verify_dropped": "metrics"
+  }
+]
