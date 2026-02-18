@@ -133,3 +133,12 @@ cc_test(
         "@com_google_googletest//:gtest_main",
     ],
 )
+
+cc_test(
+    name = "alias_expander_test",
+    srcs = ["alias_expander_test.cpp"],
+    deps = [
+        "//libs/compiler",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
