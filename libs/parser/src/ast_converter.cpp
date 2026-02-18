@@ -207,6 +207,39 @@ ast::SelectStmt convert_select_stmt(const json& node) {
         stmt.from_alias =
             from["RangeVar"]["alias"]["aliasname"].get<std::string>();
       }
+    } else if (from.contains("JoinExpr")) {
+      // JOIN: left arg is the main table, right arg is the join target
+      const auto& join_expr = from["JoinExpr"];
+
+      // Left (main) table
+      if (join_expr.contains("larg") && join_expr["larg"].contains("RangeVar")) {
+        const auto& larg = join_expr["larg"]["RangeVar"];
+        stmt.from_table = larg["relname"].get<std::string>();
+        if (larg.contains("alias") && !larg["alias"].is_null()) {
+          stmt.from_alias = larg["alias"]["aliasname"].get<std::string>();
+        }
+      }
+
+      // Right (join target)
+      if (join_expr.contains("rarg") && join_expr["rarg"].contains("RangeVar")) {
+        ast::JoinClause jc;
+        const auto& rarg = join_expr["rarg"]["RangeVar"];
+        jc.table_name = rarg["relname"].get<std::string>();
+        if (rarg.contains("alias") && !rarg["alias"].is_null()) {
+          jc.table_alias = rarg["alias"]["aliasname"].get<std::string>();
+        }
+
+        std::string jointype = join_expr.value("jointype", "JOIN_INNER");
+        if (jointype == "JOIN_LEFT") jc.join_type = "LEFT";
+        else if (jointype == "JOIN_RIGHT") jc.join_type = "RIGHT";
+        else jc.join_type = "INNER";
+
+        if (join_expr.contains("quals") && !join_expr["quals"].is_null()) {
+          jc.on_condition = convert_expr(join_expr["quals"]);
+        }
+
+        stmt.join_clauses.push_back(std::move(jc));
+      }
     }
   }
 
@@ -225,6 +258,31 @@ ast::SelectStmt convert_select_stmt(const json& node) {
   // HAVING
   if (node.contains("havingClause") && !node["havingClause"].is_null()) {
     stmt.having = convert_expr(node["havingClause"]);
+  }
+
+  // ORDER BY
+  if (node.contains("sortClause") && !node["sortClause"].is_null()) {
+    for (const auto& sort_item : node["sortClause"]) {
+      if (sort_item.contains("SortBy")) {
+        const auto& sb = sort_item["SortBy"];
+        ast::OrderByItem item;
+        item.expr = convert_expr(sb["node"]);
+        // sortby_dir: pg_query uses "SORTBY_DESC" for descending.
+        // ("SORTBY_DIR_DESC" was a legacy format; "SORTBY_DESC" is current.)
+        bool descending = false;
+        if (sb.contains("sortby_dir")) {
+          const auto& dir = sb["sortby_dir"];
+          if (dir.is_string()) {
+            const auto& s = dir.get<std::string>();
+            descending = (s == "SORTBY_DESC" || s == "SORTBY_DIR_DESC");
+          } else if (dir.is_number()) {
+            descending = (dir.get<int>() == 2);  // 2 = SORTBY_DIR_DESC
+          }
+        }
+        item.descending = descending;
+        stmt.order_by.push_back(std::move(item));
+      }
+    }
   }
 
   // LIMIT
@@ -255,6 +313,17 @@ ast::CreateStreamStmt convert_create_stmt(const json& node) {
         if (elt["ColumnDef"].contains("typeName")) {
           const auto& names = elt["ColumnDef"]["typeName"]["names"];
           col.type_name = names.back()["String"]["sval"].get<std::string>();
+        }
+        // Check for PRIMARY KEY constraint
+        if (elt["ColumnDef"].contains("constraints")) {
+          for (const auto& constraint : elt["ColumnDef"]["constraints"]) {
+            if (constraint.contains("Constraint")) {
+              std::string contype = constraint["Constraint"].value("contype", "");
+              if (contype == "CONSTR_PRIMARY") {
+                col.primary_key = true;
+              }
+            }
+          }
         }
         stmt.columns.push_back(std::move(col));
       }
@@ -351,6 +420,17 @@ ast::DropStmt convert_drop_stmt(const json& node) {
   return stmt;
 }
 
+// --- DELETE ---
+
+ast::DeleteStmt convert_delete_stmt(const json& node) {
+  ast::DeleteStmt stmt;
+  stmt.table_name = node["relation"]["relname"].get<std::string>();
+  if (node.contains("whereClause") && !node["whereClause"].is_null()) {
+    stmt.where_clause = convert_expr(node["whereClause"]);
+  }
+  return stmt;
+}
+
 }  // namespace
 
 ast::Statement convert_parse_tree(const std::string& json_str) {
@@ -379,6 +459,9 @@ ast::Statement convert_parse_tree(const std::string& json_str) {
   }
   if (stmt_wrapper.contains("DropStmt")) {
     return convert_drop_stmt(stmt_wrapper["DropStmt"]);
+  }
+  if (stmt_wrapper.contains("DeleteStmt")) {
+    return convert_delete_stmt(stmt_wrapper["DeleteStmt"]);
   }
 
   throw std::runtime_error("unsupported statement type");

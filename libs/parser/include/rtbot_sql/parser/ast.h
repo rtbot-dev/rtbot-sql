@@ -101,19 +101,34 @@ struct SelectItem {
   std::optional<std::string> alias;
 };
 
+struct JoinClause {
+  std::string join_type;    // "INNER", "LEFT", "RIGHT"
+  std::string table_name;
+  std::string table_alias;
+  std::optional<Expr> on_condition;
+};
+
+struct OrderByItem {
+  Expr expr;
+  bool descending = false;  // ASC=false, DESC=true
+};
+
 struct SelectStmt {
   std::vector<SelectItem> select_list;
   std::string from_table;
   std::string from_alias;
+  std::vector<JoinClause> join_clauses;
   std::optional<Expr> where_clause;
   std::vector<Expr> group_by;
   std::optional<Expr> having;
+  std::vector<OrderByItem> order_by;
   std::optional<int> limit;
 };
 
 struct ColumnDefAST {
   std::string name;
   std::string type_name;
+  bool primary_key = false;
 };
 
 struct CreateStreamStmt {
@@ -139,11 +154,17 @@ struct DropStmt {
   bool if_exists;
 };
 
+struct DeleteStmt {
+  std::string table_name;
+  std::optional<Expr> where_clause;
+};
+
 using Statement = std::variant<
     SelectStmt,
     CreateStreamStmt,
     CreateViewStmt,
     InsertStmt,
-    DropStmt>;
+    DropStmt,
+    DeleteStmt>;
 
 }  // namespace rtbot_sql::parser::ast
