@@ -85,6 +85,20 @@ json result_to_json(const CompilationResult& r) {
       j["schema"] = cols;
       break;
     }
+    case StatementType::CREATE_TABLE: {
+      json cols = json::array();
+      for (const auto& col : r.table_schema.columns) {
+        cols.push_back({{"name", col.name}, {"index", col.index}});
+      }
+      j["schema"] = cols;
+      j["key_columns"] = r.table_schema.key_columns;
+      j["changelog_stream"] = r.table_schema.changelog_stream;
+      break;
+    }
+    case StatementType::DELETE: {
+      j["delete_payload"] = r.delete_payload;
+      break;
+    }
     case StatementType::INSERT: {
       j["values"] = r.insert_payload;
       break;

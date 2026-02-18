@@ -314,5 +314,71 @@ TEST(ViewTest, FromJsonForAugmentationRoundTrip) {
   EXPECT_NO_THROW(builder.to_json());
 }
 
+// ---------------------------------------------------------------------------
+// Test 9: ORDER BY + LIMIT compiles to TopK
+// ---------------------------------------------------------------------------
+
+TEST(ViewTest, OrderByLimitCompilesTopK) {
+  auto catalog = trades_catalog();
+
+  // SELECT instrument_id, quantity FROM trades ORDER BY quantity DESC LIMIT 3
+  auto result = compile_sql(
+      "SELECT instrument_id, quantity FROM trades "
+      "ORDER BY quantity DESC LIMIT 3",
+      catalog);
+
+  EXPECT_FALSE(result.has_errors()) << first_error(result);
+  EXPECT_EQ(result.statement_type, StatementType::SELECT);
+  EXPECT_EQ(result.select_tier, SelectTier::TIER3_EPHEMERAL);
+
+  // The compiled graph must contain a TopK operator.
+  EXPECT_TRUE(contains(result.program_json, "TopK"))
+      << "Expected TopK in program: " << result.program_json;
+
+  // Verify k=3 and descending=true are serialized correctly.
+  // The JSON is pretty-printed so field values have a space after the colon.
+  EXPECT_TRUE(contains(result.program_json, "\"k\": 3"))
+      << "program_json: " << result.program_json;
+  EXPECT_TRUE(contains(result.program_json, "\"descending\": \"true\""))
+      << "program_json: " << result.program_json;
+}
+
+// ---------------------------------------------------------------------------
+// Test 10: ORDER BY without LIMIT → error
+// ---------------------------------------------------------------------------
+
+TEST(ViewTest, OrderByWithoutLimitIsError) {
+  auto catalog = trades_catalog();
+
+  auto result = compile_sql(
+      "SELECT instrument_id, quantity FROM trades ORDER BY quantity DESC",
+      catalog);
+
+  EXPECT_TRUE(result.has_errors());
+  EXPECT_TRUE(contains(first_error(result), "LIMIT"))
+      << "Error was: " << first_error(result);
+}
+
+// ---------------------------------------------------------------------------
+// Test 11: ORDER BY ASC LIMIT compiles TopK with descending=false
+// ---------------------------------------------------------------------------
+
+TEST(ViewTest, OrderByAscLimitCompilesTopKAscending) {
+  auto catalog = trades_catalog();
+
+  auto result = compile_sql(
+      "SELECT instrument_id, quantity FROM trades "
+      "ORDER BY quantity ASC LIMIT 5",
+      catalog);
+
+  EXPECT_FALSE(result.has_errors()) << first_error(result);
+  EXPECT_TRUE(contains(result.program_json, "TopK"))
+      << "program_json: " << result.program_json;
+  EXPECT_TRUE(contains(result.program_json, "\"k\": 5"))
+      << "program_json: " << result.program_json;
+  EXPECT_TRUE(contains(result.program_json, "\"descending\": \"false\""))
+      << "program_json: " << result.program_json;
+}
+
 }  // namespace
 }  // namespace rtbot_sql::api

@@ -136,7 +136,8 @@ PYBIND11_MODULE(_rtbot_sql_native, m) {
       .value("INSERT", StatementType::INSERT)
       .value("SELECT", StatementType::SELECT)
       .value("SUBSCRIBE", StatementType::SUBSCRIBE)
-      .value("DROP", StatementType::DROP);
+      .value("DROP", StatementType::DROP)
+      .value("DELETE", StatementType::DELETE);
 
   py::enum_<SelectTier>(m, "SelectTier")
       .value("TIER1_READ", SelectTier::TIER1_READ)

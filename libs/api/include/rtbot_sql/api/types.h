@@ -20,6 +20,7 @@ enum class StatementType {
   SELECT,
   SUBSCRIBE,
   DROP,
+  DELETE,
 };
 
 enum class SelectTier { TIER1_READ, TIER2_SCAN, TIER3_EPHEMERAL };
@@ -61,6 +62,7 @@ struct TableSchema {
   std::string name;
   std::vector<ColumnDef> columns;
   std::string changelog_stream;
+  std::vector<int> key_columns;  // indices of primary key columns
 };
 
 struct CatalogSnapshot {
@@ -86,6 +88,8 @@ struct CompilationResult {
   int select_limit = -1;  // SQL LIMIT value (-1 = no limit)
   std::vector<double> insert_payload;
   StreamSchema stream_schema;
+  TableSchema table_schema;        // for CREATE_TABLE
+  std::vector<double> delete_payload;  // for DELETE: [key, NaN]
   std::string entity_name;
   std::string drop_entity_name;
   EntityType drop_entity_type;

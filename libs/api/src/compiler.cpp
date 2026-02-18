@@ -1,11 +1,14 @@
 #include "rtbot_sql/api/compiler.h"
 
 #include <algorithm>
+#include <cmath>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <variant>
 
 #include "rtbot_sql/analyzer/scope.h"
+#include "rtbot_sql/compiler/alias_expander.h"
 #include "rtbot_sql/compiler/graph_builder.h"
 #include "rtbot_sql/compiler/group_by_compiler.h"
 #include "rtbot_sql/compiler/select_compiler.h"
@@ -91,10 +94,61 @@ CompilationResult compile_select_to_program(
   builder.add_operator("input_0", "Input");
   compiler::Endpoint current{"input_0", "o1"};
 
-  // WHERE clause
+  // ── Alias expansion ──────────────────────────────────────────────────────
+  auto alias_map = compiler::build_alias_map(stmt.select_list);
+
+  // Produce expanded SELECT list for projection / GROUP BY compilers
+  std::vector<parser::ast::SelectItem> expanded_select;
+  expanded_select.reserve(stmt.select_list.size());
+  for (const auto& item : stmt.select_list) {
+    expanded_select.push_back(
+        {compiler::expand_aliases(item.expr, alias_map), item.alias});
+  }
+
+  // Expand WHERE; reject aggregate aliases (those belong in HAVING)
+  std::optional<parser::ast::Expr> expanded_where;
   if (stmt.where_clause.has_value()) {
-    current = compiler::compile_where(*stmt.where_clause, current, scope,
-                                      builder);
+    expanded_where = compiler::expand_aliases(*stmt.where_clause, alias_map);
+    if (compiler::expr_has_aggregate(*expanded_where)) {
+      return make_error(
+          "aggregate function not allowed in WHERE clause; use HAVING");
+    }
+  }
+
+  // Expand HAVING
+  std::optional<parser::ast::Expr> expanded_having;
+  if (stmt.having.has_value()) {
+    expanded_having = compiler::expand_aliases(*stmt.having, alias_map);
+  }
+  // ─────────────────────────────────────────────────────────────────────────
+
+  // WHERE clause
+  if (expanded_where.has_value()) {
+    current = compiler::compile_where(*expanded_where, current, scope, builder);
+  }
+
+  // Validate ORDER BY + LIMIT early
+  if (!stmt.order_by.empty() && !stmt.limit.has_value()) {
+    return make_error("ORDER BY requires LIMIT in streaming context");
+  }
+
+  // Compute input column count for composite GROUP BY support
+  int num_input_cols = 0;
+  {
+    auto it = catalog.streams.find(stmt.from_table);
+    if (it != catalog.streams.end()) {
+      num_input_cols = static_cast<int>(it->second.columns.size());
+    } else {
+      auto it_v = catalog.views.find(stmt.from_table);
+      if (it_v != catalog.views.end()) {
+        num_input_cols = static_cast<int>(it_v->second.field_map.size());
+      } else {
+        auto it_t = catalog.tables.find(stmt.from_table);
+        if (it_t != catalog.tables.end()) {
+          num_input_cols = static_cast<int>(it_t->second.columns.size());
+        }
+      }
+    }
   }
 
   compiler::FieldMap field_map;
@@ -102,16 +156,39 @@ CompilationResult compile_select_to_program(
   // GROUP BY
   if (!stmt.group_by.empty()) {
     auto [ep, fm] = compiler::compile_group_by(
-        stmt.select_list, stmt.group_by, stmt.having, current, scope, builder);
+        expanded_select, stmt.group_by, expanded_having, current, scope,
+        builder, num_input_cols);
     current = ep;
     field_map = fm;
   } else {
     // SELECT projection
     auto [ep, fm] =
-        compiler::compile_select_projection(stmt.select_list, current, scope,
+        compiler::compile_select_projection(expanded_select, current, scope,
                                             builder);
     current = ep;
     field_map = fm;
+  }
+
+  // ORDER BY + LIMIT → TopK
+  if (!stmt.order_by.empty() && stmt.limit.has_value()) {
+    const auto& ob = stmt.order_by[0];
+    int score_index = -1;
+    if (auto* col = std::get_if<parser::ast::ColumnRef>(&ob.expr)) {
+      auto it = field_map.find(col->column_name);
+      if (it != field_map.end()) {
+        score_index = it->second;
+      }
+    }
+    if (score_index < 0) {
+      return make_error("ORDER BY column not found in SELECT list");
+    }
+    auto topk_id = builder.next_id("topk");
+    builder.add_operator(topk_id, "TopK",
+                         {{"k", static_cast<double>(*stmt.limit)},
+                          {"score_index", static_cast<double>(score_index)}},
+                         {{"descending", ob.descending ? "true" : "false"}});
+    builder.connect(current, {topk_id, "i1"});
+    current = {topk_id, "o1"};
   }
 
   // Output operator
@@ -135,14 +212,18 @@ CompilationResult compile_select_to_program(
   // Determine view type
   if (!stmt.group_by.empty()) {
     result.view_type = ViewType::KEYED;
-    // key_index from the GROUP BY column
-    auto* key_col =
-        std::get_if<parser::ast::ColumnRef>(&stmt.group_by[0]);
-    if (key_col) {
-      auto binding = scope.resolve(*key_col);
-      if (auto* b = std::get_if<analyzer::ColumnBinding>(&binding)) {
-        result.key_index = b->index;
+    if (stmt.group_by.size() == 1) {
+      // Single key: key_index is the column index in the input stream
+      auto* key_col = std::get_if<parser::ast::ColumnRef>(&stmt.group_by[0]);
+      if (key_col) {
+        auto binding = scope.resolve(*key_col);
+        if (auto* b = std::get_if<analyzer::ColumnBinding>(&binding)) {
+          result.key_index = b->index;
+        }
       }
+    } else {
+      // Composite key: routing is via hash — no single key_index
+      result.key_index = -1;
     }
   } else {
     result.view_type = ViewType::SCALAR;
@@ -168,6 +249,37 @@ CompilationResult handle_create_stream(
   return result;
 }
 
+// Handle CREATE TABLE (with PRIMARY KEY).
+CompilationResult handle_create_table(const parser::ast::CreateStreamStmt& stmt) {
+  CompilationResult result{};
+  result.statement_type = StatementType::CREATE_TABLE;
+  result.entity_name = stmt.name;
+
+  std::vector<int> key_cols;
+  for (size_t i = 0; i < stmt.columns.size(); ++i) {
+    if (stmt.columns[i].primary_key) {
+      key_cols.push_back(static_cast<int>(i));
+    }
+  }
+  if (key_cols.empty()) {
+    return make_error("CREATE TABLE requires a PRIMARY KEY column");
+  }
+  if (key_cols.size() > 1) {
+    return make_error("Composite table keys are not yet supported");
+  }
+
+  TableSchema schema;
+  schema.name = stmt.name;
+  for (size_t i = 0; i < stmt.columns.size(); ++i) {
+    schema.columns.push_back({stmt.columns[i].name, static_cast<int>(i)});
+  }
+  schema.key_columns = key_cols;
+  schema.changelog_stream = "rtbot:sql:table:" + stmt.name + ":changelog";
+
+  result.table_schema = schema;
+  return result;
+}
+
 // Handle INSERT.
 CompilationResult handle_insert(const parser::ast::InsertStmt& stmt) {
   CompilationResult result{};
@@ -184,10 +296,53 @@ CompilationResult handle_insert(const parser::ast::InsertStmt& stmt) {
   return result;
 }
 
-// Forward declaration — defined below after handle_create_mat_view.
+// Handle DELETE FROM TABLE.
+CompilationResult handle_delete(const parser::ast::DeleteStmt& stmt,
+                                const CatalogSnapshot& catalog) {
+  CompilationResult result{};
+  result.statement_type = StatementType::DELETE;
+  result.entity_name = stmt.table_name;
+
+  auto it = catalog.tables.find(stmt.table_name);
+  if (it == catalog.tables.end()) {
+    return make_error("DELETE: unknown table: " + stmt.table_name);
+  }
+  const auto& table = it->second;
+  if (table.key_columns.empty()) {
+    return make_error("DELETE: table has no primary key: " + stmt.table_name);
+  }
+
+  if (!stmt.where_clause.has_value()) {
+    return make_error("DELETE requires WHERE key_column = value");
+  }
+
+  const auto* cmp =
+      std::get_if<std::unique_ptr<parser::ast::ComparisonExpr>>(&*stmt.where_clause);
+  if (!cmp || (*cmp)->op != "=") {
+    return make_error("DELETE WHERE must be key_column = constant");
+  }
+
+  const auto* key_const = std::get_if<parser::ast::Constant>(&(*cmp)->right);
+  if (!key_const) {
+    // Try left side (constant = col)
+    key_const = std::get_if<parser::ast::Constant>(&(*cmp)->left);
+  }
+  if (!key_const) {
+    return make_error("DELETE WHERE value must be a constant");
+  }
+
+  // Payload: [key, NaN] — NaN signals deletion to KeyedVariable
+  result.delete_payload = {key_const->value,
+                           std::numeric_limits<double>::quiet_NaN()};
+  return result;
+}
+
+// Forward declarations — defined below.
 CompilationResult handle_select_from_view(const parser::ast::SelectStmt& stmt,
                                           const ViewMeta& view_meta,
                                           const CatalogSnapshot& catalog);
+CompilationResult compile_joined_select(const parser::ast::SelectStmt& stmt,
+                                        const CatalogSnapshot& catalog);
 
 // Handle SELECT.
 CompilationResult handle_select(const parser::ast::SelectStmt& stmt,
@@ -196,6 +351,20 @@ CompilationResult handle_select(const parser::ast::SelectStmt& stmt,
   result.statement_type = StatementType::SELECT;
 
   try {
+    // JOINs always require full graph compilation (TIER3_EPHEMERAL)
+    if (!stmt.join_clauses.empty()) {
+      result.select_tier = SelectTier::TIER3_EPHEMERAL;
+      auto compiled = compile_joined_select(stmt, catalog);
+      if (compiled.has_errors()) return compiled;
+      result.program_json = compiled.program_json;
+      result.field_map = compiled.field_map;
+      result.source_streams = compiled.source_streams;
+      result.view_type = compiled.view_type;
+      result.key_index = compiled.key_index;
+      result.select_limit = stmt.limit.value_or(-1);
+      return result;
+    }
+
     auto cat = snapshot_to_catalog(catalog);
     auto tier = planner::classify_select(stmt, cat);
     result.select_tier = tier;
@@ -213,6 +382,7 @@ CompilationResult handle_select(const parser::ast::SelectStmt& stmt,
       }
 
       auto compiled = compile_select_to_program(stmt, catalog);
+      if (compiled.has_errors()) return compiled;
       result.program_json = compiled.program_json;
       result.field_map = compiled.field_map;
       result.source_streams = compiled.source_streams;
@@ -220,8 +390,22 @@ CompilationResult handle_select(const parser::ast::SelectStmt& stmt,
       result.key_index = compiled.key_index;
       result.select_limit = stmt.limit.value_or(-1);
     } else {
-      // Tier 1/2: populate basic plan info
-      auto plan = planner::plan_select(stmt, cat);
+      // Tier 1/2: expand aliases then plan
+      // (group_by, order_by, having, join_clauses are empty for Tier 1/2)
+      auto alias_map_t12 = compiler::build_alias_map(stmt.select_list);
+      parser::ast::SelectStmt expanded_stmt_t12;
+      expanded_stmt_t12.from_table = stmt.from_table;
+      expanded_stmt_t12.from_alias = stmt.from_alias;
+      expanded_stmt_t12.limit = stmt.limit;
+      for (const auto& item : stmt.select_list) {
+        expanded_stmt_t12.select_list.push_back(
+            {compiler::expand_aliases(item.expr, alias_map_t12), item.alias});
+      }
+      if (stmt.where_clause.has_value()) {
+        expanded_stmt_t12.where_clause =
+            compiler::expand_aliases(*stmt.where_clause, alias_map_t12);
+      }
+      auto plan = planner::plan_select(expanded_stmt_t12, cat);
       result.field_map = plan.field_map;
       result.source_streams = {stmt.from_table};
       result.select_limit = plan.limit;
@@ -233,6 +417,159 @@ CompilationResult handle_select(const parser::ast::SelectStmt& stmt,
   return result;
 }
 
+// Compile a Stream–TABLE JOIN using KeyedVariable pattern.
+//
+// Graph:
+//   Input(numInputPorts=2)
+//     o1 → VectorExtract(join_col) → kv.c1 (query)
+//     o1 → VectorExtract [fan-out]  → kv.c2 (heartbeat)
+//     o2 → kv.i1 (changelog data)
+//     o1 → dmux.i1 (full left tuple)
+//   kv.o1 → dmux.c1 (boolean gate)
+//   dmux.o1 → [WHERE] → [SELECT projection] → Output
+CompilationResult compile_table_join(
+    const parser::ast::SelectStmt& stmt,
+    const parser::ast::JoinClause& join,
+    const CatalogSnapshot& catalog) {
+  // Look up left stream
+  auto it_left = catalog.streams.find(stmt.from_table);
+  if (it_left == catalog.streams.end()) {
+    return make_error("JOIN: unknown left stream: " + stmt.from_table);
+  }
+  const StreamSchema& left_schema = it_left->second;
+
+  // Look up right table (verify existence)
+  if (catalog.tables.find(join.table_name) == catalog.tables.end()) {
+    return make_error("JOIN: unknown table: " + join.table_name);
+  }
+
+  // Resolve join column index from ON condition (left side)
+  int join_col_idx = -1;
+  if (join.on_condition.has_value()) {
+    const auto* cmp = std::get_if<std::unique_ptr<parser::ast::ComparisonExpr>>(
+        &*join.on_condition);
+    if (cmp && (*cmp)->op == "=") {
+      auto try_left_col = [&](const parser::ast::Expr& e) -> int {
+        const auto* ref = std::get_if<parser::ast::ColumnRef>(&e);
+        if (!ref) return -1;
+        // Belongs to left stream if alias matches (or empty/no alias)
+        if (!ref->table_alias.empty() &&
+            ref->table_alias != stmt.from_alias &&
+            ref->table_alias != stmt.from_table) {
+          return -1;
+        }
+        auto idx = left_schema.column_index(ref->column_name);
+        return idx.value_or(-1);
+      };
+      join_col_idx = try_left_col((*cmp)->left);
+      if (join_col_idx == -1) join_col_idx = try_left_col((*cmp)->right);
+    }
+  }
+  if (join_col_idx == -1) {
+    return make_error(
+        "JOIN: could not resolve join column from ON condition for table: " +
+        join.table_name);
+  }
+
+  // Build graph
+  compiler::GraphBuilder builder;
+
+  // Input with 2 ports: i1 = main stream, i2 = table changelog
+  builder.add_operator("input_0", "Input", {{"numInputPorts", 2.0}});
+
+  // VectorExtract for join column (shared for both c1 query and c2 heartbeat)
+  std::string ve_id = builder.next_id("ve");
+  builder.add_operator(ve_id, "VectorExtract",
+                       {{"index", static_cast<double>(join_col_idx)}});
+  builder.connect({"input_0", "o1"}, {ve_id, "i1"});
+
+  // KeyedVariable (exists mode: key presence check)
+  std::string kv_id = builder.next_id("kv");
+  builder.add_operator(kv_id, "KeyedVariable", {}, {{"mode", "exists"}});
+  builder.connect({ve_id, "o1"}, {kv_id, "c1"});  // query port
+  builder.connect({ve_id, "o1"}, {kv_id, "c2"});  // heartbeat port
+  builder.connect({"input_0", "o2"}, {kv_id, "i1"});  // changelog data
+
+  // Demultiplexer (boolean gate on the full left tuple)
+  std::string dmux_id = builder.next_id("dmux");
+  builder.add_operator(dmux_id, "Demultiplexer",
+                       {{"numPorts", 1.0}}, {{"portType", "vector_number"}});
+  builder.connect({"input_0", "o1"}, {dmux_id, "i1"});
+  builder.connect({kv_id, "o1"}, {dmux_id, "c1"});
+
+  // Build scope for subsequent WHERE / SELECT projection
+  analyzer::Scope scope;
+  scope.register_stream(stmt.from_table, left_schema,
+                        stmt.from_alias.empty() ? "" : stmt.from_alias);
+
+  compiler::Endpoint current{dmux_id, "o1"};
+
+  // Optional additional WHERE clause
+  if (stmt.where_clause.has_value()) {
+    current = compiler::compile_where(*stmt.where_clause, current, scope, builder);
+  }
+
+  // SELECT projection (or pass-through for SELECT *)
+  compiler::FieldMap field_map;
+  if (!stmt.select_list.empty()) {
+    auto [ep, fm] = compiler::compile_select_projection(
+        stmt.select_list, current, scope, builder);
+    current = ep;
+    field_map = fm;
+  } else {
+    for (const auto& col : left_schema.columns) {
+      field_map[col.name] = col.index;
+    }
+  }
+
+  // Output
+  builder.add_operator("output_0", "Output");
+  builder.connect(current, {"output_0", "i1"});
+
+  auto validation_errors = builder.validate();
+  if (!validation_errors.empty()) {
+    CompilationResult err{};
+    for (const auto& msg : validation_errors) {
+      err.errors.push_back({"graph validation: " + msg, -1, -1});
+    }
+    return err;
+  }
+
+  CompilationResult result{};
+  result.statement_type = StatementType::SELECT;
+  result.select_tier = SelectTier::TIER3_EPHEMERAL;
+  result.program_json = builder.to_json();
+  result.field_map = field_map;
+  // source_streams: left stream + table entity name (for dependency checking)
+  result.source_streams = {stmt.from_table, join.table_name};
+  result.view_type = ViewType::SCALAR;
+  result.key_index = -1;
+  return result;
+}
+
+// Dispatch JOIN compilation based on join target type.
+CompilationResult compile_joined_select(const parser::ast::SelectStmt& stmt,
+                                        const CatalogSnapshot& catalog) {
+  if (stmt.join_clauses.empty()) {
+    return compile_select_to_program(stmt, catalog);
+  }
+
+  const auto& join = stmt.join_clauses[0];
+
+  auto cat = snapshot_to_catalog(catalog);
+  auto entity_type = cat.resolve_entity(join.table_name);
+
+  if (!entity_type.has_value()) {
+    return make_error("JOIN: unknown join target: " + join.table_name);
+  }
+  if (*entity_type == EntityType::TABLE) {
+    return compile_table_join(stmt, join, catalog);
+  }
+
+  return make_error("JOIN: unsupported join target type for: " + join.table_name +
+                    " (only TABLE joins are supported)");
+}
+
 // Handle CREATE MATERIALIZED VIEW.
 CompilationResult handle_create_mat_view(
     const parser::ast::CreateViewStmt& stmt,
@@ -240,7 +577,13 @@ CompilationResult handle_create_mat_view(
   CompilationResult result{};
 
   try {
-    auto compiled = compile_select_to_program(stmt.query, catalog);
+    CompilationResult compiled;
+    if (!stmt.query.join_clauses.empty()) {
+      compiled = compile_joined_select(stmt.query, catalog);
+    } else {
+      compiled = compile_select_to_program(stmt.query, catalog);
+    }
+    if (compiled.has_errors()) return compiled;
     result = compiled;
     result.statement_type = stmt.materialized
                                 ? StatementType::CREATE_MATERIALIZED_VIEW
@@ -403,7 +746,12 @@ CompilationResult compile_sql(const std::string& sql,
       return handle_select(*s, catalog);
     }
     if (auto* s = std::get_if<parser::ast::CreateStreamStmt>(&stmt)) {
-      return handle_create_stream(*s);
+      // Route to CREATE TABLE if any column has PRIMARY KEY
+      bool has_pk = std::any_of(s->columns.begin(), s->columns.end(),
+                                [](const parser::ast::ColumnDefAST& c) {
+                                  return c.primary_key;
+                                });
+      return has_pk ? handle_create_table(*s) : handle_create_stream(*s);
     }
     if (auto* s = std::get_if<parser::ast::CreateViewStmt>(&stmt)) {
       return handle_create_mat_view(*s, catalog);
@@ -413,6 +761,9 @@ CompilationResult compile_sql(const std::string& sql,
     }
     if (auto* s = std::get_if<parser::ast::DropStmt>(&stmt)) {
       return handle_drop(*s, catalog);
+    }
+    if (auto* s = std::get_if<parser::ast::DeleteStmt>(&stmt)) {
+      return handle_delete(*s, catalog);
     }
     return make_error("unsupported statement type");
   } catch (const std::exception& e) {
@@ -464,6 +815,13 @@ Tier2FilterResult apply_tier2_filter(
   if (plan.tier != SelectTier::TIER2_SCAN) {
     // Not Tier 2 — return rows unchanged
     out.rows = input_rows;
+    return out;
+  }
+
+  // Cross-key aggregation: reduce all rows to a single output row.
+  if (plan.is_cross_key) {
+    out.rows.push_back(
+        planner::evaluate_cross_key_agg(plan.cross_key_aggs, input_rows));
     return out;
   }
 

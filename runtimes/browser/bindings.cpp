@@ -114,6 +114,8 @@ std::string statement_type_str(StatementType t) {
       return "SUBSCRIBE";
     case StatementType::DROP:
       return "DROP";
+    case StatementType::DELETE:
+      return "DELETE";
   }
   return "UNKNOWN";
 }
