@@ -1,4 +1,5 @@
 #include "rtbot_sql/planner/evaluator.h"
+#include "rtbot_sql/planner/planner.h"
 
 #include <algorithm>
 #include <cmath>
@@ -129,6 +130,51 @@ std::vector<double> evaluate_select(
   for (const auto& expr : select_exprs) {
     result.push_back(expr->evaluate(row));
   }
+  return result;
+}
+
+std::vector<double> evaluate_cross_key_agg(
+    const std::vector<CrossKeyAgg>& aggs,
+    const std::vector<std::vector<double>>& rows) {
+  std::vector<double> result;
+  result.reserve(aggs.size());
+
+  for (const auto& agg : aggs) {
+    double val = 0.0;
+
+    if (agg.func == "COUNT") {
+      val = static_cast<double>(rows.size());
+    } else if (agg.func == "SUM") {
+      for (const auto& row : rows) {
+        val += row[agg.col_index];
+      }
+    } else if (agg.func == "AVG") {
+      if (!rows.empty()) {
+        double sum = 0.0;
+        for (const auto& row : rows) {
+          sum += row[agg.col_index];
+        }
+        val = sum / static_cast<double>(rows.size());
+      }
+    } else if (agg.func == "MIN") {
+      if (!rows.empty()) {
+        val = rows[0][agg.col_index];
+        for (const auto& row : rows) {
+          val = std::min(val, row[agg.col_index]);
+        }
+      }
+    } else if (agg.func == "MAX") {
+      if (!rows.empty()) {
+        val = rows[0][agg.col_index];
+        for (const auto& row : rows) {
+          val = std::max(val, row[agg.col_index]);
+        }
+      }
+    }
+
+    result.push_back(val);
+  }
+
   return result;
 }
 

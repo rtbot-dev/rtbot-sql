@@ -139,5 +139,69 @@ TEST_F(PlanTest, Tier3Plan) {
   EXPECT_TRUE(plan.needs_compilation);
 }
 
+// Cross-key aggregation: SELECT SUM(total_volume) FROM instrument_stats
+TEST_F(PlanTest, CrossKeyAggSumPlan) {
+  SelectStmt stmt;
+  stmt.from_table = "instrument_stats";
+
+  std::vector<Expr> sum_args;
+  sum_args.push_back(col("total_volume"));
+  stmt.select_list.push_back(item(func_expr("SUM", std::move(sum_args)), "total"));
+
+  auto plan = plan_select(stmt, catalog);
+  EXPECT_EQ(plan.tier, SelectTier::TIER2_SCAN);
+  EXPECT_TRUE(plan.is_cross_key);
+  ASSERT_EQ(plan.cross_key_aggs.size(), 1u);
+  EXPECT_EQ(plan.cross_key_aggs[0].func, "SUM");
+  EXPECT_EQ(plan.cross_key_aggs[0].col_index, 1);  // total_volume at index 1
+  EXPECT_EQ(plan.cross_key_aggs[0].alias, "total");
+  EXPECT_EQ(plan.field_map.at("total"), 0);
+}
+
+// Cross-key aggregation: SELECT COUNT(*), AVG(total_volume) FROM instrument_stats
+TEST_F(PlanTest, CrossKeyAggMultipleFuncsPlan) {
+  SelectStmt stmt;
+  stmt.from_table = "instrument_stats";
+
+  stmt.select_list.push_back(
+      item(func_expr("COUNT", std::vector<Expr>{}), "cnt"));
+
+  std::vector<Expr> avg_args;
+  avg_args.push_back(col("total_volume"));
+  stmt.select_list.push_back(
+      item(func_expr("AVG", std::move(avg_args)), "avg_vol"));
+
+  auto plan = plan_select(stmt, catalog);
+  EXPECT_EQ(plan.tier, SelectTier::TIER2_SCAN);
+  EXPECT_TRUE(plan.is_cross_key);
+  ASSERT_EQ(plan.cross_key_aggs.size(), 2u);
+
+  EXPECT_EQ(plan.cross_key_aggs[0].func, "COUNT");
+  EXPECT_EQ(plan.cross_key_aggs[0].col_index, -1);
+  EXPECT_EQ(plan.cross_key_aggs[0].alias, "cnt");
+
+  EXPECT_EQ(plan.cross_key_aggs[1].func, "AVG");
+  EXPECT_EQ(plan.cross_key_aggs[1].col_index, 1);
+  EXPECT_EQ(plan.cross_key_aggs[1].alias, "avg_vol");
+
+  EXPECT_EQ(plan.field_map.at("cnt"), 0);
+  EXPECT_EQ(plan.field_map.at("avg_vol"), 1);
+}
+
+// Cross-key: mixing plain column with aggregate in SELECT → error
+TEST_F(PlanTest, CrossKeyAggMixedSelectThrows) {
+  SelectStmt stmt;
+  stmt.from_table = "instrument_stats";
+  // A plain column alongside an aggregate triggers is_keyed_view_agg but the
+  // non-aggregate item is rejected.
+  stmt.select_list.push_back(item(col("instrument_id")));  // plain — not an agg
+
+  std::vector<Expr> sum_args;
+  sum_args.push_back(col("total_volume"));
+  stmt.select_list.push_back(item(func_expr("SUM", std::move(sum_args)), "total"));
+
+  EXPECT_THROW(plan_select(stmt, catalog), std::runtime_error);
+}
+
 }  // namespace
 }  // namespace rtbot_sql::planner

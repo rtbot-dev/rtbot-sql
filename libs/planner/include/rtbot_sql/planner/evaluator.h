@@ -151,4 +151,13 @@ std::vector<double> evaluate_select(
     const std::vector<std::unique_ptr<CompiledExpr>>& select_exprs,
     const std::vector<double>& row);
 
+// Forward declaration for cross-key aggregation (defined in planner.h context).
+struct CrossKeyAgg;
+
+// Evaluate cross-key aggregates over all rows, returning a single output row.
+// Each CrossKeyAgg describes one aggregate (SUM/COUNT/AVG/MIN/MAX + col_index).
+std::vector<double> evaluate_cross_key_agg(
+    const std::vector<CrossKeyAgg>& aggs,
+    const std::vector<std::vector<double>>& rows);
+
 }  // namespace rtbot_sql::planner

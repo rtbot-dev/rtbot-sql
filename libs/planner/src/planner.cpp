@@ -119,26 +119,86 @@ SelectPlan plan_select(const parser::ast::SelectStmt& stmt,
       plan.scan_stream = stmt.from_table;
       auto schema = resolve_schema(stmt.from_table, catalog);
 
-      // Compile WHERE predicate
-      if (stmt.where_clause.has_value()) {
-        plan.where_predicate =
-            compile_for_eval(*stmt.where_clause, schema);
-      }
+      // Check if this is a cross-key aggregation over a keyed materialized view.
+      auto view_meta = catalog.lookup_view(stmt.from_table);
+      bool is_keyed_view_agg = view_meta.has_value() &&
+                               view_meta->view_type == ViewType::KEYED &&
+                               !stmt.select_list.empty();
 
-      // Compile SELECT expressions
-      if (stmt.select_list.empty()) {
-        // SELECT * — identity, no compiled exprs needed
-        for (const auto& col : schema.columns) {
-          plan.field_map[col.name] = col.index;
-        }
-      } else {
+      if (is_keyed_view_agg) {
+        // Validate all SELECT items are aggregate functions.
+        plan.is_cross_key = true;
         for (size_t i = 0; i < stmt.select_list.size(); ++i) {
           const auto& item = stmt.select_list[i];
-          plan.select_exprs.push_back(
-              compile_for_eval(item.expr, schema));
-          std::string alias =
-              item.alias.value_or(default_alias(item.expr, static_cast<int>(i)));
-          plan.field_map[alias] = static_cast<int>(i);
+          auto* func_ptr =
+              std::get_if<std::unique_ptr<parser::ast::FuncCall>>(&item.expr);
+          if (!func_ptr) {
+            throw std::runtime_error(
+                "cross-key aggregation: SELECT items must be aggregate functions");
+          }
+          const auto& func = **func_ptr;
+          std::string upper = func.name;
+          std::transform(upper.begin(), upper.end(), upper.begin(), ::toupper);
+
+          if (upper != "SUM" && upper != "COUNT" && upper != "AVG" &&
+              upper != "MIN" && upper != "MAX") {
+            throw std::runtime_error(
+                "cross-key aggregation: unsupported function " + func.name +
+                " (use SUM, COUNT, AVG, MIN, MAX)");
+          }
+
+          CrossKeyAgg agg;
+          agg.func = upper;
+          agg.alias = item.alias.value_or(
+              default_alias(item.expr, static_cast<int>(i)));
+
+          // Resolve column index for the aggregate argument.
+          if (upper == "COUNT") {
+            agg.col_index = -1;  // COUNT(*) — no column needed
+          } else {
+            if (func.args.size() != 1) {
+              throw std::runtime_error(upper + " requires exactly 1 argument");
+            }
+            auto* col_ref =
+                std::get_if<parser::ast::ColumnRef>(&func.args[0]);
+            if (!col_ref) {
+              throw std::runtime_error(
+                  upper + ": argument must be a column reference");
+            }
+            auto idx = schema.column_index(col_ref->column_name);
+            if (!idx.has_value()) {
+              throw std::runtime_error("unknown column: " + col_ref->column_name);
+            }
+            agg.col_index = *idx;
+          }
+
+          plan.field_map[agg.alias] = static_cast<int>(i);
+          plan.cross_key_aggs.push_back(std::move(agg));
+        }
+      } else {
+        // Standard row scan.
+
+        // Compile WHERE predicate
+        if (stmt.where_clause.has_value()) {
+          plan.where_predicate =
+              compile_for_eval(*stmt.where_clause, schema);
+        }
+
+        // Compile SELECT expressions
+        if (stmt.select_list.empty()) {
+          // SELECT * — identity, no compiled exprs needed
+          for (const auto& col : schema.columns) {
+            plan.field_map[col.name] = col.index;
+          }
+        } else {
+          for (size_t i = 0; i < stmt.select_list.size(); ++i) {
+            const auto& item = stmt.select_list[i];
+            plan.select_exprs.push_back(
+                compile_for_eval(item.expr, schema));
+            std::string alias =
+                item.alias.value_or(default_alias(item.expr, static_cast<int>(i)));
+            plan.field_map[alias] = static_cast<int>(i);
+          }
         }
       }
 

@@ -1,4 +1,5 @@
 #include "rtbot_sql/planner/evaluator.h"
+#include "rtbot_sql/planner/planner.h"
 
 #include <gtest/gtest.h>
 
@@ -125,6 +126,123 @@ TEST_F(EvaluatorTest, EvaluateSelect) {
   ASSERT_EQ(result.size(), 2u);
   EXPECT_DOUBLE_EQ(result[0], 150.0);
   EXPECT_DOUBLE_EQ(result[1], 30000.0);
+}
+
+// ---------------------------------------------------------------------------
+// evaluate_cross_key_agg tests
+// ---------------------------------------------------------------------------
+
+// Rows: each row is [instrument_id, price, quantity]
+// instrument_id values: 1, 2, 3
+// price values: 100, 200, 150
+// quantity values: 10, 20, 30
+
+class CrossKeyAggTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    rows = {
+        {1.0, 100.0, 10.0},
+        {2.0, 200.0, 20.0},
+        {3.0, 150.0, 30.0},
+    };
+  }
+  std::vector<std::vector<double>> rows;
+};
+
+TEST_F(CrossKeyAggTest, Count) {
+  CrossKeyAgg agg;
+  agg.func = "COUNT";
+  agg.col_index = -1;
+  agg.alias = "cnt";
+
+  auto result = evaluate_cross_key_agg({agg}, rows);
+  ASSERT_EQ(result.size(), 1u);
+  EXPECT_DOUBLE_EQ(result[0], 3.0);
+}
+
+TEST_F(CrossKeyAggTest, Sum) {
+  CrossKeyAgg agg;
+  agg.func = "SUM";
+  agg.col_index = 1;  // price
+  agg.alias = "total_price";
+
+  auto result = evaluate_cross_key_agg({agg}, rows);
+  ASSERT_EQ(result.size(), 1u);
+  EXPECT_DOUBLE_EQ(result[0], 450.0);  // 100 + 200 + 150
+}
+
+TEST_F(CrossKeyAggTest, Avg) {
+  CrossKeyAgg agg;
+  agg.func = "AVG";
+  agg.col_index = 2;  // quantity
+  agg.alias = "avg_qty";
+
+  auto result = evaluate_cross_key_agg({agg}, rows);
+  ASSERT_EQ(result.size(), 1u);
+  EXPECT_DOUBLE_EQ(result[0], 20.0);  // (10 + 20 + 30) / 3
+}
+
+TEST_F(CrossKeyAggTest, Min) {
+  CrossKeyAgg agg;
+  agg.func = "MIN";
+  agg.col_index = 1;  // price
+  agg.alias = "min_price";
+
+  auto result = evaluate_cross_key_agg({agg}, rows);
+  ASSERT_EQ(result.size(), 1u);
+  EXPECT_DOUBLE_EQ(result[0], 100.0);
+}
+
+TEST_F(CrossKeyAggTest, Max) {
+  CrossKeyAgg agg;
+  agg.func = "MAX";
+  agg.col_index = 1;  // price
+  agg.alias = "max_price";
+
+  auto result = evaluate_cross_key_agg({agg}, rows);
+  ASSERT_EQ(result.size(), 1u);
+  EXPECT_DOUBLE_EQ(result[0], 200.0);
+}
+
+TEST_F(CrossKeyAggTest, MultipleAggs) {
+  CrossKeyAgg sum_agg;
+  sum_agg.func = "SUM";
+  sum_agg.col_index = 2;  // quantity
+  sum_agg.alias = "total_qty";
+
+  CrossKeyAgg cnt_agg;
+  cnt_agg.func = "COUNT";
+  cnt_agg.col_index = -1;
+  cnt_agg.alias = "cnt";
+
+  CrossKeyAgg avg_agg;
+  avg_agg.func = "AVG";
+  avg_agg.col_index = 1;  // price
+  avg_agg.alias = "avg_price";
+
+  auto result = evaluate_cross_key_agg({sum_agg, cnt_agg, avg_agg}, rows);
+  ASSERT_EQ(result.size(), 3u);
+  EXPECT_DOUBLE_EQ(result[0], 60.0);   // SUM(quantity)
+  EXPECT_DOUBLE_EQ(result[1], 3.0);    // COUNT(*)
+  EXPECT_DOUBLE_EQ(result[2], 150.0);  // AVG(price)
+}
+
+TEST_F(CrossKeyAggTest, EmptyRows) {
+  CrossKeyAgg sum_agg;
+  sum_agg.func = "SUM";
+  sum_agg.col_index = 1;
+  sum_agg.alias = "s";
+
+  CrossKeyAgg cnt_agg;
+  cnt_agg.func = "COUNT";
+  cnt_agg.col_index = -1;
+  cnt_agg.alias = "c";
+
+  std::vector<std::vector<double>> empty_rows;
+  auto result = evaluate_cross_key_agg({sum_agg, cnt_agg}, empty_rows);
+  ASSERT_EQ(result.size(), 2u);
+  EXPECT_DOUBLE_EQ(result[0], 0.0);  // SUM of empty = 0
+  EXPECT_DOUBLE_EQ(result[1], 0.0);  // COUNT of empty = 0
 }
 
 }  // namespace

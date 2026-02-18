@@ -171,11 +171,11 @@ SelectTier classify_select(const parser::ast::SelectStmt& stmt,
     return SelectTier::TIER3_EPHEMERAL;
   }
 
-  // STREAM: stateful queries (GROUP BY, aggregates, windowed) are Tier 3
-  // and don't need LIMIT — they create ephemeral pipelines.
+  // STREAM: stateful queries (GROUP BY, aggregates, windowed, ORDER BY) are
+  // Tier 3 and don't need LIMIT — they create ephemeral pipelines.
   if (type == EntityType::STREAM) {
     if (has_aggregates(stmt) || has_windowed_functions(stmt) ||
-        has_group_by(stmt)) {
+        has_group_by(stmt) || !stmt.order_by.empty()) {
       return SelectTier::TIER3_EPHEMERAL;
     }
     if (!stmt.limit.has_value()) {
