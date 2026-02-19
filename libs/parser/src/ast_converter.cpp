@@ -138,6 +138,24 @@ ast::Expr convert_bool_expr(const json& node) {
   return result;
 }
 
+ast::Expr convert_a_array_expr(const json& node) {
+  ast::ArrayLiteral arr;
+  if (node.contains("elements")) {
+    for (const auto& elem : node["elements"]) {
+      if (!elem.contains("A_Const")) {
+        throw std::runtime_error("ARRAY elements must be numeric constants");
+      }
+      auto expr = convert_a_const(elem["A_Const"]);
+      if (auto* c = std::get_if<ast::Constant>(&expr)) {
+        arr.values.push_back(c->value);
+      } else {
+        throw std::runtime_error("ARRAY elements must be numeric constants");
+      }
+    }
+  }
+  return arr;
+}
+
 ast::Expr convert_case_expr(const json& node) {
   auto e = std::make_unique<ast::CaseExpr>();
 
@@ -163,6 +181,7 @@ ast::Expr convert_expr(const json& node) {
   if (node.contains("FuncCall")) return convert_func_call(node["FuncCall"]);
   if (node.contains("BoolExpr")) return convert_bool_expr(node["BoolExpr"]);
   if (node.contains("CaseExpr")) return convert_case_expr(node["CaseExpr"]);
+  if (node.contains("A_ArrayExpr")) return convert_a_array_expr(node["A_ArrayExpr"]);
 
   throw std::runtime_error("unsupported expression node type");
 }
