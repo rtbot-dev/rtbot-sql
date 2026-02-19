@@ -67,6 +67,7 @@ TableSchema table_schema_from_json(const json& j) {
     t.columns.push_back(column_def_from_json(col));
   }
   t.changelog_stream = j.value("changelog_stream", "");
+  t.key_columns = j.value("key_columns", std::vector<int>{});
   return t;
 }
 
@@ -190,6 +191,18 @@ json result_to_json(const CompilationResult& r) {
   }
   schema["columns"] = cols;
   j["stream_schema"] = schema;
+
+  // table_schema
+  json tschema;
+  tschema["name"] = r.table_schema.name;
+  json tcols = json::array();
+  for (const auto& c : r.table_schema.columns) {
+    tcols.push_back({{"name", c.name}, {"index", c.index}});
+  }
+  tschema["columns"] = tcols;
+  tschema["changelog_stream"] = r.table_schema.changelog_stream;
+  tschema["key_columns"] = r.table_schema.key_columns;
+  j["table_schema"] = tschema;
 
   // drop info
   j["drop_entity_name"] = r.drop_entity_name;

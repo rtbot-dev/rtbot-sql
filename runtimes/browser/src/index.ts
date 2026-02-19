@@ -73,6 +73,10 @@ export class RtBotSql {
         });
         break;
 
+      case "CREATE_TABLE":
+        this.catalog.registerTable(result.entity_name, result.table_schema);
+        break;
+
       case "INSERT": {
         const msg: Message = {
           timestamp: Date.now(),

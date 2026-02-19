@@ -43,6 +43,7 @@ export interface TableSchema {
   name: string;
   columns: ColumnDef[];
   changelog_stream: string;
+  key_columns: number[];
 }
 
 export interface CatalogSnapshot {
@@ -68,6 +69,7 @@ export interface CompilationResult {
   select_tier: SelectTier;
   insert_payload: number[];
   stream_schema: StreamSchema;
+  table_schema: TableSchema;
   drop_entity_name: string;
   drop_entity_type: EntityType;
   errors: CompilationError[];
