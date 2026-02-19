@@ -206,8 +206,32 @@ Endpoint compile_having_predicate(const parser::ast::Expr& expr,
       return {id, "o1"};
     }
 
-    throw std::runtime_error(
-        "comparison of two stream expressions not yet supported in HAVING");
+    // Both sides are stream endpoints: synchronise by timestamp and compare.
+    // This is the pattern used by Bollinger-band style HAVING clauses, e.g.:
+    //   HAVING price > MOVING_AVERAGE(price, 20) + 2 * STDDEV(price, 20)
+    //   HAVING fuel_level < MOVING_AVERAGE(fuel_level, 20) - 10.0
+    // Inside the KeyedPipeline prototype every operator emits once per input
+    // message, so the two endpoints are always timestamp-aligned and
+    // CompareSync* produces the correct boolean gate.
+    {
+      auto& left_ep = std::get<Endpoint>(left);
+      auto& right_ep = std::get<Endpoint>(right);
+      std::string rtbot_type;
+      if (cmp.op == ">") rtbot_type = "CompareSyncGT";
+      else if (cmp.op == "<") rtbot_type = "CompareSyncLT";
+      else if (cmp.op == ">=") rtbot_type = "CompareSyncGTE";
+      else if (cmp.op == "<=") rtbot_type = "CompareSyncLTE";
+      else if (cmp.op == "=") rtbot_type = "CompareSyncEQ";
+      else if (cmp.op == "!=") rtbot_type = "CompareSyncNEQ";
+      else
+        throw std::runtime_error("unknown comparison operator in HAVING: " +
+                                 cmp.op);
+      auto id = builder.next_id("cmp_sync");
+      builder.add_operator(id, rtbot_type);
+      builder.connect(left_ep, {id, "i1"});
+      builder.connect(right_ep, {id, "i2"});
+      return {id, "o1"};
+    }
   }
 
   // LogicalExpr: AND/OR

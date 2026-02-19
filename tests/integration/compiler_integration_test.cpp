@@ -626,5 +626,74 @@ TEST_F(CompilerIntegrationTest, ErrorParseFailure) {
   EXPECT_TRUE(r.has_errors());
 }
 
+// --- HAVING stream-vs-stream comparisons (Bollinger-band pattern) ---
+
+// Bollinger upper-band alert: HAVING price > MA + 2*STDDEV
+// Both sides of > compile to stream endpoints inside the prototype.
+// Must compile successfully and emit no errors.
+TEST_F(CompilerIntegrationTest, HavingBollingerUpperBand) {
+  auto r = compile_sql(
+      "CREATE MATERIALIZED VIEW bollinger_alerts AS "
+      "  SELECT instrument_id, price,"
+      "         MOVING_AVERAGE(price, 20) AS mid_band,"
+      "         MOVING_AVERAGE(price, 20) + 2 * STDDEV(price, 20) AS upper_band"
+      "  FROM trades"
+      "  GROUP BY instrument_id"
+      "  HAVING price > MOVING_AVERAGE(price, 20) + 2 * STDDEV(price, 20)",
+      catalog);
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  EXPECT_EQ(r.entity_name, "bollinger_alerts");
+}
+
+// Bollinger two-sided alert (OR): price outside either band
+TEST_F(CompilerIntegrationTest, HavingBollingerTwoSidedAlert) {
+  auto r = compile_sql(
+      "CREATE MATERIALIZED VIEW price_alerts AS "
+      "  SELECT instrument_id, price"
+      "  FROM trades"
+      "  GROUP BY instrument_id"
+      "  HAVING price > MOVING_AVERAGE(price, 20) + 2 * STDDEV(price, 20)"
+      "      OR price < MOVING_AVERAGE(price, 20) - 2 * STDDEV(price, 20)",
+      catalog);
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  EXPECT_EQ(r.entity_name, "price_alerts");
+}
+
+// Fuel-leak alert: HAVING col < aggregate - constant
+// col is a stream endpoint; (aggregate - constant) is also a stream endpoint
+// (aggregate endpoint piped through an Add(-constant) scalar operator).
+TEST_F(CompilerIntegrationTest, HavingColLessThanAggregateMinusConstant) {
+  StreamSchema vs{"vehicle_telemetry",
+                  {{"vehicle_id", 0}, {"fuel_level", 1}, {"speed_kmh", 2}}};
+  catalog.streams["vehicle_telemetry"] = vs;
+
+  auto r = compile_sql(
+      "CREATE MATERIALIZED VIEW fuel_alerts AS "
+      "  SELECT vehicle_id, fuel_level,"
+      "         MOVING_AVERAGE(fuel_level, 20) AS baseline_fuel"
+      "  FROM vehicle_telemetry"
+      "  GROUP BY vehicle_id"
+      "  HAVING fuel_level < MOVING_AVERAGE(fuel_level, 20) - 10.0",
+      catalog);
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  EXPECT_EQ(r.entity_name, "fuel_alerts");
+}
+
+// Deviation-from-baseline: HAVING col - MA(col) > constant
+// LHS arithmetic folds to a single endpoint; comparison is scalar CompareGT.
+// This already worked before the fix; keep as regression test.
+TEST_F(CompilerIntegrationTest, HavingDeviationFromMeanGreaterThanConstant) {
+  auto r = compile_sql(
+      "CREATE MATERIALIZED VIEW thermal_alerts AS "
+      "  SELECT instrument_id, price,"
+      "         MOVING_AVERAGE(price, 10) AS baseline"
+      "  FROM trades"
+      "  GROUP BY instrument_id"
+      "  HAVING price - MOVING_AVERAGE(price, 10) > 5.0",
+      catalog);
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  EXPECT_EQ(r.entity_name, "thermal_alerts");
+}
+
 }  // namespace
 }  // namespace rtbot_sql::api

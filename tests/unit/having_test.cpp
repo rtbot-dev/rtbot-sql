@@ -200,5 +200,110 @@ TEST_F(HavingTest, VelocityPatternBuildsOuterPrefilter) {
   EXPECT_EQ(field_map.at("total"), 1);
 }
 
+// Test: HAVING with two stream expressions (Bollinger-band pattern)
+// e.g. HAVING price > MOVING_AVERAGE(price, 20) + 2 * STDDEV(price, 20)
+//
+// Both sides of the comparison compile to stream endpoints.  The compiler
+// must emit a CompareSyncGT operator (not throw) and connect both endpoints
+// to it so that the comparison is evaluated timestamp-by-timestamp inside the
+// KeyedPipeline prototype.
+TEST_F(HavingTest, HavingTwoStreamExpressionsBollingerStyle) {
+  // SELECT instrument_id, price,
+  //        MOVING_AVERAGE(price, 20) AS mid,
+  //        MOVING_AVERAGE(price, 20) + 2 * STDDEV(price, 20) AS upper
+  // FROM trades GROUP BY instrument_id
+  // HAVING price > MOVING_AVERAGE(price, 20) + 2 * STDDEV(price, 20)
+
+  std::vector<SelectItem> select_list;
+  select_list.push_back(item(col("instrument_id")));
+  select_list.push_back(item(col("price")));
+
+  std::vector<Expr> ma_args;
+  ma_args.push_back(col("price"));
+  ma_args.push_back(num(20));
+  select_list.push_back(
+      item(func_expr("MOVING_AVERAGE", std::move(ma_args)), "mid"));
+
+  std::vector<Expr> group_by;
+  group_by.push_back(col("instrument_id"));
+
+  // Build: HAVING price > MOVING_AVERAGE(price, 20) + 2 * STDDEV(price, 20)
+  // i.e. price > (ma + (2 * std))
+  std::vector<Expr> ma_args2;
+  ma_args2.push_back(col("price"));
+  ma_args2.push_back(num(20));
+  std::vector<Expr> std_args;
+  std_args.push_back(col("price"));
+  std_args.push_back(num(20));
+
+  // 2 * STDDEV(price, 20)
+  auto two_std_bin = std::make_unique<parser::ast::BinaryExpr>();
+  two_std_bin->op = "*";
+  two_std_bin->left = num(2);
+  two_std_bin->right = func_expr("STDDEV", std::move(std_args));
+
+  // MOVING_AVERAGE(price, 20) + 2 * STDDEV(price, 20)
+  auto upper_bin = std::make_unique<parser::ast::BinaryExpr>();
+  upper_bin->op = "+";
+  upper_bin->left = func_expr("MOVING_AVERAGE", std::move(ma_args2));
+  upper_bin->right = std::move(two_std_bin);
+
+  Expr having = cmp(">", col("price"), std::move(upper_bin));
+
+  GraphBuilder fresh_builder;
+  compile_group_by(select_list, group_by, std::move(having), input, scope,
+                   fresh_builder);
+
+  // CompareSyncGT lives inside the KeyedPipeline prototype, not the outer graph.
+  ASSERT_EQ(fresh_builder.prototypes().size(), 1u);
+  bool has_cmp_sync = false;
+  for (const auto& op : fresh_builder.prototypes()[0].operators) {
+    if (op.type == "CompareSyncGT") has_cmp_sync = true;
+  }
+  EXPECT_TRUE(has_cmp_sync)
+      << "Expected CompareSyncGT operator for stream-vs-stream HAVING";
+}
+
+// Test: HAVING col - MA(col, n) > constant  (deviation from baseline)
+// This pattern already worked before the fix (LHS folds into one endpoint),
+// but verify it still does.
+TEST_F(HavingTest, HavingDeviationFromBaseline) {
+  // SELECT instrument_id, price
+  // FROM trades GROUP BY instrument_id
+  // HAVING price - MOVING_AVERAGE(price, 10) > 5.0
+
+  std::vector<SelectItem> select_list;
+  select_list.push_back(item(col("instrument_id")));
+  select_list.push_back(item(col("price")));
+
+  std::vector<Expr> group_by;
+  group_by.push_back(col("instrument_id"));
+
+  std::vector<Expr> ma_args;
+  ma_args.push_back(col("price"));
+  ma_args.push_back(num(10));
+
+  auto diff_bin = std::make_unique<parser::ast::BinaryExpr>();
+  diff_bin->op = "-";
+  diff_bin->left = col("price");
+  diff_bin->right = func_expr("MOVING_AVERAGE", std::move(ma_args));
+
+  Expr having = cmp(">", std::move(diff_bin), num(5.0));
+
+  GraphBuilder fresh_builder;
+  EXPECT_NO_THROW({
+    compile_group_by(select_list, group_by, std::move(having), input, scope,
+                     fresh_builder);
+  });
+
+  // CompareGT lives inside the KeyedPipeline prototype, not the outer graph.
+  ASSERT_EQ(fresh_builder.prototypes().size(), 1u);
+  bool has_compare = false;
+  for (const auto& op : fresh_builder.prototypes()[0].operators) {
+    if (op.type == "CompareGT") has_compare = true;
+  }
+  EXPECT_TRUE(has_compare) << "Expected CompareGT for deviation > constant";
+}
+
 }  // namespace
 }  // namespace rtbot_sql::compiler
