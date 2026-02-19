@@ -28,3 +28,14 @@ cc_test(
         "@com_google_googletest//:gtest_main",
     ],
 )
+
+cc_test(
+    name = "scenarios_e2e_test",
+    srcs = ["scenarios_e2e_test.cpp"],
+    deps = [
+        "//libs/api:api_compiler",
+        "@rtbot//libs/api:rtbot-api",
+        "@json-cpp//:lib",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
