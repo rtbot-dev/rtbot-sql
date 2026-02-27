@@ -20,3 +20,13 @@ node_modules/
 
 # Environment
 .env*
+
+# Notebook data (download via examples/notebooks/download_data.sh)
+examples/notebooks/data/*.csv
+examples/notebooks/data/*.zip
+
+# Notebook virtual environments
+examples/notebooks/.venv/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
