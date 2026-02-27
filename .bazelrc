@@ -24,6 +24,15 @@ test:debug --test_output=streamed
 test:debug --nocache_test_results
 test:debug --test_strategy=exclusive
 
+# AddressSanitizer config: build with debug symbols + ASan
+# Usage: bazel build --config=asan //runtimes/python:rtbot_sql_whl
+build:asan --copt=-g
+build:asan --copt=-fsanitize=address
+build:asan --copt=-fno-omit-frame-pointer
+build:asan --linkopt=-fsanitize=address
+build:asan --strip=never
+build:asan --compilation_mode=dbg
+
 # Emscripten flags
 build --action_env=EMCC_CFLAGS="-fexceptions -Wno-c++11-narrowing -Wno-unused-const-variable"
 
