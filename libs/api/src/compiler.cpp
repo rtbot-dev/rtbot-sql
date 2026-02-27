@@ -213,14 +213,11 @@ CompilationResult compile_select_to_program(
   if (!stmt.group_by.empty()) {
     result.view_type = ViewType::KEYED;
     if (stmt.group_by.size() == 1) {
-      // Single key: key_index is the column index in the input stream
-      auto* key_col = std::get_if<parser::ast::ColumnRef>(&stmt.group_by[0]);
-      if (key_col) {
-        auto binding = scope.resolve(*key_col);
-        if (auto* b = std::get_if<analyzer::ColumnBinding>(&binding)) {
-          result.key_index = b->index;
-        }
-      }
+      // Single-key GROUP BY outputs the key at position 0 in the keyed view
+      // payload (see compile_group_by field_map contract). Runtime key tracking
+      // and tier-1 keyed reads must use the keyed-view output index, not the
+      // original source-stream column index.
+      result.key_index = 0;
     } else {
       // Composite key: routing is via hash — no single key_index
       result.key_index = -1;

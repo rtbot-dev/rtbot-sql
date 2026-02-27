@@ -1,6 +1,7 @@
 #include "rtbot_sql/parser/ast_converter.h"
 
 #include <algorithm>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -16,6 +17,76 @@ namespace {
 
 ast::Expr convert_expr(const json& node);
 
+std::optional<double> parse_numeric_const_value(const json& node) {
+  if (node.contains("ival")) {
+    const auto& iv = node["ival"];
+    if (iv.is_object() && iv.contains("ival") && iv["ival"].is_number_integer()) {
+      return static_cast<double>(iv["ival"].get<int64_t>());
+    }
+    if (iv.is_object() && iv.empty()) {
+      return 0.0;
+    }
+    if (iv.is_number_integer()) {
+      return static_cast<double>(iv.get<int64_t>());
+    }
+  }
+
+  if (node.contains("fval")) {
+    const auto& fv = node["fval"];
+    if (fv.is_object() && fv.contains("fval") && fv["fval"].is_string()) {
+      return std::stod(fv["fval"].get<std::string>());
+    }
+    if (fv.is_string()) {
+      return std::stod(fv.get<std::string>());
+    }
+    if (fv.is_number()) {
+      return fv.get<double>();
+    }
+  }
+
+  if (node.contains("boolval")) {
+    const auto& bv = node["boolval"];
+    if (bv.is_object() && bv.contains("boolval") && bv["boolval"].is_boolean()) {
+      return bv["boolval"].get<bool>() ? 1.0 : 0.0;
+    }
+    if (bv.is_boolean()) {
+      return bv.get<bool>() ? 1.0 : 0.0;
+    }
+  }
+
+  if (node.contains("val") && node["val"].is_object()) {
+    const auto& val = node["val"];
+
+    if (val.contains("Integer") && val["Integer"].is_object() &&
+        val["Integer"].contains("ival") &&
+        val["Integer"]["ival"].is_number_integer()) {
+      return static_cast<double>(val["Integer"]["ival"].get<int64_t>());
+    }
+    if (val.contains("Integer") && val["Integer"].is_object() &&
+        val["Integer"].empty()) {
+      return 0.0;
+    }
+
+    if (val.contains("Float") && val["Float"].is_object()) {
+      const auto& fl = val["Float"];
+      if (fl.contains("fval") && fl["fval"].is_string()) {
+        return std::stod(fl["fval"].get<std::string>());
+      }
+      if (fl.contains("str") && fl["str"].is_string()) {
+        return std::stod(fl["str"].get<std::string>());
+      }
+    }
+
+    if (val.contains("Boolean") && val["Boolean"].is_object() &&
+        val["Boolean"].contains("boolval") &&
+        val["Boolean"]["boolval"].is_boolean()) {
+      return val["Boolean"]["boolval"].get<bool>() ? 1.0 : 0.0;
+    }
+  }
+
+  return std::nullopt;
+}
+
 ast::Expr convert_column_ref(const json& node) {
   ast::ColumnRef ref;
   const auto& fields = node["fields"];
@@ -29,17 +100,18 @@ ast::Expr convert_column_ref(const json& node) {
 }
 
 ast::Expr convert_a_const(const json& node) {
-  if (node.contains("ival")) {
-    return ast::Constant{static_cast<double>(node["ival"]["ival"].get<int64_t>())};
-  }
-  if (node.contains("fval")) {
-    return ast::Constant{std::stod(node["fval"]["fval"].get<std::string>())};
+  if (auto numeric = parse_numeric_const_value(node); numeric.has_value()) {
+    return ast::Constant{*numeric};
   }
   if (node.contains("sval")) {
     // String constants not supported — all values are numeric in RTBot
     throw std::runtime_error("string constants not supported");
   }
-  throw std::runtime_error("unknown A_Const type");
+  if (node.contains("val") && node["val"].is_object() &&
+      node["val"].contains("String")) {
+    throw std::runtime_error("string constants not supported");
+  }
+  throw std::runtime_error("unknown A_Const type: " + node.dump());
 }
 
 bool is_comparison_op(const std::string& op) {
@@ -308,8 +380,9 @@ ast::SelectStmt convert_select_stmt(const json& node) {
   if (node.contains("limitCount") && !node["limitCount"].is_null()) {
     const auto& lc = node["limitCount"];
     if (lc.contains("A_Const")) {
-      if (lc["A_Const"].contains("ival")) {
-        stmt.limit = lc["A_Const"]["ival"]["ival"].get<int>();
+      if (auto limit_value = parse_numeric_const_value(lc["A_Const"]);
+          limit_value.has_value()) {
+        stmt.limit = static_cast<int>(*limit_value);
       }
     }
   }
