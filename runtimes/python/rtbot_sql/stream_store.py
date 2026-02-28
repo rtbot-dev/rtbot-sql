@@ -46,6 +46,14 @@ class InMemoryStreamStore:
       return list(data)
     return list(data[-count:])
 
+  def read_latest_before(self, stream_name: str, timestamp: int) -> Optional[Message]:
+    data = self._streams.get(stream_name, [])
+    target = int(timestamp)
+    for msg in reversed(data):
+      if msg.timestamp <= target:
+        return Message(msg.timestamp, list(msg.values))
+    return None
+
   def read_range(
       self,
       stream_name: str,
