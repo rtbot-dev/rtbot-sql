@@ -2,8 +2,9 @@
 
 from .catalog import ColumnDef, InMemoryCatalog, StreamSchema, TableSchema, ViewMeta
 from .compiler import compile_sql, native, validate_sql
+from .formatter import normalize_time_column
 from .pipeline_runner import InputMessage, LocalPipelineRunner, PipelineOutput
-from .runtime import RtBotSql, SqlError
+from .runtime import InsertResult, RtBotSql, SqlError
 from .stream_store import InMemoryStreamStore, Message
 
 
@@ -37,8 +38,10 @@ __all__ = [
     "InputMessage",
     "PipelineOutput",
     "LocalPipelineRunner",
+    "InsertResult",
     "RtBotSql",
     "SqlError",
+    "normalize_time_column",
     "compile_sql",
     "validate_sql",
     "native",
