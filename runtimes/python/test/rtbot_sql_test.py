@@ -6,7 +6,13 @@ from rtbot_sql import compiler
 
 def _columns_and_rows(result):
   if isinstance(result, dict):
-    return list(result["columns"]), [list(row) for row in result["rows"]]
+    columns = list(result["columns"])
+    rows = [list(row) for row in result["rows"]]
+    if "timestamps" in result:
+      time_column = result.get("time_column", "time")
+      columns = [time_column] + columns
+      rows = [[float(ts)] + row for ts, row in zip(result["timestamps"], rows)]
+    return columns, rows
 
   if hasattr(result, "columns") and hasattr(result, "values"):
     return list(result.columns), result.values.tolist()
@@ -38,8 +44,9 @@ class RuntimeLifecycleTest(unittest.TestCase):
     result = sql.execute("SELECT * FROM ticks LIMIT 1")
     columns, rows = _columns_and_rows(result)
 
-    self.assertEqual(columns, ["value"])
-    self.assertEqual(rows, [[42.0]])
+    self.assertEqual(columns, ["time", "value"])
+    self.assertEqual(len(rows), 1)
+    self.assertEqual(rows[0][1:], [42.0])
 
   def test_create_insert_select_limit(self):
     sql = rtbot_sql.RtBotSql()
@@ -54,8 +61,8 @@ class RuntimeLifecycleTest(unittest.TestCase):
     result = sql.execute("SELECT instrument_id, price FROM trades LIMIT 2")
     columns, rows = _columns_and_rows(result)
 
-    self.assertEqual(columns, ["instrument_id", "price"])
-    self.assertEqual(rows, [[2.0, 80.0], [3.0, 90.0]])
+    self.assertEqual(columns, ["time", "instrument_id", "price"])
+    self.assertEqual([row[1:] for row in rows], [[2.0, 80.0], [3.0, 90.0]])
 
   def test_where_and_expression_projection(self):
     sql = rtbot_sql.RtBotSql()
@@ -73,8 +80,8 @@ class RuntimeLifecycleTest(unittest.TestCase):
     )
     columns, rows = _columns_and_rows(result)
 
-    self.assertEqual(columns, ["instrument_id", "trade_value"])
-    self.assertEqual(rows, [[1.0, 30000.0], [3.0, 12000.0]])
+    self.assertEqual(columns, ["time", "instrument_id", "trade_value"])
+    self.assertEqual([row[1:] for row in rows], [[1.0, 30000.0], [3.0, 12000.0]])
 
   def test_materialized_view_latest_per_key(self):
     sql = rtbot_sql.RtBotSql()
@@ -95,11 +102,121 @@ class RuntimeLifecycleTest(unittest.TestCase):
     result = sql.execute("SELECT * FROM stats")
     columns, rows = _columns_and_rows(result)
 
-    self.assertEqual(columns, ["instrument_id", "total_qty", "cnt"])
+    self.assertEqual(columns, ["time", "instrument_id", "total_qty", "cnt"])
 
-    actual = {row[0]: row for row in rows}
+    actual = {row[1]: row[1:] for row in rows}
     self.assertEqual(actual[1.0], [1.0, 17.0, 2.0])
     self.assertEqual(actual[2.0], [2.0, 5.0, 1.0])
+
+  def test_insert_dataframe_with_column_map(self):
+    try:
+      import pandas as pd
+    except ImportError:
+      self.skipTest("pandas is required")
+
+    sql = rtbot_sql.RtBotSql()
+    sql.execute(
+        "CREATE STREAM trades (price DOUBLE PRECISION, qty DOUBLE PRECISION, "
+        "quote_qty DOUBLE PRECISION, is_buyer_maker DOUBLE PRECISION)"
+    )
+
+    df = pd.DataFrame({
+        "timestamp": [1700000001000, 1700000001001],
+        "price": [10.0, 11.0],
+        "qty": [1.5, 2.5],
+        "quoteQty": [15.0, 27.5],
+        "isBuyerMaker_num": [1.0, 0.0],
+    })
+    sql.insert_dataframe(
+        "trades",
+        df,
+        column_map={
+            "quote_qty": "quoteQty",
+            "is_buyer_maker": "isBuyerMaker_num",
+        },
+    )
+
+    result = sql.execute("SELECT * FROM trades LIMIT 2")
+    columns, rows = _columns_and_rows(result)
+
+    self.assertEqual(
+        columns,
+        ["time", "price", "qty", "quote_qty", "is_buyer_maker"],
+    )
+    self.assertEqual(
+        [row[1:] for row in rows],
+        [[10.0, 1.5, 15.0, 1.0], [11.0, 2.5, 27.5, 0.0]],
+    )
+
+  def test_multi_from_materialized_view(self):
+    sql = rtbot_sql.RtBotSql()
+
+    sql.execute("CREATE STREAM btc (price DOUBLE PRECISION)")
+    sql.execute("CREATE STREAM eth (price DOUBLE PRECISION)")
+    sql.execute(
+        "CREATE MATERIALIZED VIEW cross_stats AS "
+        "SELECT b.price AS btc_price, e.price AS eth_price, b.price - e.price AS spread "
+        "FROM btc b, eth e"
+    )
+
+    sql.insert_dataframe(
+        "btc",
+        [
+            {"time": 1700000001000, "price": 100.0},
+            {"time": 1700000003000, "price": 101.0},
+        ],
+    )
+    sql.insert_dataframe(
+        "eth",
+        [
+            {"time": 1700000002000, "price": 95.0},
+            {"time": 1700000004000, "price": 95.0},
+        ],
+    )
+
+    result = sql.execute("SELECT * FROM cross_stats LIMIT 10")
+    columns, rows = _columns_and_rows(result)
+
+    self.assertEqual(columns, ["time", "btc_price", "eth_price", "spread"])
+    self.assertEqual(
+        [row[1:] for row in rows],
+        [[100.0, 95.0, 5.0], [101.0, 95.0, 6.0]],
+    )
+
+  def test_multi_from_ephemeral_select_asof_correlation(self):
+    sql = rtbot_sql.RtBotSql()
+
+    sql.execute("CREATE STREAM btc (price DOUBLE PRECISION)")
+    sql.execute("CREATE STREAM eth (price DOUBLE PRECISION)")
+
+    sql.insert_dataframe("btc", [{"time": 1000, "price": 100.0}])
+    sql.insert_dataframe("eth", [{"time": 1200, "price": 95.0}])
+    sql.insert_dataframe("btc", [{"time": 1300, "price": 102.0}])
+    sql.insert_dataframe("eth", [{"time": 1700, "price": 97.0}])
+
+    result = sql.execute(
+        "SELECT b.price AS btc_price, e.price AS eth_price, "
+        "b.price - e.price AS spread FROM btc b, eth e LIMIT 10"
+    )
+    columns, rows = _columns_and_rows(result)
+
+    self.assertEqual(columns, ["time", "btc_price", "eth_price", "spread"])
+    self.assertEqual(
+        [row[1:] for row in rows],
+        [[100.0, 95.0, 5.0], [102.0, 95.0, 7.0], [102.0, 97.0, 5.0]],
+    )
+
+  def test_configure_time_format_override(self):
+    sql = rtbot_sql.RtBotSql()
+    sql.execute("CREATE STREAM ticks (value DOUBLE PRECISION)")
+    sql.insert_dataframe("ticks", [{"time": 1700000000000, "value": 1.0}])
+
+    sql.configure_time_format(unit="ms", column_name="ts", formatter=lambda ts: ts)
+    result = sql.execute("SELECT * FROM ticks LIMIT 1")
+    columns, rows = _columns_and_rows(result)
+
+    self.assertEqual(columns, ["ts", "value"])
+    self.assertEqual(rows[0][0], 1700000000000.0)
 
 
 if __name__ == "__main__":

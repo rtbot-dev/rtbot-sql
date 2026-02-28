@@ -25,6 +25,7 @@ def test_basic_lifecycle():
     print("=== Basic lifecycle ===")
     print(result)
     assert len(result) == 3, f"Expected 3 rows, got {len(result)}"
+    assert list(result.columns)[0] == "time", "Expected time column"
     print("PASS\n")
 
 
@@ -54,6 +55,7 @@ def test_materialized_view_group_by():
     print("=== Materialized view with GROUP BY ===")
     print(result)
     assert len(result) == 2, f"Expected 2 keys, got {len(result)}"
+    assert list(result.columns)[0] == "time", "Expected time column"
     print("PASS\n")
 
 
@@ -79,6 +81,7 @@ def test_where_clause():
     print("=== WHERE clause ===")
     print(result)
     assert len(result) == 2, f"Expected 2 rows, got {len(result)}"
+    assert list(result.columns)[0] == "time", "Expected time column"
     print("PASS\n")
 
 
@@ -113,6 +116,7 @@ def test_windowed_functions():
     print("=== Windowed functions (MOVING_AVERAGE, STDDEV) ===")
     print(result)
     assert len(result) == 2, f"Expected 2 devices, got {len(result)}"
+    assert list(result.columns)[0] == "time", "Expected time column"
     print("PASS\n")
 
 
@@ -146,6 +150,7 @@ def test_having_clause():
     result = sql.execute("SELECT * FROM alerts")
     print("=== HAVING clause (alert mechanism) ===")
     print(result)
+    assert list(result.columns)[0] == "time", "Expected time column"
     # Only sensor 2 should have triggered
     if len(result) > 0:
         sensor_ids = set(result["sensor_id"].tolist())
@@ -164,22 +169,34 @@ def test_insert_dataframe():
         "CREATE STREAM fleet ("
         "  vehicle_id DOUBLE PRECISION,"
         "  temp_c DOUBLE PRECISION,"
-        "  door_open DOUBLE PRECISION"
+        "  quote_qty DOUBLE PRECISION,"
+        "  is_buyer_maker DOUBLE PRECISION"
         ")"
     )
 
     df = pd.DataFrame({
+        "timestamp": [1700000000000, 1700000000001, 1700000000002, 1700000000003],
         "vehicle_id": [1.0, 1.0, 2.0, 2.0],
         "temp_c": [2.5, 2.6, 3.1, 3.0],
-        "door_open": [0.0, 0.0, 1.0, 0.0],
+        "quoteQty": [100.0, 101.0, 102.0, 103.0],
+        "isBuyerMaker_num": [0.0, 1.0, 1.0, 0.0],
     })
 
-    sql.insert_dataframe("fleet", df)
+    sql.insert_dataframe(
+        "fleet",
+        df,
+        column_map={
+            "quote_qty": "quoteQty",
+            "is_buyer_maker": "isBuyerMaker_num",
+        },
+    )
 
     result = sql.execute("SELECT * FROM fleet LIMIT 10")
     print("=== insert_dataframe ===")
     print(result)
     assert len(result) == 4, f"Expected 4 rows, got {len(result)}"
+    assert list(result.columns)[0] == "time", "Expected time column"
+    assert str(result["time"].iloc[0]).startswith("2023-11"), "Unexpected formatted time"
     print("PASS\n")
 
 
@@ -219,6 +236,31 @@ def test_multi_column_group_by_scenario():
     print("=== Cold chain pattern (multi-column GROUP BY) ===")
     print(result)
     assert len(result) == 2, f"Expected 2 vehicles, got {len(result)}"
+    assert list(result.columns)[0] == "time", "Expected time column"
+    print("PASS\n")
+
+
+def test_multi_from_correlation_asof():
+    """Cross-stream SQL should correlate with latest values from both streams."""
+    sql = RtBotSql()
+
+    sql.execute("CREATE STREAM btc_trades (price DOUBLE PRECISION)")
+    sql.execute("CREATE STREAM eth_trades (price DOUBLE PRECISION)")
+
+    sql.insert_dataframe("btc_trades", [{"time": 1000, "price": 100.0}])
+    sql.insert_dataframe("eth_trades", [{"time": 1200, "price": 95.0}])
+    sql.insert_dataframe("btc_trades", [{"time": 1300, "price": 102.0}])
+    sql.insert_dataframe("eth_trades", [{"time": 1700, "price": 97.0}])
+
+    result = sql.execute(
+        "SELECT b.price AS btc_price, e.price AS eth_price, "
+        "b.price - e.price AS spread FROM btc_trades b, eth_trades e LIMIT 10"
+    )
+    print("=== Multi-FROM correlation (ASOF) ===")
+    print(result)
+    assert list(result.columns)[0] == "time", "Expected time column"
+    assert len(result) == 3, f"Expected 3 correlated rows, got {len(result)}"
+    assert result["spread"].tolist() == [5.0, 7.0, 5.0], "Unexpected spread sequence"
     print("PASS\n")
 
 
@@ -231,6 +273,7 @@ if __name__ == "__main__":
         test_having_clause,
         test_insert_dataframe,
         test_multi_column_group_by_scenario,
+        test_multi_from_correlation_asof,
     ]
 
     passed = 0

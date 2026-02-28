@@ -331,7 +331,7 @@ TEST_F(ExpressionTest, ConstantDivColumnProducesDivisionSync) {
 
   ASSERT_EQ(builder.connections().size(), 4u);
   expect_conn(builder, "input_0", "o1", ext.id, "i1");
-  expect_conn(builder, "input_0", "o1", cnum.id, "i1");
+  expect_conn(builder, ext.id, "o1", cnum.id, "i1");
   expect_conn(builder, cnum.id, "o1", div.id, "i1");
   expect_conn(builder, ext.id, "o1", div.id, "i2");
 }

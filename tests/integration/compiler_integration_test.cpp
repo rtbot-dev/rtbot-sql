@@ -428,6 +428,44 @@ TEST_F(CompilerIntegrationTest, CompositeGroupBy) {
   EXPECT_NE(r.field_map.find("total"), r.field_map.end());
 }
 
+TEST_F(CompilerIntegrationTest, MultiFromCrossStreamSelect) {
+  StreamSchema eth_trades{"eth_trades", {{"price", 0}, {"quantity", 1}}};
+  catalog.streams["eth_trades"] = eth_trades;
+
+  auto r = compile_sql(
+      "SELECT t.price AS trade_price, e.price AS eth_price, "
+      "t.price - e.price AS spread "
+      "FROM trades t, eth_trades e LIMIT 10",
+      catalog);
+
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  EXPECT_EQ(r.select_tier, SelectTier::TIER3_EPHEMERAL);
+  ASSERT_EQ(r.source_streams.size(), 2u);
+  EXPECT_EQ(r.source_streams[0], "trades");
+  EXPECT_EQ(r.source_streams[1], "eth_trades");
+
+  EXPECT_EQ(r.field_map.at("trade_price"), 0);
+  EXPECT_EQ(r.field_map.at("eth_price"), 1);
+  EXPECT_EQ(r.field_map.at("spread"), 2);
+
+  auto program = json::parse(r.program_json);
+  bool has_two_port_input = false;
+  bool has_subtraction = false;
+  for (const auto& op : program["operators"]) {
+    if (op["type"] == "Input") {
+      const auto& pt = op["portTypes"];
+      if (pt.is_array() && pt.size() == 2) {
+        has_two_port_input = true;
+      }
+    }
+    if (op["type"] == "Subtraction") {
+      has_subtraction = true;
+    }
+  }
+  EXPECT_TRUE(has_two_port_input);
+  EXPECT_TRUE(has_subtraction);
+}
+
 // --- Test 16: Tier 2 cross-key aggregation via apply_tier2_filter ---
 //
 // Setup: instrument_stats is a keyed materialized view with schema

@@ -156,7 +156,17 @@ TEST_F(TierTest, ViewIsTier3) {
   EXPECT_EQ(classify_select(stmt, catalog), SelectTier::TIER3_EPHEMERAL);
 }
 
-// Test 9: SELECT * FROM trades (no LIMIT) → Error
+// Test 9: SELECT ... FROM trades, orders LIMIT 10 → Tier 3
+TEST_F(TierTest, MultiFromIsTier3) {
+  SelectStmt stmt;
+  stmt.from_table = "trades";
+  stmt.limit = 10;
+  stmt.from_tables.push_back(FromSource{"trades", "t"});
+  stmt.from_tables.push_back(FromSource{"orders", "o"});
+  EXPECT_EQ(classify_select(stmt, catalog), SelectTier::TIER3_EPHEMERAL);
+}
+
+// Test 10: SELECT * FROM trades (no LIMIT) → Error
 TEST_F(TierTest, UnboundedStreamThrows) {
   SelectStmt stmt;
   stmt.from_table = "trades";
