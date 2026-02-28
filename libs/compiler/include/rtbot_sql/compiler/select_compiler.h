@@ -26,6 +26,7 @@ SelectResult compile_select_projection(
     const std::vector<parser::ast::SelectItem>& select_list,
     const Endpoint& input_endpoint,
     const analyzer::Scope& scope,
-    GraphBuilder& builder);
+    GraphBuilder& builder,
+    const std::map<std::string, Endpoint>* source_endpoints = nullptr);
 
 }  // namespace rtbot_sql::compiler

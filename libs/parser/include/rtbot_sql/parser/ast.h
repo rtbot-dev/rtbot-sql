@@ -108,6 +108,11 @@ struct JoinClause {
   std::optional<Expr> on_condition;
 };
 
+struct FromSource {
+  std::string table_name;
+  std::string alias;
+};
+
 struct OrderByItem {
   Expr expr;
   bool descending = false;  // ASC=false, DESC=true
@@ -117,6 +122,7 @@ struct SelectStmt {
   std::vector<SelectItem> select_list;
   std::string from_table;
   std::string from_alias;
+  std::vector<FromSource> from_tables;
   std::vector<JoinClause> join_clauses;
   std::optional<Expr> where_clause;
   std::vector<Expr> group_by;

@@ -115,7 +115,6 @@ Endpoint compile_scalar_op(const std::string& op, const Endpoint& stream_ep,
 // Compile: constant OP stream → reversed scalar operator chain
 Endpoint compile_scalar_op_reversed(const std::string& op,
                                     const Endpoint& stream_ep, double constant,
-                                    const Endpoint& input_endpoint,
                                     GraphBuilder& builder) {
   if (op == "+") {
     // Commutative
@@ -146,7 +145,7 @@ Endpoint compile_scalar_op_reversed(const std::string& op,
     // constant / stream → ConstantNumber + Division sync
     auto const_id = builder.next_id("const");
     builder.add_operator(const_id, "ConstantNumber", {{"value", constant}});
-    builder.connect(input_endpoint, {const_id, "i1"});
+    builder.connect(stream_ep, {const_id, "i1"});
 
     auto div_id = builder.next_id("div");
     builder.add_operator(div_id, "Division", {{"numPorts", 2}});
@@ -177,7 +176,8 @@ ExprResult compile_expression(const parser::ast::Expr& expr,
                               const Endpoint& input_endpoint,
                               const analyzer::Scope& scope,
                               GraphBuilder& builder,
-                              ExprCache* cache) {
+                              ExprCache* cache,
+                              const std::map<std::string, Endpoint>* source_endpoints) {
   using namespace parser::ast;
 
   // Cache lookup
@@ -202,10 +202,17 @@ ExprResult compile_expression(const parser::ast::Expr& expr,
       throw std::runtime_error(*err);
     }
     auto& binding = std::get<analyzer::ColumnBinding>(result);
+    Endpoint source_ep = input_endpoint;
+    if (source_endpoints) {
+      auto it = source_endpoints->find(binding.stream_name);
+      if (it != source_endpoints->end()) {
+        source_ep = it->second;
+      }
+    }
     auto id = builder.next_id("ext");
     builder.add_operator(id, "VectorExtract",
                          {{"index", static_cast<double>(binding.index)}});
-    builder.connect(input_endpoint, {id, "i1"});
+    builder.connect(source_ep, {id, "i1"});
     ExprResult r = Endpoint{id, "o1"};
     maybe_cache(expr, r);
     return r;
@@ -219,8 +226,10 @@ ExprResult compile_expression(const parser::ast::Expr& expr,
   // BinaryExpr → scalar or sync arithmetic
   if (auto* bin_ptr = std::get_if<std::unique_ptr<BinaryExpr>>(&expr)) {
     const auto& bin = **bin_ptr;
-    auto left = compile_expression(bin.left, input_endpoint, scope, builder, cache);
-    auto right = compile_expression(bin.right, input_endpoint, scope, builder, cache);
+    auto left = compile_expression(bin.left, input_endpoint, scope, builder, cache,
+                                   source_endpoints);
+    auto right = compile_expression(bin.right, input_endpoint, scope, builder,
+                                    cache, source_endpoints);
 
     auto* left_const = std::get_if<ConstantMarker>(&left);
     auto* right_const = std::get_if<ConstantMarker>(&right);
@@ -242,8 +251,7 @@ ExprResult compile_expression(const parser::ast::Expr& expr,
     // Constant OP stream
     if (left_const) {
       ExprResult r = compile_scalar_op_reversed(bin.op, std::get<Endpoint>(right),
-                                                left_const->value, input_endpoint,
-                                                builder);
+                                                left_const->value, builder);
       maybe_cache(expr, r);
       return r;
     }
@@ -268,9 +276,9 @@ ExprResult compile_expression(const parser::ast::Expr& expr,
         throw std::runtime_error("POWER requires exactly 2 arguments");
       }
       auto base = compile_expression(func.args[0], input_endpoint, scope,
-                                     builder, cache);
+                                     builder, cache, source_endpoints);
       auto exp_result = compile_expression(func.args[1], input_endpoint, scope,
-                                           builder, cache);
+                                            builder, cache, source_endpoints);
       auto* exp_const = std::get_if<ConstantMarker>(&exp_result);
       if (!exp_const) {
         throw std::runtime_error("POWER exponent must be a constant");
@@ -295,7 +303,7 @@ ExprResult compile_expression(const parser::ast::Expr& expr,
       // Delegate to aggregate/windowed function compiler
       if (is_aggregate_or_windowed(func.name)) {
         ExprResult r = compile_function(func.name, func.args, input_endpoint,
-                                        scope, builder, cache);
+                                        scope, builder, cache, source_endpoints);
         maybe_cache(expr, r);
         return r;
       }
@@ -305,7 +313,8 @@ ExprResult compile_expression(const parser::ast::Expr& expr,
       throw std::runtime_error(func.name + " requires exactly 1 argument");
     }
 
-    auto arg = compile_expression(func.args[0], input_endpoint, scope, builder, cache);
+    auto arg = compile_expression(func.args[0], input_endpoint, scope, builder,
+                                  cache, source_endpoints);
 
     // Constant argument → fold
     if (auto* arg_const = std::get_if<ConstantMarker>(&arg)) {
@@ -331,13 +340,15 @@ ExprResult compile_expression(const parser::ast::Expr& expr,
     // Compile each WHEN condition → boolean endpoint.
     std::vector<Endpoint> cond_eps;
     for (const auto& clause : ce.when_clauses) {
-      cond_eps.push_back(compile_predicate(clause.condition, input_endpoint, scope, builder));
+      cond_eps.push_back(compile_predicate(clause.condition, input_endpoint,
+                                           scope, builder, source_endpoints));
     }
 
     // Compile each THEN result → number endpoint.
     std::vector<Endpoint> result_eps;
     for (const auto& clause : ce.when_clauses) {
-      auto r = compile_expression(clause.result, input_endpoint, scope, builder, cache);
+      auto r = compile_expression(clause.result, input_endpoint, scope, builder,
+                                  cache, source_endpoints);
       result_eps.push_back(ensure_endpoint_local(std::move(r), input_endpoint, builder));
     }
 
@@ -380,7 +391,8 @@ ExprResult compile_expression(const parser::ast::Expr& expr,
     // ELSE branch (if present)
     if (ce.else_result.has_value()) {
       exclusive_eps.push_back(not_all_prev);  // else fires when no WHEN matched
-      auto r = compile_expression(*ce.else_result, input_endpoint, scope, builder, cache);
+      auto r = compile_expression(*ce.else_result, input_endpoint, scope,
+                                  builder, cache, source_endpoints);
       result_eps.push_back(ensure_endpoint_local(std::move(r), input_endpoint, builder));
     }
 

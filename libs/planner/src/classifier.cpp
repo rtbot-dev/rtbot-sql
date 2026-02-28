@@ -154,6 +154,10 @@ bool is_simple_read(const parser::ast::SelectStmt& stmt) {
 
 SelectTier classify_select(const parser::ast::SelectStmt& stmt,
                            const catalog::Catalog& catalog) {
+  if (stmt.from_tables.size() > 1) {
+    return SelectTier::TIER3_EPHEMERAL;
+  }
+
   auto entity_type = catalog.resolve_entity(stmt.from_table);
   if (!entity_type.has_value()) {
     throw std::runtime_error("unknown source: " + stmt.from_table);

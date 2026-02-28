@@ -1,5 +1,6 @@
 #pragma once
 
+#include <map>
 #include <string>
 #include <vector>
 
@@ -22,7 +23,8 @@ Endpoint compile_function(const std::string& name,
                           const Endpoint& input_endpoint,
                           const analyzer::Scope& scope,
                           GraphBuilder& builder,
-                          ExprCache* cache = nullptr);
+                          ExprCache* cache = nullptr,
+                          const std::map<std::string, Endpoint>* source_endpoints = nullptr);
 
 // Returns true if the function name is handled by compile_function
 // (i.e., it's an aggregate, windowed, or DSP function).

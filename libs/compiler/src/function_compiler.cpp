@@ -71,7 +71,8 @@ Endpoint compile_function(const std::string& name,
                           const Endpoint& input_endpoint,
                           const analyzer::Scope& scope,
                           GraphBuilder& builder,
-                          ExprCache* cache) {
+                          ExprCache* cache,
+                          const std::map<std::string, Endpoint>* source_endpoints) {
   std::string upper = name;
   std::transform(upper.begin(), upper.end(), upper.begin(), ::toupper);
 
@@ -82,7 +83,8 @@ Endpoint compile_function(const std::string& name,
       throw std::runtime_error("SUM requires exactly 1 argument");
     }
     auto expr_ep = ensure_endpoint(
-        compile_expression(args[0], input_endpoint, scope, builder, cache),
+        compile_expression(args[0], input_endpoint, scope, builder, cache,
+                           source_endpoints),
         input_endpoint, builder);
     auto sum_id = builder.next_id("cumsum");
     builder.add_operator(sum_id, "CumulativeSum");
@@ -107,7 +109,8 @@ Endpoint compile_function(const std::string& name,
       throw std::runtime_error("AVG requires exactly 1 argument");
     }
     auto expr_ep = ensure_endpoint(
-        compile_expression(args[0], input_endpoint, scope, builder, cache),
+        compile_expression(args[0], input_endpoint, scope, builder, cache,
+                           source_endpoints),
         input_endpoint, builder);
     auto sum_id = builder.next_id("cumsum");
     builder.add_operator(sum_id, "CumulativeSum");
@@ -133,7 +136,8 @@ Endpoint compile_function(const std::string& name,
     }
     int window = require_constant_int("MOVING_AVERAGE", args[1], "window_size");
     auto expr_ep = ensure_endpoint(
-        compile_expression(args[0], input_endpoint, scope, builder, cache),
+        compile_expression(args[0], input_endpoint, scope, builder, cache,
+                           source_endpoints),
         input_endpoint, builder);
     auto ma_id = builder.next_id("mavg");
     builder.add_operator(ma_id, "MovingAverage",
@@ -149,7 +153,8 @@ Endpoint compile_function(const std::string& name,
     }
     int window = require_constant_int("MOVING_SUM", args[1], "window_size");
     auto expr_ep = ensure_endpoint(
-        compile_expression(args[0], input_endpoint, scope, builder, cache),
+        compile_expression(args[0], input_endpoint, scope, builder, cache,
+                           source_endpoints),
         input_endpoint, builder);
     auto ms_id = builder.next_id("msum");
     builder.add_operator(ms_id, "MovingSum",
@@ -184,7 +189,8 @@ Endpoint compile_function(const std::string& name,
     }
     int window = require_constant_int("MOVING_STD", args[1], "window_size");
     auto expr_ep = ensure_endpoint(
-        compile_expression(args[0], input_endpoint, scope, builder, cache),
+        compile_expression(args[0], input_endpoint, scope, builder, cache,
+                           source_endpoints),
         input_endpoint, builder);
     auto sd_id = builder.next_id("stddev");
     builder.add_operator(sd_id, "StandardDeviation",
@@ -201,7 +207,8 @@ Endpoint compile_function(const std::string& name,
     }
     int window = require_constant_int("STDDEV", args[1], "window_size");
     auto expr_ep = ensure_endpoint(
-        compile_expression(args[0], input_endpoint, scope, builder, cache),
+        compile_expression(args[0], input_endpoint, scope, builder, cache,
+                           source_endpoints),
         input_endpoint, builder);
     auto sd_id = builder.next_id("stddev");
     builder.add_operator(sd_id, "StandardDeviation",
@@ -219,7 +226,8 @@ Endpoint compile_function(const std::string& name,
     }
     int window = require_constant_int("MOVING_MIN", args[1], "window_size");
     auto expr_ep = ensure_endpoint(
-        compile_expression(args[0], input_endpoint, scope, builder, cache),
+        compile_expression(args[0], input_endpoint, scope, builder, cache,
+                           source_endpoints),
         input_endpoint, builder);
     auto id = builder.next_id("wmin");
     builder.add_operator(id, "WindowMinMax",
@@ -236,7 +244,8 @@ Endpoint compile_function(const std::string& name,
     }
     int window = require_constant_int("MOVING_MAX", args[1], "window_size");
     auto expr_ep = ensure_endpoint(
-        compile_expression(args[0], input_endpoint, scope, builder, cache),
+        compile_expression(args[0], input_endpoint, scope, builder, cache,
+                           source_endpoints),
         input_endpoint, builder);
     auto id = builder.next_id("wmax");
     builder.add_operator(id, "WindowMinMax",
@@ -258,7 +267,8 @@ Endpoint compile_function(const std::string& name,
       throw std::runtime_error("FIR: second argument must be an array literal");
     }
     auto expr_ep = ensure_endpoint(
-        compile_expression(args[0], input_endpoint, scope, builder, cache),
+        compile_expression(args[0], input_endpoint, scope, builder, cache,
+                           source_endpoints),
         input_endpoint, builder);
     auto fir_id = builder.next_id("fir");
     std::vector<double> coeffs(arr->values.begin(), arr->values.end());
@@ -280,7 +290,8 @@ Endpoint compile_function(const std::string& name,
           "IIR: second and third arguments must be array literals");
     }
     auto expr_ep = ensure_endpoint(
-        compile_expression(args[0], input_endpoint, scope, builder, cache),
+        compile_expression(args[0], input_endpoint, scope, builder, cache,
+                           source_endpoints),
         input_endpoint, builder);
     auto iir_id = builder.next_id("iir");
     std::vector<double> a_coeffs(a_arr->values.begin(), a_arr->values.end());
@@ -298,7 +309,8 @@ Endpoint compile_function(const std::string& name,
     }
     int interval = require_constant_int("RESAMPLE", args[1], "interval");
     auto expr_ep = ensure_endpoint(
-        compile_expression(args[0], input_endpoint, scope, builder, cache),
+        compile_expression(args[0], input_endpoint, scope, builder, cache,
+                           source_endpoints),
         input_endpoint, builder);
     auto rs_id = builder.next_id("resample");
     builder.add_operator(rs_id, "ResamplerConstant",
@@ -314,7 +326,8 @@ Endpoint compile_function(const std::string& name,
     }
     int window = require_constant_int("PEAK_DETECT", args[1], "window_size");
     auto expr_ep = ensure_endpoint(
-        compile_expression(args[0], input_endpoint, scope, builder, cache),
+        compile_expression(args[0], input_endpoint, scope, builder, cache,
+                           source_endpoints),
         input_endpoint, builder);
     auto pd_id = builder.next_id("peakdet");
     builder.add_operator(pd_id, "PeakDetector",

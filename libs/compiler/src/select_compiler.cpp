@@ -1,6 +1,7 @@
 #include "rtbot_sql/compiler/select_compiler.h"
 
 #include <algorithm>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -63,7 +64,8 @@ SelectResult compile_select_projection(
     const std::vector<parser::ast::SelectItem>& select_list,
     const Endpoint& input_endpoint,
     const analyzer::Scope& scope,
-    GraphBuilder& builder) {
+    GraphBuilder& builder,
+    const std::map<std::string, Endpoint>* source_endpoints) {
   // SELECT * → identity passthrough
   if (select_list.empty()) {
     // Build field map from scope — not available directly, so return empty map.
@@ -71,8 +73,38 @@ SelectResult compile_select_projection(
     return {input_endpoint, {}};
   }
 
-  // Optimization: all plain ColumnRefs → VectorProject
-  if (all_column_refs(select_list)) {
+  // Optimization: all plain ColumnRefs from the same source → VectorProject
+  bool can_use_vector_project = all_column_refs(select_list);
+  Endpoint projection_input = input_endpoint;
+  if (can_use_vector_project && source_endpoints) {
+    std::string projection_stream;
+    bool has_projection_stream = false;
+
+    for (const auto& item : select_list) {
+      const auto& col = std::get<parser::ast::ColumnRef>(item.expr);
+      auto result = scope.resolve(col);
+      if (auto* err = std::get_if<std::string>(&result)) {
+        throw std::runtime_error(*err);
+      }
+      const auto& binding = std::get<analyzer::ColumnBinding>(result);
+      if (!has_projection_stream) {
+        projection_stream = binding.stream_name;
+        has_projection_stream = true;
+      } else if (binding.stream_name != projection_stream) {
+        can_use_vector_project = false;
+        break;
+      }
+    }
+
+    if (can_use_vector_project && has_projection_stream) {
+      auto it = source_endpoints->find(projection_stream);
+      if (it != source_endpoints->end()) {
+        projection_input = it->second;
+      }
+    }
+  }
+
+  if (can_use_vector_project) {
     std::vector<int> indices;
     FieldMap field_map;
 
@@ -93,7 +125,7 @@ SelectResult compile_select_projection(
     auto proj_id = builder.next_id("proj");
     builder.add_operator(proj_id, "VectorProject", {}, {}, {},
                          {{"indices", indices}});
-    builder.connect(input_endpoint, {proj_id, "i1"});
+    builder.connect(projection_input, {proj_id, "i1"});
     return {{proj_id, "o1"}, field_map};
   }
 
@@ -101,11 +133,47 @@ SelectResult compile_select_projection(
   std::vector<Endpoint> endpoints;
   FieldMap field_map;
 
+  std::optional<Endpoint> sync_zero_ep;
+  if (source_endpoints && source_endpoints->size() > 1) {
+    std::vector<Endpoint> source_clocks;
+    source_clocks.reserve(source_endpoints->size());
+    for (const auto& [_, source_ep] : *source_endpoints) {
+      auto clock_id = builder.next_id("clock");
+      builder.add_operator(clock_id, "VectorExtract", {{"index", 0.0}});
+      builder.connect(source_ep, {clock_id, "i1"});
+      source_clocks.push_back({clock_id, "o1"});
+    }
+
+    Endpoint any_clock = source_clocks.front();
+    for (size_t i = 1; i < source_clocks.size(); ++i) {
+      auto add_id = builder.next_id("clock_sync");
+      builder.add_operator(add_id, "Addition", {{"numPorts", 2.0}});
+      builder.connect(any_clock, {add_id, "i1"});
+      builder.connect(source_clocks[i], {add_id, "i2"});
+      any_clock = {add_id, "o1"};
+    }
+
+    auto zero_id = builder.next_id("const");
+    builder.add_operator(zero_id, "ConstantNumber", {{"value", 0.0}});
+    builder.connect(any_clock, {zero_id, "i1"});
+    sync_zero_ep = Endpoint{zero_id, "o1"};
+  }
+
   for (size_t i = 0; i < select_list.size(); ++i) {
     const auto& item = select_list[i];
     auto result =
-        compile_expression(item.expr, input_endpoint, scope, builder);
+        compile_expression(item.expr, input_endpoint, scope, builder, nullptr,
+                           source_endpoints);
     auto ep = ensure_endpoint(std::move(result), input_endpoint, builder);
+
+    if (sync_zero_ep.has_value()) {
+      auto sync_id = builder.next_id("col_sync");
+      builder.add_operator(sync_id, "Addition", {{"numPorts", 2.0}});
+      builder.connect(ep, {sync_id, "i1"});
+      builder.connect(*sync_zero_ep, {sync_id, "i2"});
+      ep = {sync_id, "o1"};
+    }
+
     endpoints.push_back(ep);
 
     std::string alias =

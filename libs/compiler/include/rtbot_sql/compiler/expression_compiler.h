@@ -1,5 +1,6 @@
 #pragma once
 
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <variant>
@@ -26,6 +27,7 @@ ExprResult compile_expression(const parser::ast::Expr& expr,
                               const Endpoint& input_endpoint,
                               const analyzer::Scope& scope,
                               GraphBuilder& builder,
-                              ExprCache* cache = nullptr);
+                              ExprCache* cache = nullptr,
+                              const std::map<std::string, Endpoint>* source_endpoints = nullptr);
 
 }  // namespace rtbot_sql::compiler

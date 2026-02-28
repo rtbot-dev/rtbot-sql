@@ -290,47 +290,55 @@ ast::SelectStmt convert_select_stmt(const json& node) {
 
   // FROM clause
   if (node.contains("fromClause") && !node["fromClause"].empty()) {
-    const auto& from = node["fromClause"][0];
-    if (from.contains("RangeVar")) {
-      stmt.from_table = from["RangeVar"]["relname"].get<std::string>();
-      if (from["RangeVar"].contains("alias") &&
-          !from["RangeVar"]["alias"].is_null()) {
-        stmt.from_alias =
-            from["RangeVar"]["alias"]["aliasname"].get<std::string>();
-      }
-    } else if (from.contains("JoinExpr")) {
-      // JOIN: left arg is the main table, right arg is the join target
-      const auto& join_expr = from["JoinExpr"];
-
-      // Left (main) table
-      if (join_expr.contains("larg") && join_expr["larg"].contains("RangeVar")) {
-        const auto& larg = join_expr["larg"]["RangeVar"];
-        stmt.from_table = larg["relname"].get<std::string>();
-        if (larg.contains("alias") && !larg["alias"].is_null()) {
-          stmt.from_alias = larg["alias"]["aliasname"].get<std::string>();
+    for (const auto& from : node["fromClause"]) {
+      if (from.contains("RangeVar")) {
+        ast::FromSource src;
+        src.table_name = from["RangeVar"]["relname"].get<std::string>();
+        if (from["RangeVar"].contains("alias") &&
+            !from["RangeVar"]["alias"].is_null()) {
+          src.alias =
+              from["RangeVar"]["alias"]["aliasname"].get<std::string>();
         }
-      }
+        stmt.from_tables.push_back(std::move(src));
+      } else if (from.contains("JoinExpr")) {
+        // JOIN: left arg is the main table, right arg is the join target
+        const auto& join_expr = from["JoinExpr"];
 
-      // Right (join target)
-      if (join_expr.contains("rarg") && join_expr["rarg"].contains("RangeVar")) {
-        ast::JoinClause jc;
-        const auto& rarg = join_expr["rarg"]["RangeVar"];
-        jc.table_name = rarg["relname"].get<std::string>();
-        if (rarg.contains("alias") && !rarg["alias"].is_null()) {
-          jc.table_alias = rarg["alias"]["aliasname"].get<std::string>();
+        // Left (main) table
+        if (join_expr.contains("larg") && join_expr["larg"].contains("RangeVar")) {
+          const auto& larg = join_expr["larg"]["RangeVar"];
+          stmt.from_table = larg["relname"].get<std::string>();
+          if (larg.contains("alias") && !larg["alias"].is_null()) {
+            stmt.from_alias = larg["alias"]["aliasname"].get<std::string>();
+          }
         }
 
-        std::string jointype = join_expr.value("jointype", "JOIN_INNER");
-        if (jointype == "JOIN_LEFT") jc.join_type = "LEFT";
-        else if (jointype == "JOIN_RIGHT") jc.join_type = "RIGHT";
-        else jc.join_type = "INNER";
+        // Right (join target)
+        if (join_expr.contains("rarg") && join_expr["rarg"].contains("RangeVar")) {
+          ast::JoinClause jc;
+          const auto& rarg = join_expr["rarg"]["RangeVar"];
+          jc.table_name = rarg["relname"].get<std::string>();
+          if (rarg.contains("alias") && !rarg["alias"].is_null()) {
+            jc.table_alias = rarg["alias"]["aliasname"].get<std::string>();
+          }
 
-        if (join_expr.contains("quals") && !join_expr["quals"].is_null()) {
-          jc.on_condition = convert_expr(join_expr["quals"]);
+          std::string jointype = join_expr.value("jointype", "JOIN_INNER");
+          if (jointype == "JOIN_LEFT") jc.join_type = "LEFT";
+          else if (jointype == "JOIN_RIGHT") jc.join_type = "RIGHT";
+          else jc.join_type = "INNER";
+
+          if (join_expr.contains("quals") && !join_expr["quals"].is_null()) {
+            jc.on_condition = convert_expr(join_expr["quals"]);
+          }
+
+          stmt.join_clauses.push_back(std::move(jc));
         }
-
-        stmt.join_clauses.push_back(std::move(jc));
       }
+    }
+
+    if (!stmt.from_tables.empty()) {
+      stmt.from_table = stmt.from_tables[0].table_name;
+      stmt.from_alias = stmt.from_tables[0].alias;
     }
   }
 

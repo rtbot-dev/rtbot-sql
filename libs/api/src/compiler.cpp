@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <variant>
@@ -29,15 +30,11 @@ CompilationResult make_error(const std::string& msg) {
   return r;
 }
 
-// Build a Scope from a CatalogSnapshot for a given source table.
-analyzer::Scope build_scope(const std::string& source,
-                            const CatalogSnapshot& catalog) {
-  analyzer::Scope scope;
-
+StreamSchema lookup_schema(const std::string& source,
+                           const CatalogSnapshot& catalog) {
   auto it_stream = catalog.streams.find(source);
   if (it_stream != catalog.streams.end()) {
-    scope.register_stream(source, it_stream->second);
-    return scope;
+    return it_stream->second;
   }
 
   auto it_view = catalog.views.find(source);
@@ -48,8 +45,7 @@ analyzer::Scope build_scope(const std::string& source,
     for (const auto& [name, idx] : it_view->second.field_map) {
       schema.columns.push_back({name, idx});
     }
-    scope.register_stream(source, schema);
-    return scope;
+    return schema;
   }
 
   // TODO: Review table-as-source approach. Currently tables are treated
@@ -59,12 +55,18 @@ analyzer::Scope build_scope(const std::string& source,
   // engine cannot wire it correctly yet.
   auto it_table = catalog.tables.find(source);
   if (it_table != catalog.tables.end()) {
-    StreamSchema schema{it_table->second.name, it_table->second.columns};
-    scope.register_stream(source, schema);
-    return scope;
+    return StreamSchema{it_table->second.name, it_table->second.columns};
   }
 
   throw std::runtime_error("unknown source: " + source);
+}
+
+// Build a Scope from a CatalogSnapshot for a given source table.
+analyzer::Scope build_scope(const std::string& source,
+                            const CatalogSnapshot& catalog) {
+  analyzer::Scope scope;
+  scope.register_stream(source, lookup_schema(source, catalog));
+  return scope;
 }
 
 // Build a Catalog object from a snapshot (needed by planner).
@@ -82,10 +84,119 @@ catalog::Catalog snapshot_to_catalog(const CatalogSnapshot& snap) {
   return cat;
 }
 
+CompilationResult compile_stream_cross_select(
+    const parser::ast::SelectStmt& stmt,
+    const CatalogSnapshot& catalog) {
+  CompilationResult result{};
+
+  int n_sources = static_cast<int>(stmt.from_tables.size());
+  if (n_sources <= 1) {
+    return make_error("cross-select requires multiple FROM sources");
+  }
+
+  compiler::GraphBuilder builder;
+  builder.add_operator("input_0", "Input",
+                       {{"numInputPorts", static_cast<double>(n_sources)}});
+
+  analyzer::Scope scope;
+  std::map<std::string, compiler::Endpoint> source_ports;
+  for (int i = 0; i < n_sources; ++i) {
+    const auto& src = stmt.from_tables[i];
+    auto scope_schema = lookup_schema(src.table_name, catalog);
+    scope.register_stream(src.table_name, scope_schema,
+                          src.alias.empty() ? "" : src.alias);
+    source_ports[src.table_name] = {"input_0", "o" + std::to_string(i + 1)};
+  }
+
+  compiler::Endpoint current{"input_0", "o1"};
+
+  auto alias_map = compiler::build_alias_map(stmt.select_list);
+
+  std::vector<parser::ast::SelectItem> expanded_select;
+  expanded_select.reserve(stmt.select_list.size());
+  for (const auto& item : stmt.select_list) {
+    expanded_select.push_back(
+        {compiler::expand_aliases(item.expr, alias_map), item.alias});
+  }
+
+  std::optional<parser::ast::Expr> expanded_where;
+  if (stmt.where_clause.has_value()) {
+    expanded_where = compiler::expand_aliases(*stmt.where_clause, alias_map);
+    if (compiler::expr_has_aggregate(*expanded_where)) {
+      return make_error(
+          "aggregate function not allowed in WHERE clause; use HAVING");
+    }
+  }
+
+  if (expanded_where.has_value()) {
+    current = compiler::compile_where(*expanded_where, current, scope, builder,
+                                      &source_ports);
+  }
+
+  if (!stmt.order_by.empty() && !stmt.limit.has_value()) {
+    return make_error("ORDER BY requires LIMIT in streaming context");
+  }
+
+  if (!stmt.group_by.empty()) {
+    return make_error("GROUP BY with multiple FROM sources is not yet supported");
+  }
+
+  auto [ep, field_map] = compiler::compile_select_projection(
+      expanded_select, current, scope, builder, &source_ports);
+  current = ep;
+
+  if (!stmt.order_by.empty() && stmt.limit.has_value()) {
+    const auto& ob = stmt.order_by[0];
+    int score_index = -1;
+    if (auto* col = std::get_if<parser::ast::ColumnRef>(&ob.expr)) {
+      auto it = field_map.find(col->column_name);
+      if (it != field_map.end()) {
+        score_index = it->second;
+      }
+    }
+    if (score_index < 0) {
+      return make_error("ORDER BY column not found in SELECT list");
+    }
+    auto topk_id = builder.next_id("topk");
+    builder.add_operator(topk_id, "TopK",
+                         {{"k", static_cast<double>(*stmt.limit)},
+                          {"score_index", static_cast<double>(score_index)}},
+                         {{"descending", ob.descending ? "true" : "false"}});
+    builder.connect(current, {topk_id, "i1"});
+    current = {topk_id, "o1"};
+  }
+
+  builder.add_operator("output_0", "Output");
+  builder.connect(current, {"output_0", "i1"});
+
+  auto validation_errors = builder.validate();
+  if (!validation_errors.empty()) {
+    CompilationResult err_result{};
+    for (const auto& msg : validation_errors) {
+      err_result.errors.push_back({"graph validation: " + msg, -1, -1});
+    }
+    return err_result;
+  }
+
+  result.program_json = builder.to_json();
+  result.field_map = field_map;
+  result.source_streams.clear();
+  for (const auto& src : stmt.from_tables) {
+    result.source_streams.push_back(src.table_name);
+  }
+  result.view_type = ViewType::SCALAR;
+  result.key_index = -1;
+  return result;
+}
+
 // Compile a SELECT query that needs a full operator graph (Tier 3 or GROUP BY).
 CompilationResult compile_select_to_program(
     const parser::ast::SelectStmt& stmt, const CatalogSnapshot& catalog) {
   CompilationResult result{};
+
+  if (stmt.from_tables.size() > 1) {
+    return compile_stream_cross_select(stmt, catalog);
+  }
 
   auto scope = build_scope(stmt.from_table, catalog);
   compiler::GraphBuilder builder;
@@ -393,6 +504,7 @@ CompilationResult handle_select(const parser::ast::SelectStmt& stmt,
       parser::ast::SelectStmt expanded_stmt_t12;
       expanded_stmt_t12.from_table = stmt.from_table;
       expanded_stmt_t12.from_alias = stmt.from_alias;
+      expanded_stmt_t12.from_tables = stmt.from_tables;
       expanded_stmt_t12.limit = stmt.limit;
       for (const auto& item : stmt.select_list) {
         expanded_stmt_t12.select_list.push_back(
@@ -575,7 +687,9 @@ CompilationResult handle_create_mat_view(
 
   try {
     CompilationResult compiled;
-    if (!stmt.query.join_clauses.empty()) {
+    if (stmt.query.from_tables.size() > 1) {
+      compiled = compile_stream_cross_select(stmt.query, catalog);
+    } else if (!stmt.query.join_clauses.empty()) {
       compiled = compile_joined_select(stmt.query, catalog);
     } else {
       compiled = compile_select_to_program(stmt.query, catalog);

@@ -36,9 +36,12 @@ std::string invert_comparison(const std::string& op) {
 Endpoint compile_comparison(const parser::ast::ComparisonExpr& cmp,
                             const Endpoint& input_endpoint,
                             const analyzer::Scope& scope,
-                            GraphBuilder& builder) {
-  auto left = compile_expression(cmp.left, input_endpoint, scope, builder);
-  auto right = compile_expression(cmp.right, input_endpoint, scope, builder);
+                            GraphBuilder& builder,
+                            const std::map<std::string, Endpoint>* source_endpoints) {
+  auto left = compile_expression(cmp.left, input_endpoint, scope, builder,
+                                 nullptr, source_endpoints);
+  auto right = compile_expression(cmp.right, input_endpoint, scope, builder,
+                                  nullptr, source_endpoints);
 
   auto* left_const = std::get_if<ConstantMarker>(&left);
   auto* right_const = std::get_if<ConstantMarker>(&right);
@@ -104,20 +107,24 @@ Endpoint compile_comparison(const parser::ast::ComparisonExpr& cmp,
 Endpoint compile_predicate(const parser::ast::Expr& expr,
                            const Endpoint& input_endpoint,
                            const analyzer::Scope& scope,
-                           GraphBuilder& builder) {
+                           GraphBuilder& builder,
+                           const std::map<std::string, Endpoint>* source_endpoints) {
   using namespace parser::ast;
 
   // ComparisonExpr → CompareScalar
   if (auto* cmp_ptr = std::get_if<std::unique_ptr<ComparisonExpr>>(&expr)) {
-    return compile_comparison(**cmp_ptr, input_endpoint, scope, builder);
+    return compile_comparison(**cmp_ptr, input_endpoint, scope, builder,
+                              source_endpoints);
   }
 
   // LogicalExpr → LogicalAnd / LogicalOr
   if (auto* log_ptr = std::get_if<std::unique_ptr<LogicalExpr>>(&expr)) {
     const auto& log = **log_ptr;
-    auto left_ep = compile_predicate(log.left, input_endpoint, scope, builder);
+    auto left_ep = compile_predicate(log.left, input_endpoint, scope, builder,
+                                     source_endpoints);
     auto right_ep =
-        compile_predicate(log.right, input_endpoint, scope, builder);
+        compile_predicate(log.right, input_endpoint, scope, builder,
+                          source_endpoints);
 
     std::string upper_op = log.op;
     std::transform(upper_op.begin(), upper_op.end(), upper_op.begin(),
@@ -146,9 +153,11 @@ Endpoint compile_predicate(const parser::ast::Expr& expr,
       // Build an inverted comparison
       auto inverted_op = invert_comparison(cmp.op);
       auto left =
-          compile_expression(cmp.left, input_endpoint, scope, builder);
+          compile_expression(cmp.left, input_endpoint, scope, builder, nullptr,
+                             source_endpoints);
       auto right =
-          compile_expression(cmp.right, input_endpoint, scope, builder);
+          compile_expression(cmp.right, input_endpoint, scope, builder,
+                             nullptr, source_endpoints);
 
       auto* right_const = std::get_if<ConstantMarker>(&right);
       if (!right_const) {
@@ -171,16 +180,19 @@ Endpoint compile_predicate(const parser::ast::Expr& expr,
     const auto& btw = **btw_ptr;
 
     auto expr_result =
-        compile_expression(btw.expr, input_endpoint, scope, builder);
+        compile_expression(btw.expr, input_endpoint, scope, builder, nullptr,
+                           source_endpoints);
     if (std::holds_alternative<ConstantMarker>(expr_result)) {
       throw std::runtime_error("BETWEEN on constant expression not supported");
     }
     auto& stream_ep = std::get<Endpoint>(expr_result);
 
     auto low_result =
-        compile_expression(btw.low, input_endpoint, scope, builder);
+        compile_expression(btw.low, input_endpoint, scope, builder, nullptr,
+                           source_endpoints);
     auto high_result =
-        compile_expression(btw.high, input_endpoint, scope, builder);
+        compile_expression(btw.high, input_endpoint, scope, builder, nullptr,
+                           source_endpoints);
     auto* low_const = std::get_if<ConstantMarker>(&low_result);
     auto* high_const = std::get_if<ConstantMarker>(&high_result);
     if (!low_const || !high_const) {
@@ -211,8 +223,10 @@ Endpoint compile_predicate(const parser::ast::Expr& expr,
 Endpoint compile_where(const parser::ast::Expr& where_clause,
                        const Endpoint& input_endpoint,
                        const analyzer::Scope& scope,
-                       GraphBuilder& builder) {
-  auto bool_ep = compile_predicate(where_clause, input_endpoint, scope, builder);
+                       GraphBuilder& builder,
+                       const std::map<std::string, Endpoint>* source_endpoints) {
+  auto bool_ep = compile_predicate(where_clause, input_endpoint, scope, builder,
+                                   source_endpoints);
 
   auto demux_id = builder.next_id("demux");
   builder.add_operator(demux_id, "Demultiplexer", {{"numPorts", 1}},
