@@ -1,6 +1,6 @@
-# RTBot SQL Language Reference
+# RtBot SQL Language Reference
 
-RTBot SQL compiles standard SQL into incremental operator graphs that process data one message at a time. Every query is *maintained*, not recomputed — results update as each message arrives, with O(1) cost per message for most operations.
+RtBot SQL compiles standard SQL into incremental operator graphs that process data one message at a time. Every query is *maintained*, not recomputed — results update as each message arrives, with O(1) cost per message for most operations.
 
 All values are IEEE 754 double-precision floating-point. There are no string, boolean, or timestamp column types — timestamps are carried as event-time values within the data itself.
 
@@ -24,7 +24,7 @@ CREATE TABLE stream_name (
 
 **Description:**
 
-Registers a named stream with an ordered list of columns. Each column maps to a positional index in the input vector (column1 = index 0, column2 = index 1, etc.). No timestamp column is needed — RTBot assigns event timestamps automatically from the message arrival sequence.
+Registers a named stream with an ordered list of columns. Each column maps to a positional index in the input vector (column1 = index 0, column2 = index 1, etc.). No timestamp column is needed — RtBot assigns event timestamps automatically from the message arrival sequence.
 
 **Example:**
 
@@ -99,7 +99,7 @@ CREATE MATERIALIZED VIEW view_name AS
 
 **Description:**
 
-Compiles the SELECT query into an RTBot program (a DAG of operators) and deploys it. The view updates on every incoming message — not on a schedule, not on a trigger. It is always current. The result is readable via `SELECT * FROM view_name`.
+Compiles the SELECT query into an RtBot program (a DAG of operators) and deploys it. The view updates on every incoming message — not on a schedule, not on a trigger. It is always current. The result is readable via `SELECT * FROM view_name`.
 
 **Example:**
 
@@ -469,7 +469,7 @@ SELECT ... FROM source ORDER BY column [ASC|DESC] LIMIT n
 
 **Description:**
 
-Compiles to a `TopK` operator. ORDER BY without LIMIT is an error — RTBot does not sort unbounded streams.
+Compiles to a `TopK` operator. ORDER BY without LIMIT is an error — RtBot does not sort unbounded streams.
 
 **Example:**
 
@@ -789,7 +789,7 @@ STDDEV(expr, window_size)
 
 **Description:**
 
-Computes the standard deviation of the last `window_size` values. O(1) per message using Welford's online algorithm. This is what makes Bollinger-style anomaly detection a one-liner in RTBot SQL.
+Computes the standard deviation of the last `window_size` values. O(1) per message using Welford's online algorithm. This is what makes Bollinger-style anomaly detection a one-liner in RtBot SQL.
 
 **Parameters:**
 
@@ -1046,7 +1046,7 @@ CREATE MATERIALIZED VIEW peaks AS
 
 Scalar math functions operate element-wise on each message. They are stateless — no incremental behavior section needed. All accept a single argument and return a single value.
 
-| Function | Description | RTBot Operator |
+| Function | Description | RtBot Operator |
 |----------|-------------|----------------|
 | `ABS(expr)` | Absolute value | `Abs` |
 | `FLOOR(expr)` | Round down to nearest integer | `Floor` |
@@ -1109,7 +1109,7 @@ Scalar comparison is used when one side is a constant (e.g., `price > 100`). Syn
 
 ### Logical Operators
 
-| Operator | Description | RTBot Operator |
+| Operator | Description | RtBot Operator |
 |----------|-------------|----------------|
 | `AND` | Logical conjunction | `LogicalAnd` |
 | `OR` | Logical disjunction | `LogicalOr` |
@@ -1192,7 +1192,7 @@ The table state is maintained via its changelog stream. The `KeyedVariable` oper
 
 ### Incremental Semantics
 
-Every RTBot SQL query is **maintained**, not recomputed. The compiled operator graph processes each incoming message and updates internal state. The output reflects the current aggregate state, not a batch recomputation over all historical data.
+Every RtBot SQL query is **maintained**, not recomputed. The compiled operator graph processes each incoming message and updates internal state. The output reflects the current aggregate state, not a batch recomputation over all historical data.
 
 **What "maintained" means:**
 
@@ -1258,7 +1258,7 @@ De-duplication also applies between SELECT and HAVING: `COUNT(*)` used in both c
 
 ### Determinism Guarantees
 
-RTBot SQL provides **execution determinism**: the same input data produces identical results on any deployment, at any time, without requiring the same persisted metadata state.
+RtBot SQL provides **execution determinism**: the same input data produces identical results on any deployment, at any time, without requiring the same persisted metadata state.
 
 **Conditions for identical results:**
 
@@ -1268,7 +1268,7 @@ RTBot SQL provides **execution determinism**: the same input data produces ident
 
 That's it. No need for the same deployment, the same cluster configuration, or the same wall-clock time.
 
-**Why RTBot is deterministic:**
+**Why RtBot is deterministic:**
 
 | Property | Guarantee |
 |----------|-----------|
@@ -1285,7 +1285,7 @@ That's it. No need for the same deployment, the same cluster configuration, or t
 - **Cross-environment consistency:** Development, staging, and production produce identical results from identical data.
 - **Compliance:** Regulators can independently verify that the system produces the claimed outputs from the claimed inputs.
 
-This is a strictly stronger guarantee than **recovery determinism** (same persisted state → same results), which is what distributed streaming systems typically offer. RTBot doesn't need persisted reclocking decisions because timestamps are in the data — there is nothing to "decide."
+This is a strictly stronger guarantee than **recovery determinism** (same persisted state → same results), which is what distributed streaming systems typically offer. RtBot doesn't need persisted reclocking decisions because timestamps are in the data — there is nothing to "decide."
 
 ---
 
@@ -1349,7 +1349,7 @@ The compiler collects all detectable errors before returning — it does not fai
 
 ## Worked Example: Bollinger Bands
 
-The canonical RTBot SQL example — a complete Bollinger Bands computation in 7 lines.
+The canonical RtBot SQL example — a complete Bollinger Bands computation in 7 lines.
 
 ```sql
 CREATE MATERIALIZED VIEW bollinger AS
