@@ -20,7 +20,10 @@ jobs:
           - os: ubuntu-24.04-arm
             arch: aarch64
             platform: linux
-          - os: macos-13
+          - # macos-13 is unavailable in this repo's runner configuration.
+            # Use an explicit Intel image for x86_64 wheel builds.
+            # Keep architecture tag as x86_64.
+            os: macos-15-intel
             arch: x86_64
             platform: darwin
           - os: macos-latest
@@ -78,7 +81,7 @@ jobs:
           echo "wheel_target=//runtimes/python:rtbot_sql_whl_${cp_tag}" >> "$GITHUB_OUTPUT"
 
       - name: Build wheel with Bazel
-        run: bazel build --override_module=rtbot="${RTBOT_DIR}" "${{ steps.resolve.outputs.wheel_target }}"
+        run: bazel build --override_module=rtbot="${RTBOT_DIR}" --cxxopt=-Wno-c++11-narrowing "${{ steps.resolve.outputs.wheel_target }}"
 
       - name: Upload built wheel artifact
         uses: actions/upload-artifact@v4
