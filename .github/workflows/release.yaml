@@ -55,6 +55,9 @@ jobs:
           set -euo pipefail
           git clone "https://x-access-token:${RTBOT_REPO_READ_TOKEN}@github.com/rtbot-dev/rtbot.git" "${RUNNER_TEMP}/rtbot"
           git -C "${RUNNER_TEMP}/rtbot" checkout "${{ vars.RTBOT_REF }}"
+          if [ ! -f "${RUNNER_TEMP}/rtbot/tools/BUILD.bazel" ]; then
+            printf 'exports_files(["non_bcr_deps.bzl"])\n' > "${RUNNER_TEMP}/rtbot/tools/BUILD.bazel"
+          fi
           echo "RTBOT_DIR=${RUNNER_TEMP}/rtbot" >> "$GITHUB_ENV"
 
       - name: Setup Bazel
