@@ -1,5 +1,8 @@
 name: CI
 
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main]
@@ -15,6 +18,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Validate RTBot ref
+        shell: bash
+        run: |
+          if [ -z "${{ vars.RTBOT_REF }}" ]; then
+            echo "Repository variable RTBOT_REF must be set to an rtbot tag or commit SHA."
+            exit 1
+          fi
+
+      - name: Create RTBot app token
+        id: rtbot_app_token
+        if: ${{ secrets.RTBOT_APP_ID != '' && secrets.RTBOT_APP_PRIVATE_KEY != '' }}
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.RTBOT_APP_ID }}
+          private-key: ${{ secrets.RTBOT_APP_PRIVATE_KEY }}
+          owner: rtbot-dev
+
+      - name: Checkout RTBot
+        uses: actions/checkout@v4
+        with:
+          repository: rtbot-dev/rtbot
+          ref: ${{ vars.RTBOT_REF }}
+          token: ${{ steps.rtbot_app_token.outputs.token || secrets.RTBOT_REPO_READ_TOKEN || github.token }}
+          path: rtbot
+
       - name: Setup Bazel
         uses: bazel-contrib/setup-bazel@0.14.0
         with:
@@ -23,7 +51,7 @@ jobs:
           repository-cache: true
 
       - name: Build
-        run: bazel build //...
+        run: bazel build --override_module=rtbot="${GITHUB_WORKSPACE}/rtbot" //...
 
       - name: Test
-        run: bazel test //...
+        run: bazel test --override_module=rtbot="${GITHUB_WORKSPACE}/rtbot" //...
