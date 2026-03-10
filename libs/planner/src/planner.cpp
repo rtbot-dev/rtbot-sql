@@ -1,5 +1,6 @@
 #include "rtbot_sql/planner/planner.h"
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 
