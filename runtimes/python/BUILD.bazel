@@ -4,6 +4,8 @@ load("@rules_python//python:packaging.bzl", "py_package", "py_wheel")
 
 package(default_visibility = ["//visibility:public"])
 
+exports_files(["sql_bindings.cpp"])
+
 config_setting(
     name = "macos_arm64",
     constraint_values = [
@@ -44,6 +46,12 @@ config_setting(
     ],
 )
 
+py_library(
+    name = "rtbot_sql_py",
+    srcs = glob(["rtbot_sql/**/*.py"]),
+    imports = ["."],
+)
+
 cc_binary(
     name = "_rtbot_sql_native.so",
     srcs = ["sql_bindings.cpp"],
@@ -78,9 +86,8 @@ genrule(
 
 py_library(
     name = "rtbot_sql",
-    srcs = glob(["rtbot_sql/**/*.py"]),
     data = [":native_module_in_package"],
-    imports = ["."],
+    deps = [":rtbot_sql_py"],
 )
 
 py_package(
@@ -88,31 +95,84 @@ py_package(
     deps = [":rtbot_sql"],
 )
 
-py_wheel(
-    name = "rtbot_sql_wheel",
-    abi = "cp311",
-    distribution = "rtbot-sql",
-    platform = select({
-        ":macos_arm64": "macosx_11_0_arm64",
-        ":macos_x86_64": "macosx_10_14_x86_64",
-        ":linux_arm64": "manylinux2014_aarch64",
-        ":linux_x86_64": "manylinux2014_x86_64",
-        ":windows_x86_64": "win_amd64",
-        "//conditions:default": "any",
+_WHEEL_PLATFORM = select({
+    ":macos_arm64": "macosx_11_0_arm64",
+    ":macos_x86_64": "macosx_10_14_x86_64",
+    ":linux_arm64": "manylinux2014_aarch64",
+    ":linux_x86_64": "manylinux2014_x86_64",
+    ":windows_x86_64": "win_amd64",
+    "//conditions:default": "any",
+})
+
+_WHEEL_MATRIX = [
+    {"tag": "cp310", "python_repo": "@python_3_10"},
+    {"tag": "cp311", "python_repo": "@python_3_11"},
+    {"tag": "cp312", "python_repo": "@python_3_12"},
+    {"tag": "cp313", "python_repo": "@python_3_13"},
+]
+
+[cc_binary(
+    name = "_rtbot_sql_native_%s.so" % _entry["tag"],
+    srcs = ["sql_bindings.cpp"],
+    copts = select({
+        "@pybind11//:msvc_compiler": [],
+        "//conditions:default": [
+            "-fexceptions",
+            "-fvisibility=hidden",
+        ],
     }),
-    python_tag = "cp311",
-    strip_path_prefixes = ["runtimes/python"],
+    linkopts = select({
+        "@pybind11//:msvc_compiler": [],
+        "@pybind11//:osx": [],
+        "//conditions:default": ["-Wl,-Bsymbolic"],
+    }),
+    linkshared = 1,
+    deps = [
+        "//libs/api:api_compiler",
+        "@rtbot//libs/api:rtbot-api",
+        "@pybind11",
+        "%s//:python_headers" % _entry["python_repo"],
+        "%s//:libpython" % _entry["python_repo"],
+    ],
+) for _entry in _WHEEL_MATRIX]
+
+[genrule(
+    name = "native_module_in_package_%s" % _entry["tag"],
+    srcs = [":_rtbot_sql_native_%s.so" % _entry["tag"]],
+    outs = ["%s/rtbot_sql/_rtbot_sql_native.so" % _entry["tag"]],
+    cmd = "cp $(location :_rtbot_sql_native_%s.so) $@" % _entry["tag"],
+) for _entry in _WHEEL_MATRIX]
+
+[py_library(
+    name = "rtbot_sql_%s" % _entry["tag"],
+    data = [":native_module_in_package_%s" % _entry["tag"]],
+    deps = [":rtbot_sql_py"],
+) for _entry in _WHEEL_MATRIX]
+
+[py_package(
+    name = "rtbot_sql_pkg_%s" % _entry["tag"],
+    deps = [":rtbot_sql_%s" % _entry["tag"]],
+) for _entry in _WHEEL_MATRIX]
+
+[py_wheel(
+    name = "rtbot_sql_wheel_%s" % _entry["tag"],
+    abi = _entry["tag"],
+    distribution = "rtbot-sql",
+    platform = _WHEEL_PLATFORM,
+    python_tag = _entry["tag"],
+    strip_path_prefixes = [
+        "runtimes/python/%s" % _entry["tag"],
+        "runtimes/python",
+    ],
     version = "{STABLE_RTBOT_SQL_VERSION}",
     stamp = 1,
-    deps = [":rtbot_sql_pkg"],
-)
+    deps = [":rtbot_sql_pkg_%s" % _entry["tag"]],
+) for _entry in _WHEEL_MATRIX]
 
-genrule(
-    name = "rtbot_sql_whl",
-    srcs = [":rtbot_sql_wheel.dist"],
-    outs = ["rtbot_sql.whl"],
-    cmd = "cp $(location :rtbot_sql_wheel.dist)/*.whl $@",
-)
+[alias(
+    name = "rtbot_sql_whl_%s" % _entry["tag"],
+    actual = ":rtbot_sql_wheel_%s" % _entry["tag"],
+) for _entry in _WHEEL_MATRIX]
 
 py_test(
     name = "runtime_test",
