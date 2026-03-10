@@ -81,7 +81,7 @@ jobs:
           echo "wheel_target=//runtimes/python:rtbot_sql_whl_${cp_tag}" >> "$GITHUB_OUTPUT"
 
       - name: Build wheel with Bazel
-        run: bazel build --override_module=rtbot="${RTBOT_DIR}" --cxxopt=-Wno-c++11-narrowing "${{ steps.resolve.outputs.wheel_target }}"
+        run: bazel build --stamp --override_module=rtbot="${RTBOT_DIR}" --cxxopt=-Wno-c++11-narrowing "${{ steps.resolve.outputs.wheel_target }}"
 
       - name: Upload built wheel artifact
         uses: actions/upload-artifact@v4
