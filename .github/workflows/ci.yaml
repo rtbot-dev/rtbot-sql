@@ -37,12 +37,14 @@ jobs:
           fi
 
       - name: Checkout RTBot
-        uses: actions/checkout@v4
-        with:
-          repository: rtbot-dev/rtbot
-          ref: ${{ vars.RTBOT_REF }}
-          token: ${{ secrets.RTBOT_REPO_READ_TOKEN }}
-          path: rtbot
+        shell: bash
+        env:
+          RTBOT_REPO_READ_TOKEN: ${{ secrets.RTBOT_REPO_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          git clone "https://x-access-token:${RTBOT_REPO_READ_TOKEN}@github.com/rtbot-dev/rtbot.git" "${RUNNER_TEMP}/rtbot"
+          git -C "${RUNNER_TEMP}/rtbot" checkout "${{ vars.RTBOT_REF }}"
+          echo "RTBOT_DIR=${RUNNER_TEMP}/rtbot" >> "$GITHUB_ENV"
 
       - name: Setup Bazel
         uses: bazel-contrib/setup-bazel@0.14.0
@@ -52,7 +54,7 @@ jobs:
           repository-cache: true
 
       - name: Build
-        run: bazel build --override_module=rtbot="${GITHUB_WORKSPACE}/rtbot" //...
+        run: bazel build --override_module=rtbot="${RTBOT_DIR}" //...
 
       - name: Test
-        run: bazel test --override_module=rtbot="${GITHUB_WORKSPACE}/rtbot" //...
+        run: bazel test --override_module=rtbot="${RTBOT_DIR}" //...
