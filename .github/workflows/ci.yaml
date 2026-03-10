@@ -17,7 +17,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6.0.2
 
       - name: Validate pinned RTBot ref
         shell: bash
@@ -51,7 +51,7 @@ jobs:
           echo "RTBOT_DIR=${RUNNER_TEMP}/rtbot" >> "$GITHUB_ENV"
 
       - name: Setup Bazel toolchain
-        uses: bazel-contrib/setup-bazel@0.14.0
+        uses: bazel-contrib/setup-bazel@0.18.0
         with:
           bazelisk-cache: true
           disk-cache: ${{ github.workflow }}

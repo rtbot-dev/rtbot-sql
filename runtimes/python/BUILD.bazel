@@ -171,7 +171,7 @@ _WHEEL_MATRIX = [
 
 [alias(
     name = "rtbot_sql_whl_%s" % _entry["tag"],
-    actual = ":rtbot_sql_wheel_%s" % _entry["tag"],
+    actual = ":rtbot_sql_wheel_%s.dist" % _entry["tag"],
 ) for _entry in _WHEEL_MATRIX]
 
 py_test(
