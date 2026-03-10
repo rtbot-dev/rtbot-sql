@@ -2,6 +2,31 @@
 
 SQL compiler for RTBot. Translates SQL queries into RTBot operator graphs (JSON programs) that run on RTBot's streaming runtime.
 
+## Python package quick-start
+
+Python wheels are published as GitHub Release assets for each supported platform and Python ABI.
+
+1. Open the latest release and download the wheel that matches your OS/CPU and Python tag.
+2. Install from the downloaded wheel file.
+
+```bash
+pip install ./rtbot_sql-<version>-cp313-cp313-<platform>.whl
+```
+
+Wheel selection guidance:
+- Linux x86_64: `manylinux*_x86_64` with `cp310`, `cp311`, `cp312`, or `cp313`
+- Linux aarch64: `manylinux*_aarch64` with `cp310`, `cp311`, `cp312`, or `cp313`
+- macOS x86_64 (Intel): `macosx_*_x86_64` with `cp310`, `cp311`, `cp312`, or `cp313`
+- macOS arm64 (Apple Silicon): `macosx_*_arm64` with `cp310`, `cp311`, `cp312`, or `cp313`
+
+Tiny smoke test:
+
+```python
+from rtbot_sql import RtBotSql
+
+print("rtbot-sql import OK:", RtBotSql)
+```
+
 ## Quick start
 
 ```bash
@@ -186,3 +211,13 @@ dist/bin/apps/cli/rtbot-sql --file examples/queries/bollinger.sql --catalog exam
 | `IIR(expr, ARRAY[...], ARRAY[...])` | DSP | Infinite impulse response filter |
 | `RESAMPLE(expr, N)` | DSP | Constant-rate resampling |
 | `PEAK_DETECT(expr, N)` | DSP | Peak detection |
+
+## License
+
+This project is licensed under the Business Source License 1.1 (`BUSL-1.1`).
+
+- Licensor: `rtbot-dev`
+- Change Date: `2029-03-10`
+- Change License: `Apache-2.0`
+
+See `LICENSE` for full terms.
