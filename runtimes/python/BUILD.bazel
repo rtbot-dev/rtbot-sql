@@ -105,8 +105,6 @@ _WHEEL_PLATFORM = select({
 })
 
 _WHEEL_MATRIX = [
-    {"tag": "cp310", "python_repo": "@python_3_10"},
-    {"tag": "cp311", "python_repo": "@python_3_11"},
     {"tag": "cp312", "python_repo": "@python_3_12"},
     {"tag": "cp313", "python_repo": "@python_3_13"},
 ]

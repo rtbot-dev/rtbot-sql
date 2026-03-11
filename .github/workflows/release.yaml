@@ -12,7 +12,7 @@ jobs:
     name: Build wheel (${{ matrix.target.platform }}-${{ matrix.target.arch }}, py${{ matrix.python-version }})
     strategy:
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        python-version: ["3.12", "3.13"]
         target:
           - os: ubuntu-latest
             arch: x86_64
@@ -92,6 +92,61 @@ jobs:
 
       # TODO (batch 21): build release targets, create tarball + SHA256, upload artifacts
 
+  windows_experimental:
+    name: Build wheel (windows-x86_64, py3.13, experimental)
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6.0.2
+
+      - name: Validate pinned RTBot ref
+        shell: bash
+        run: |
+          if [ -z "${{ vars.RTBOT_REF }}" ]; then
+            echo "Repository variable RTBOT_REF must be set to an rtbot tag or commit SHA."
+            exit 1
+          fi
+
+      - name: Validate RTBot checkout token
+        shell: bash
+        env:
+          RTBOT_REPO_READ_TOKEN: ${{ secrets.RTBOT_REPO_READ_TOKEN }}
+        run: |
+          if [ -z "$RTBOT_REPO_READ_TOKEN" ]; then
+            echo "Repository secret RTBOT_REPO_READ_TOKEN must be set for cross-repo checkout."
+            exit 1
+          fi
+
+      - name: Checkout pinned RTBot source
+        shell: bash
+        env:
+          RTBOT_REPO_READ_TOKEN: ${{ secrets.RTBOT_REPO_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          git clone "https://x-access-token:${RTBOT_REPO_READ_TOKEN}@github.com/rtbot-dev/rtbot.git" "${RUNNER_TEMP}/rtbot"
+          git -C "${RUNNER_TEMP}/rtbot" checkout "${{ vars.RTBOT_REF }}"
+          if [ ! -f "${RUNNER_TEMP}/rtbot/tools/BUILD.bazel" ]; then
+            printf 'exports_files(["non_bcr_deps.bzl"])\n' > "${RUNNER_TEMP}/rtbot/tools/BUILD.bazel"
+          fi
+          echo "RTBOT_DIR=${RUNNER_TEMP}/rtbot" >> "$GITHUB_ENV"
+
+      - name: Setup Bazel toolchain
+        uses: bazel-contrib/setup-bazel@0.18.0
+        with:
+          bazelisk-cache: true
+          repository-cache: true
+
+      - name: Build wheel with Bazel (experimental)
+        shell: bash
+        run: bazel build --stamp --override_module=rtbot="${RTBOT_DIR}" --cxxopt=-Wno-c++11-narrowing //runtimes/python:rtbot_sql_whl_cp313
+
+      - name: Upload Windows experimental wheel artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: rtbot-sql-experimental-wheel-windows-cp313
+          path: dist/bin/runtimes/python/rtbot_sql_wheel_cp313_dist/*.whl
+          if-no-files-found: error
+
   release:
     name: Publish release wheel assets
     needs: build
@@ -114,7 +169,7 @@ jobs:
 
           wheels=(release-wheels/*.whl)
           count=${#wheels[@]}
-          expected=16
+          expected=8
 
           if [ "$count" -ne "$expected" ]; then
             echo "Expected $expected wheels, found $count"

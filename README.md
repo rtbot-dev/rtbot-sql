@@ -14,10 +14,12 @@ pip install ./rtbot_sql-<version>-cp313-cp313-<platform>.whl
 ```
 
 Wheel selection guidance:
-- Linux x86_64: `manylinux*_x86_64` with `cp310`, `cp311`, `cp312`, or `cp313`
-- Linux aarch64: `manylinux*_aarch64` with `cp310`, `cp311`, `cp312`, or `cp313`
-- macOS x86_64 (Intel): `macosx_*_x86_64` with `cp310`, `cp311`, `cp312`, or `cp313`
-- macOS arm64 (Apple Silicon): `macosx_*_arm64` with `cp310`, `cp311`, `cp312`, or `cp313`
+- Linux x86_64: `manylinux*_x86_64` with `cp312` or `cp313`
+- Linux aarch64: `manylinux*_aarch64` with `cp312` or `cp313`
+- macOS x86_64 (Intel): `macosx_*_x86_64` with `cp312` or `cp313`
+- macOS arm64 (Apple Silicon): `macosx_*_arm64` with `cp312` or `cp313`
+
+Windows wheel support is currently experimental in CI and not yet published as a guaranteed release asset.
 
 Tiny smoke test:
 
