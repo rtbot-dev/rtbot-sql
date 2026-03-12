@@ -35,9 +35,6 @@ jobs:
           - os: windows-latest
             arch: x86_64
             platform: windows
-          - os: windows-11-arm
-            arch: arm64
-            platform: windows
     runs-on: ${{ matrix.target.os }}
     steps:
       - uses: actions/checkout@v5
@@ -147,7 +144,7 @@ jobs:
 
           wheels=(release-wheels/*.whl)
           count=${#wheels[@]}
-          expected=12
+          expected=10
 
           if [ "$count" -ne "$expected" ]; then
             echo "Expected $expected wheels, found $count"
