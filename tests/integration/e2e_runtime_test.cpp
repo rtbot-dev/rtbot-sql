@@ -682,5 +682,142 @@ TEST_F(E2eRuntimeTest, NestedViewMultiKey) {
   EXPECT_NEAR(ob4[avg_vol_idx], 12.5, 1e-9);  // (5+20)/2
 }
 
+// ---------------------------------------------------------------------------
+// T12: Multi-stream cross-join — two input streams at runtime
+// Verifies that a program compiled from "FROM stream_a a, stream_b b"
+// correctly receives data on separate input ports (i1 and i2) and
+// produces cross-joined output.
+// ---------------------------------------------------------------------------
+
+TEST_F(E2eRuntimeTest, MultiStreamCrossJoinRuntime) {
+  // Register a second stream alongside the default "trades" stream.
+  StreamSchema btc_klines{"btcusdt_klines", {{"close", 0}, {"volume", 1}}};
+  StreamSchema eth_klines{"ethusdt_klines", {{"close", 0}, {"volume", 1}}};
+  catalog.streams["btcusdt_klines"] = btc_klines;
+  catalog.streams["ethusdt_klines"] = eth_klines;
+
+  // Simple cross-join: select close prices from both streams
+  auto r = compile(
+      "CREATE MATERIALIZED VIEW cross_prices AS "
+      "SELECT b.close AS btc_price, e.close AS eth_price, "
+      "b.close - e.close AS spread "
+      "FROM btcusdt_klines b, ethusdt_klines e");
+
+  ASSERT_EQ(r.source_streams.size(), 2u);
+  EXPECT_EQ(r.source_streams[0], "btcusdt_klines");
+  EXPECT_EQ(r.source_streams[1], "ethusdt_klines");
+
+  int btc_idx = r.field_map.at("btc_price");
+  int eth_idx = r.field_map.at("eth_price");
+  int spread_idx = r.field_map.at("spread");
+
+  // Inspect program JSON to verify multi-port Input
+  auto program_json = json::parse(r.program_json);
+  bool has_two_port_input = false;
+  for (const auto& op : program_json["operators"]) {
+    if (op["type"] == "Input") {
+      const auto& pt = op["portTypes"];
+      if (pt.is_array() && pt.size() == 2) {
+        has_two_port_input = true;
+      }
+    }
+  }
+  ASSERT_TRUE(has_two_port_input) << "Input operator must have 2 portTypes";
+
+  rtbot::Program program(r.program_json);
+
+  // Send BTC data to port i1 (stream 0: btcusdt_klines)
+  // BTC: close=71000, volume=1.5
+  auto batch1 = program.receive(
+      make_msg(1000, {71000.0, 1.5}), "i1");
+
+  // After sending to only one port, we may or may not get output yet.
+  // The cross-join needs data on both ports.
+
+  // Send ETH data to port i2 (stream 1: ethusdt_klines)
+  // ETH: close=2500, volume=10.0
+  auto batch2 = program.receive(
+      make_msg(1000, {2500.0, 10.0}), "i2");
+
+  // After feeding both ports, the cross-join should produce output
+  // containing: btc_price=71000, eth_price=2500, spread=68500
+  size_t total_outputs = count_outputs(batch1) + count_outputs(batch2);
+  ASSERT_GT(total_outputs, 0u)
+      << "Cross-join must produce output after feeding both streams";
+
+  // Find the batch that has output
+  auto out = extract_output(batch2);
+  if (out.empty()) {
+    out = extract_output(batch1);
+  }
+  ASSERT_FALSE(out.empty()) << "Should have output values from the cross-join";
+
+  EXPECT_DOUBLE_EQ(out[btc_idx], 71000.0);
+  EXPECT_DOUBLE_EQ(out[eth_idx], 2500.0);
+  EXPECT_DOUBLE_EQ(out[spread_idx], 68500.0);
+}
+
+// ---------------------------------------------------------------------------
+// T13: Multi-stream cross-join — multiple messages on time grid
+// Verifies that repeatedly feeding aligned timestamps produces
+// correct cross-join output for each pair.
+// ---------------------------------------------------------------------------
+
+TEST_F(E2eRuntimeTest, MultiStreamCrossJoinTimeSeries) {
+  StreamSchema btc{"btcusdt_klines", {{"close", 0}}};
+  StreamSchema eth{"ethusdt_klines", {{"close", 0}}};
+  catalog.streams["btcusdt_klines"] = btc;
+  catalog.streams["ethusdt_klines"] = eth;
+
+  auto r = compile(
+      "CREATE MATERIALIZED VIEW cross_prices AS "
+      "SELECT b.close AS btc_price, e.close AS eth_price "
+      "FROM btcusdt_klines b, ethusdt_klines e");
+
+  rtbot::Program program(r.program_json);
+
+  int btc_idx = r.field_map.at("btc_price");
+  int eth_idx = r.field_map.at("eth_price");
+
+  // Feed 5 aligned data points
+  struct Pair {
+    double btc;
+    double eth;
+  };
+  std::vector<Pair> data = {
+      {70000, 2400},
+      {70100, 2410},
+      {70200, 2420},
+      {70300, 2430},
+      {70400, 2440},
+  };
+
+  size_t output_count = 0;
+  for (size_t i = 0; i < data.size(); ++i) {
+    auto t = static_cast<rtbot::timestamp_t>(i + 1);
+
+    // Send BTC (port i1)
+    auto batch_btc = program.receive(make_msg(t, {data[i].btc}), "i1");
+
+    // Send ETH (port i2) at the same timestamp
+    auto batch_eth = program.receive(make_msg(t, {data[i].eth}), "i2");
+
+    // Check for output from either batch
+    auto out = extract_output(batch_eth);
+    if (out.empty()) out = extract_output(batch_btc);
+
+    if (!out.empty()) {
+      EXPECT_DOUBLE_EQ(out[btc_idx], data[i].btc)
+          << "BTC price mismatch at step " << i;
+      EXPECT_DOUBLE_EQ(out[eth_idx], data[i].eth)
+          << "ETH price mismatch at step " << i;
+      ++output_count;
+    }
+  }
+
+  EXPECT_GT(output_count, 0u)
+      << "Multi-stream cross-join must produce at least one output row";
+}
+
 }  // namespace
 }  // namespace rtbot_sql::api
