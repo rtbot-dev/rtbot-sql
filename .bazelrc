@@ -11,11 +11,13 @@ build --enable_platform_specific_config
 build:linux --repo_env=CC=clang
 build:linux --cxxopt=-std=c++17
 build:linux --host_cxxopt=-std=c++17
+build:linux --cxxopt=-Wno-c++11-narrowing
 
 # macOS clang + C++17
 build:macos --repo_env=CC=clang
 build:macos --cxxopt=-std=c++17
 build:macos --host_cxxopt=-std=c++17
+build:macos --cxxopt=-Wno-c++11-narrowing
 build:macos --cxxopt=-stdlib=libc++
 build:macos --host_cxxopt=-stdlib=libc++
 build:macos --linkopt=-stdlib=libc++

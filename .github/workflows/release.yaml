@@ -160,7 +160,7 @@ jobs:
         uses: actions/upload-artifact@v5
         with:
           name: rtbot-sql-experimental-wheel-windows-cp313
-          path: dist/bin/runtimes/python/rtbot_sql_wheel_cp313_dist/*.whl
+          path: dist/bin/runtimes/python/*cp313*.whl
           if-no-files-found: error
 
   release:
