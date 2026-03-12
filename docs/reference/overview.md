@@ -50,6 +50,20 @@ The output is a `CompilationResult` containing:
 - **`statement_type`** — what kind of SQL was compiled
 - **`errors`** — compilation errors, if any
 
+## What RtBot SQL is not
+
+RtBot SQL is a purpose-built language for streaming numerical computation. It intentionally omits standard SQL features that don't have meaningful streaming semantics.
+
+- **No string or text types.** All values are IEEE 754 double-precision floats. Text data must be encoded numerically upstream (e.g., category IDs, enum values).
+- **No subqueries or CTEs.** Queries cannot nest SELECT statements or use WITH clauses. Compose pipelines by creating multiple views instead.
+- **No window functions in the SQL:2003 sense.** There is no OVER or PARTITION BY syntax. RtBot provides its own streaming functions (MOVING_AVERAGE, MOVING_STD, FIR, etc.) that maintain state incrementally.
+- **No DISTINCT.** Deduplication has no bounded-memory streaming implementation for arbitrary data.
+- **No stream-to-stream JOIN.** Use multi-source FROM with automatic time alignment instead.
+- **COUNT only supports COUNT(\*).** COUNT(expr) with null filtering is not supported.
+- **ORDER BY requires LIMIT.** Sorting an unbounded stream is not meaningful without a finite result set.
+
+These constraints keep the language small, deterministic, and fast. Every valid program compiles to a bounded-memory operator graph that processes each message in constant time.
+
 ## The catalog
 
 The catalog is the schema registry. It tracks all streams, views, and tables you've created, along with their schemas and dependencies.

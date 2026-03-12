@@ -86,23 +86,23 @@ When you run a SELECT query, the runtime chooses an execution strategy:
 
 ### TIER1_READ
 
-Direct read from stored data. Used when the query is a simple projection on a materialized view, table, or stream.
+Direct read from the output stream. Used when the query is a simple projection on a materialized view, table, or stream.
 
 ```sql
 SELECT * FROM bollinger LIMIT 10
 ```
 
-No computation is needed — the data is already computed and stored. This is the fastest tier.
+No computation is needed — the output rows have already been produced by the pipeline. This is the fastest tier.
 
 ### TIER2_SCAN
 
-Filtered read. Used when the query filters stored data with a WHERE clause.
+Filtered read. Used when the query filters output rows with a WHERE clause.
 
 ```sql
 SELECT * FROM bollinger WHERE instrument_id = 42
 ```
 
-Scans stored data and applies the filter. No pipeline compilation needed.
+Scans available output rows and applies the filter. No pipeline compilation needed.
 
 ### TIER3_EPHEMERAL
 

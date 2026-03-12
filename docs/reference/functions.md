@@ -45,6 +45,8 @@ Compiles to: `CumulativeSum` + `Count` + division.
 
 These functions operate over a sliding window of the last N values. The window size is a required integer parameter.
 
+**Warmup behavior:** All windowed functions begin producing output from the first message. During the first N-1 messages (the warmup period), they operate on whatever data is available rather than a full window. For most use cases this is fine, but in production alerting scenarios you may want to discard or gate early outputs to avoid false positives during startup.
+
 ### MOVING_AVERAGE(expr, N)
 
 Average of the last N values. Also known as Simple Moving Average (SMA).
@@ -64,6 +66,8 @@ Sum of the last N values.
 ```sql
 SELECT MOVING_SUM(quantity, 50) AS volume_50 FROM trades
 ```
+
+During the first N-1 messages, the sum is computed over all available data. From the Nth message onward, it maintains a constant-size sliding window.
 
 Compiles to: `MovingSum(window_size=N)` operator.
 
@@ -85,6 +89,8 @@ Standard deviation over the last N values. `STDDEV` is accepted as an alias but 
 SELECT MOVING_STD(price, 20) AS volatility FROM trades
 ```
 
+During the first N-1 messages, the standard deviation is computed over all available values. This means early outputs may have higher variance due to the small sample size. From the Nth message onward, the window is full.
+
 Compiles to: `StandardDeviation(window_size=N)` operator.
 
 ### MOVING_MIN(expr, N)
@@ -95,6 +101,8 @@ Minimum value in the last N values.
 SELECT MOVING_MIN(price, 50) AS price_floor FROM trades
 ```
 
+During the first N-1 messages, the minimum is computed over all available values.
+
 Compiles to: `WindowMinMax(mode="min", window_size=N)` operator.
 
 ### MOVING_MAX(expr, N)
@@ -104,6 +112,8 @@ Maximum value in the last N values.
 ```sql
 SELECT MOVING_MAX(price, 50) AS price_ceiling FROM trades
 ```
+
+During the first N-1 messages, the maximum is computed over all available values.
 
 Compiles to: `WindowMinMax(mode="max", window_size=N)` operator.
 
@@ -123,6 +133,8 @@ FROM bearing_sensors
 
 FIR filters are used for smoothing, noise removal, bandpass filtering, and signal conditioning. The coefficients determine the filter's frequency response.
 
+During the first N-1 messages (where N is the number of coefficients), the filter operates with zero-padded history. Early outputs may not represent the intended frequency response.
+
 Compiles to: `FiniteImpulseResponse(coefficients=[...])` operator.
 
 ### IIR(expr, ARRAY[ff_coefficients], ARRAY[fb_coefficients])
@@ -136,6 +148,8 @@ FROM grid_sensors
 ```
 
 IIR filters can achieve sharper frequency response than FIR filters with fewer coefficients, but they can be unstable if the feedback coefficients are not chosen carefully.
+
+The filter starts with zero initial state for both feedforward and feedback history. The output stabilizes after a transient period that depends on the filter's pole locations.
 
 Compiles to: `InfiniteImpulseResponse(ff_coefficients=[...], fb_coefficients=[...])` operator.
 
@@ -159,6 +173,8 @@ Detects local peaks (maxima) in the signal over a window of N values. Emits the 
 ```sql
 SELECT PEAK_DETECT(pressure, 30) AS pressure_peak FROM pipeline_sensors
 ```
+
+The detector requires at least N messages before it can confirm a peak. During the warmup period, no peaks are emitted.
 
 Compiles to: `PeakDetector(window_size=N)` operator.
 
@@ -214,7 +230,7 @@ Compiled as mutually exclusive gates and a multiplexer.
 
 ## Tier-2 aggregate functions
 
-When you SELECT from a materialized view (not a stream), you can use aggregate functions that operate across all stored output rows. These are evaluated at query time, not incrementally.
+When you SELECT from a materialized view (not a stream), you can use aggregate functions that operate across the available output rows. These are evaluated at query time, not incrementally.
 
 ```sql
 -- Aggregate across all instruments
@@ -226,7 +242,7 @@ FROM instrument_stats
 
 Supported tier-2 aggregates: `SUM`, `COUNT`, `AVG`, `MIN`, `MAX`.
 
-These are standard SQL aggregates — they scan the stored data at query time, similar to how a database would execute them.
+These are standard SQL aggregates — they scan the available output rows at query time.
 
 ## Combining functions
 

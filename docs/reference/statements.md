@@ -119,8 +119,8 @@ SELECT execution uses a tiered system:
 
 | Tier | Name | When used | How it works |
 |------|------|-----------|-------------|
-| TIER1 | READ | Direct query on a stream, table, or materialized view | Reads stored data directly. Fastest. |
-| TIER2 | SCAN | Query with WHERE filter on stored data | Reads and filters stored data. |
+| TIER1 | READ | Direct query on a stream, table, or materialized view | Reads available output rows directly. Fastest. |
+| TIER2 | SCAN | Query with WHERE filter on output rows | Reads and filters available output rows. |
 | TIER3 | EPHEMERAL | Query with computations (functions, expressions) | Compiles an ephemeral pipeline, feeds source data through it, returns results. |
 
 The compiler determines the tier automatically based on the query structure.

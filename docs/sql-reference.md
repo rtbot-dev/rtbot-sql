@@ -99,7 +99,7 @@ CREATE MATERIALIZED VIEW view_name AS
 
 **Description:**
 
-Compiles the SELECT query into an RtBot program (a DAG of operators) and deploys it. The view updates on every incoming message — not on a schedule, not on a trigger. It is always current. The result is readable via `SELECT * FROM view_name`.
+Compiles the SELECT query into an RtBot program (a DAG of operators) and deploys it. The program processes every incoming message and emits output rows — not on a schedule, not on a trigger, but on every arrival. The materialized view is conceptual: there is no stored table behind it. What you receive is a stream of individual output rows (updates) as they are produced.
 
 **Example:**
 
@@ -189,7 +189,7 @@ INSERT INTO trades VALUES (1, 150.0, 200, 42)
 
 ### SELECT
 
-Point-in-time read of current state. Reads the maintained result — does not recompute.
+Reads available output rows. Does not recompute — reads what the pipeline has already produced.
 
 **Syntax:**
 
@@ -209,7 +209,7 @@ Reads data from a stream, materialized view, or table. The execution strategy de
 
 | Tier | Pattern | Execution |
 |------|---------|-----------|
-| **Tier 1: Direct Read** | `SELECT columns FROM view LIMIT n` | Reads stored output directly. O(1). |
+| **Tier 1: Direct Read** | `SELECT columns FROM view LIMIT n` | Reads available output rows directly. O(1). |
 | **Tier 2: Scan + Filter** | `SELECT columns FROM source WHERE condition LIMIT n` | Scans with stateless per-row filter. |
 | **Tier 3: Ephemeral** | `SELECT columns FROM source GROUP BY ...` | Deploys temporary pipeline, replays data, collects result. |
 

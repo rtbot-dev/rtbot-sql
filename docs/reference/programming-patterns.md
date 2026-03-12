@@ -161,7 +161,7 @@ CREATE MATERIALIZED VIEW zone_summary AS
   GROUP BY zone_id;
 ```
 
-Dashboard clients query `zone_summary` with `SELECT * FROM zone_summary`. Since the view is materialized, this is a TIER1_READ — a direct read from stored data with no computation at query time.
+Dashboard clients query `zone_summary` with `SELECT * FROM zone_summary`. Since the view is materialized, this is a TIER1_READ — a direct read of available output rows with no computation at query time.
 
 ## Multi-resolution analysis
 
