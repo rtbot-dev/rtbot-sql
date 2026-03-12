@@ -4,17 +4,34 @@ build --symlink_prefix=dist/
 # Workspace status: derive version metadata from git tags/commit
 build --workspace_status_command=./tools/workspace_status.sh
 
-# C++17
-build --cxxopt=-std=c++17
-build --host_cxxopt=-std=c++17
+# Enable host OS-specific configs (build:linux, build:macos, build:windows, ...)
+build --enable_platform_specific_config
 
-# macOS clang
+# Linux clang + C++17
+build:linux --repo_env=CC=clang
+build:linux --cxxopt=-std=c++17
+build:linux --host_cxxopt=-std=c++17
+
+# macOS clang + C++17
+build:macos --repo_env=CC=clang
+build:macos --cxxopt=-std=c++17
+build:macos --host_cxxopt=-std=c++17
 build:macos --cxxopt=-stdlib=libc++
 build:macos --host_cxxopt=-stdlib=libc++
 build:macos --linkopt=-stdlib=libc++
 
-build --enable_platform_specific_config
-build --repo_env=CC=clang
+# Windows (explicit config also used in CI)
+build:windows --cxxopt=/std:c++17
+build:windows --host_cxxopt=/std:c++17
+build:windows --enable_runfiles
+build:windows --shell_executable=C:/Progra~1/Git/bin/bash.exe
+build:windows --repo_env=BAZEL_SH=C:/Progra~1/Git/bin/bash.exe
+build:windows --repo_env=BAZEL_VS
+build:windows --repo_env=BAZEL_VC
+build:windows --repo_env=BAZEL_VC_FULL_VERSION
+build:windows --repo_env=BAZEL_WINSDK_FULL_VERSION
+test:windows --repo_env=BAZEL_SH=C:/Progra~1/Git/bin/bash.exe
+test:windows --enable_runfiles
 
 # Test output
 test --test_output=errors
@@ -33,8 +50,9 @@ build:asan --linkopt=-fsanitize=address
 build:asan --strip=never
 build:asan --compilation_mode=dbg
 
-# Emscripten flags
-build --action_env=EMCC_CFLAGS="-fexceptions -Wno-c++11-narrowing -Wno-unused-const-variable"
+# Emscripten flags (non-Windows)
+build:linux --action_env=EMCC_CFLAGS="-fexceptions -Wno-c++11-narrowing -Wno-unused-const-variable"
+build:macos --action_env=EMCC_CFLAGS="-fexceptions -Wno-c++11-narrowing -Wno-unused-const-variable"
 
 # TypeScript
 build --@aspect_rules_ts//ts:skipLibCheck=always
