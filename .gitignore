@@ -28,5 +28,8 @@ examples/notebooks/data/*.zip
 # Notebook virtual environments
 examples/notebooks/.venv/
 
+# Git worktrees
+.worktrees/
+
 # Jupyter checkpoints
 .ipynb_checkpoints/
