@@ -31,7 +31,7 @@ jobs:
             platform: darwin
     runs-on: ${{ matrix.target.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Validate pinned RTBot ref
         shell: bash
@@ -65,7 +65,7 @@ jobs:
           echo "RTBOT_DIR=${RUNNER_TEMP}/rtbot" >> "$GITHUB_ENV"
 
       - name: Setup Bazel toolchain
-        uses: bazel-contrib/setup-bazel@0.14.0
+        uses: bazel-contrib/setup-bazel@0.18.0
         with:
           bazelisk-cache: true
           repository-cache: true
@@ -84,10 +84,10 @@ jobs:
         run: bazel build --stamp --override_module=rtbot="${RTBOT_DIR}" "${{ steps.resolve.outputs.wheel_target }}"
 
       - name: Upload built wheel artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: rtbot-sql-wheel-${{ matrix.target.platform }}-${{ matrix.target.arch }}-${{ steps.resolve.outputs.cp_tag }}
-          path: dist/bin/runtimes/python/**/*${{ steps.resolve.outputs.cp_tag }}*.whl
+          path: dist/bin/runtimes/python/rtbot_sql_wheel_${{ steps.resolve.outputs.cp_tag }}_dist/*.whl
           if-no-files-found: error
 
       # TODO (batch 21): build release targets, create tarball + SHA256, upload artifacts
@@ -160,7 +160,7 @@ jobs:
         uses: actions/upload-artifact@v5
         with:
           name: rtbot-sql-experimental-wheel-windows-cp313
-          path: dist/bin/runtimes/python/*cp313*.whl
+          path: dist/bin/runtimes/python/rtbot_sql_wheel_cp313_dist/*.whl
           if-no-files-found: error
 
   release:
@@ -171,7 +171,7 @@ jobs:
       contents: write
     steps:
       - name: Download built wheel artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           pattern: rtbot-sql-wheel-*
           path: release-wheels
