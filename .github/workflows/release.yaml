@@ -7,6 +7,9 @@ on:
   push:
     tags: ["v*"]
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   build:
     name: Build wheel (${{ matrix.target.platform }}-${{ matrix.target.arch }}, py${{ matrix.python-version }})
