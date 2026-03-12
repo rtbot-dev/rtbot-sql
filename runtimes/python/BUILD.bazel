@@ -46,6 +46,14 @@ config_setting(
     ],
 )
 
+config_setting(
+    name = "windows_arm64",
+    constraint_values = [
+        "@platforms//os:windows",
+        "@platforms//cpu:arm64",
+    ],
+)
+
 py_library(
     name = "rtbot_sql_py",
     srcs = glob(["rtbot_sql/**/*.py"]),
@@ -101,12 +109,11 @@ _WHEEL_PLATFORM = select({
     ":linux_arm64": "manylinux2014_aarch64",
     ":linux_x86_64": "manylinux2014_x86_64",
     ":windows_x86_64": "win_amd64",
+    ":windows_arm64": "win_arm64",
     "//conditions:default": "any",
 })
 
 _WHEEL_MATRIX = [
-    {"tag": "cp310", "python_repo": "@python_3_10"},
-    {"tag": "cp311", "python_repo": "@python_3_11"},
     {"tag": "cp312", "python_repo": "@python_3_12"},
     {"tag": "cp313", "python_repo": "@python_3_13"},
 ]
