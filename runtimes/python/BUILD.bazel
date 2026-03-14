@@ -72,7 +72,7 @@ cc_binary(
     }),
     linkopts = select({
         "@pybind11//:msvc_compiler": [],
-        "@pybind11//:osx": [],
+        "@pybind11//:osx": ["-undefined", "dynamic_lookup"],
         "//conditions:default": ["-Wl,-Bsymbolic"],
     }),
     linkshared = 1,
@@ -81,8 +81,10 @@ cc_binary(
         "@rtbot//libs/api:rtbot-api",
         "@pybind11",
         "@python_3_11//:python_headers",
-        "@python_3_11//:libpython",
-    ],
+    ] + select({
+        "@pybind11//:msvc_compiler": ["@python_3_11//:libpython"],
+        "//conditions:default": [],
+    }),
 )
 
 genrule(
@@ -130,7 +132,7 @@ _WHEEL_MATRIX = [
     }),
     linkopts = select({
         "@pybind11//:msvc_compiler": [],
-        "@pybind11//:osx": [],
+        "@pybind11//:osx": ["-undefined", "dynamic_lookup"],
         "//conditions:default": ["-Wl,-Bsymbolic"],
     }),
     linkshared = 1,
@@ -139,8 +141,10 @@ _WHEEL_MATRIX = [
         "@rtbot//libs/api:rtbot-api",
         "@pybind11",
         "%s//:python_headers" % _entry["python_repo"],
-        "%s//:libpython" % _entry["python_repo"],
-    ],
+    ] + select({
+        "@pybind11//:msvc_compiler": ["%s//:libpython" % _entry["python_repo"]],
+        "//conditions:default": [],
+    }),
 ) for _entry in _WHEEL_MATRIX]
 
 [genrule(
