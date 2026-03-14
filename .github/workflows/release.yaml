@@ -158,3 +158,23 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           files: release-wheels/*.whl
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: release
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - name: Download built wheel artifacts
+        uses: actions/download-artifact@v5
+        with:
+          pattern: rtbot-sql-wheel-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
