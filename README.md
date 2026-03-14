@@ -1,5 +1,10 @@
 # RtBot SQL
 
+[![PyPI](https://img.shields.io/pypi/v/rtbot-sql)](https://pypi.org/project/rtbot-sql/)
+[![Python](https://img.shields.io/pypi/pyversions/rtbot-sql)](https://pypi.org/project/rtbot-sql/)
+[![CI](https://github.com/rtbot-dev/rtbot-sql/actions/workflows/ci.yaml/badge.svg)](https://github.com/rtbot-dev/rtbot-sql/actions)
+[![License](https://img.shields.io/badge/license-BUSL--1.1-blue)](LICENSE)
+
 Composable building blocks for real-time analytics that work the same in a notebook and in production. Write SQL to define streaming pipelines — RtBot compiles them into high-performance C++ operator graphs that process data incrementally, one message at a time.
 
 ## Install
@@ -85,8 +90,8 @@ RtBot SQL compiles your query into an **operator graph** — a JSON structure th
 │  Your SQL   │ ──▶ │ Compiler │ ──▶ │ Operator Graph JSON │
 └─────────────┘     └──────────┘     └─────────┬───────────┘
                                                │
-                          ┌────────────────────┬┴───────────────────┐
-                          ▼                    ▼                    ▼
+                          ┌───────────────────┬┴───────────────────┐
+                          ▼                   ▼                    ▼
                     ┌───────────┐       ┌────────────┐      ┌────────────┐
                     │  Browser  │       │   Python   │      │   Redis    │
                     │  (WASM)   │       │  (Native)  │      │  (Module)  │
@@ -212,9 +217,9 @@ bazel test --config=debug //tests/unit:expression_test
 
 ## Documentation
 
-- [Getting Started](https://rtbot.dev/docs/user-guide/getting-started)
-- [Python Quickstart](https://rtbot.dev/docs/user-guide/quickstart-python)
-- [SQL Reference](https://rtbot.dev/docs/reference/rtbot-sql/overview)
+- [Getting Started](https://www.rtbot.dev/docs/user-guide/getting-started)
+- [Python Quickstart](https://www.rtbot.dev/docs/user-guide/quickstart-python)
+- [SQL Reference](https://www.rtbot.dev/docs/reference/rtbot-sql/overview)
 
 ## License
 
