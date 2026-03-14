@@ -1,188 +1,115 @@
-# rtbot-sql
+# RtBot SQL
 
-SQL compiler for RTBot. Translates SQL queries into RTBot operator graphs (JSON programs) that run on RTBot's streaming runtime.
+Composable building blocks for real-time analytics that work the same in a notebook and in production. Write SQL to define streaming pipelines — RtBot compiles them into high-performance C++ operator graphs that process data incrementally, one message at a time.
 
-## Python package quick-start
-
-Python wheels are published as GitHub Release assets for each supported platform and Python ABI.
-
-1. Open the latest release and download the wheel that matches your OS/CPU and Python tag.
-2. Install from the downloaded wheel file.
+## Install
 
 ```bash
-pip install ./rtbot_sql-<version>-cp313-cp313-<platform>.whl
+pip install rtbot-sql
 ```
 
-Wheel selection guidance:
-- Linux x86_64: `manylinux*_x86_64` with `cp312` or `cp313`
-- Linux aarch64: `manylinux*_aarch64` with `cp312` or `cp313`
-- macOS x86_64 (Intel): `macosx_*_x86_64` with `cp312` or `cp313`
-- macOS arm64 (Apple Silicon): `macosx_*_arm64` with `cp312` or `cp313`
-- Windows x86_64: `win_amd64` with `cp312` or `cp313`
-- Windows arm64: `win_arm64` with `cp312` or `cp313`
-
-Tiny smoke test:
-
-```python
-from rtbot_sql import RtBotSql
-
-print("rtbot-sql import OK:", RtBotSql)
-```
+Requires Python 3.13+. Prebuilt wheels are available for Linux, macOS, and Windows on both x86_64 and arm64.
 
 ## Quick start
 
-```bash
-bazel build //apps/cli:rtbot-sql
-bazel test //tests/...
+```python
+import math
+from rtbot_sql import RtBotSql
+
+sql = RtBotSql()
+sql.configure_time_format(formatter=lambda ts: ts)
+
+sql.execute("CREATE STREAM sensors (temperature DOUBLE)")
+sql.execute("""
+  CREATE MATERIALIZED VIEW stats AS
+    SELECT temperature,
+           MOVING_AVERAGE(temperature, 50) AS avg_temp,
+           MOVING_STD(temperature, 50) AS std_temp
+    FROM sensors
+""")
+
+# Generate 200 readings: smooth sine wave with 3 injected spikes
+readings = []
+for i in range(200):
+    temp = 20.0 + 2.0 * math.sin(i * 2 * math.pi / 60) + 0.3 * math.sin(i * 7.1)
+    if i == 80:
+        temp = 35.0   # spike high
+    elif i == 130:
+        temp = 5.0    # spike low
+    elif i == 170:
+        temp = 38.0   # spike high
+    readings.append({"time": i, "temperature": temp})
+
+sql.insert_dataframe("sensors", readings)
+
+# Query only the anomalies
+result = sql.execute("""
+  SELECT * FROM stats
+  WHERE ABS(temperature - avg_temp) > 2 * std_temp
+""")
+
+for col in result["columns"]:
+    print(f"{col:>15}", end="")
+print()
+for row in result["rows"]:
+    for val in row:
+        print(f"{val:>15.2f}", end="")
+    print()
 ```
 
-Build artifacts go to `dist/` (not `bazel-bin/`), configured in `.bazelrc`.
-
-## Project structure
+Output:
 
 ```
-libs/
-  api/          Top-level compile_sql() function and types
-  parser/       SQL parsing via libpg_query, AST conversion
-  analyzer/     Scope and name resolution
-  catalog/      Stream/view/table schema registry
-  compiler/     Expression, function, SELECT, WHERE, GROUP BY compilation
-  planner/      Tier classification and query planning
-
-apps/
-  cli/          Command-line SQL compiler
-
-tests/
-  unit/         Per-module unit tests
-  integration/  End-to-end compiler integration tests
-
-examples/
-  catalog.json          Sample stream catalog
-  queries/              Example SQL files
+    temperature       avg_temp       std_temp
+          35.00          20.10           2.61
+           5.00          19.27           2.39
+          38.00          20.23           3.65
 ```
 
-## CLI usage
+## Why RtBot SQL
 
-The CLI compiles SQL into RTBot program JSON. It accepts SQL via positional argument, `--file`, or stdin pipe.
+Most real-time pipelines start as a Python prototype and then get rewritten in a production language — a costly translation that introduces bugs and delays. RtBot eliminates that gap:
 
-```bash
-# Positional argument
-dist/bin/apps/cli/rtbot-sql "CREATE TABLE orders (id DOUBLE PRECISION, price DOUBLE PRECISION)"
+- **One language, all stages** — the SQL you write in a notebook is the same SQL that runs in production
+- **Incremental execution** — each new data point updates pipeline state in constant time, no batch recomputation
+- **Deterministic** — same input always produces the same output, regardless of timing or arrival order
+- **High performance** — native C++ engine with Python and JavaScript bindings
+- **Deploys alongside Redis** — no new infrastructure to operate
 
-# From file with catalog
-dist/bin/apps/cli/rtbot-sql --file examples/queries/bollinger.sql --catalog examples/catalog.json
+## From notebook to production
 
-# Pipe from stdin
-echo "SELECT instrument_id, price FROM trades LIMIT 10" | dist/bin/apps/cli/rtbot-sql --catalog examples/catalog.json
-
-# Compact output
-dist/bin/apps/cli/rtbot-sql --file examples/queries/bollinger.sql --catalog examples/catalog.json --format compact
-
-# Write to file
-dist/bin/apps/cli/rtbot-sql --file examples/queries/bollinger.sql --catalog examples/catalog.json -o output.json
-```
-
-### Options
+RtBot SQL compiles your query into an **operator graph** — a JSON structure that describes the computation as a directed graph of operators. This operator graph is the only deployment artifact. It runs identically in every environment because the operators are deterministic.
 
 ```
--f, --file <path>      Read SQL from file
--c, --catalog <path>   Catalog JSON with stream/view definitions
--o, --output <path>    Write output to file instead of stdout
-    --format <fmt>     Output format: json (default) or compact
--v, --verbose          Show extra compilation details
-    --repl             Start interactive REPL mode (not yet implemented)
--h, --help             Print help
+┌─────────────┐     ┌──────────┐     ┌─────────────────────┐
+│  Your SQL   │ ──▶ │ Compiler │ ──▶ │ Operator Graph JSON │
+└─────────────┘     └──────────┘     └─────────┬───────────┘
+                                               │
+                          ┌────────────────────┬┴───────────────────┐
+                          ▼                    ▼                    ▼
+                    ┌───────────┐       ┌────────────┐      ┌────────────┐
+                    │  Browser  │       │   Python   │      │   Redis    │
+                    │  (WASM)   │       │  (Native)  │      │  (Module)  │
+                    └───────────┘       └────────────┘      └────────────┘
+                     Playground          Notebooks           Production
 ```
 
-### Catalog format
-
-The catalog JSON defines available streams and their columns:
-
-```json
-{
-  "streams": {
-    "trades": ["instrument_id", "price", "quantity", "account_id"]
-  }
-}
-```
-
-## Testing
-
-### Run all tests
-
-```bash
-bazel test //tests/...
-```
-
-### Run specific test suites
-
-```bash
-# Unit tests only
-bazel test //tests/unit/...
-
-# Integration tests only
-bazel test //tests/integration/...
-
-# Single test
-bazel test //tests/unit:parser_test
-```
-
-### Debug a failing test
-
-Use the `debug` config to stream output and disable caching:
+1. **Prototype** in the browser playground or a Jupyter notebook — write SQL, see results immediately
+2. **Validate** in Python — load historical data with `insert_dataframe`, backtest your queries, inspect the operator graph with `explain()` and `show_graph()`
+3. **Deploy to Redis** — store the operator graph JSON in Redis, point `RTBOT.CONSUME` at it, and feed data into the input stream
 
 ```bash
-bazel test --config=debug //tests/unit:expression_test
+# Store the compiled program in Redis
+redis-cli JSON.SET alerts:program $ "$(cat alerts_program.json)"
+
+# Start the pipeline — consumes from input, writes to output
+redis-cli RTBOT.CONSUME alerts:program sensor_data alerts_output kernel_1
+
+# Read results
+redis-cli XRANGE alerts_output - +
 ```
 
-### Testing with the CLI
-
-The CLI is useful for verifying compilation results interactively during development.
-
-**Verify a CREATE STREAM statement:**
-
-```bash
-dist/bin/apps/cli/rtbot-sql "CREATE TABLE sensors (device_id DOUBLE PRECISION, temperature DOUBLE PRECISION, humidity DOUBLE PRECISION)"
-```
-
-**Verify a GROUP BY query produces correct operators:**
-
-```bash
-echo "SELECT instrument_id, SUM(quantity) AS total_qty, COUNT(*) AS cnt FROM trades GROUP BY instrument_id" \
-  | dist/bin/apps/cli/rtbot-sql --catalog examples/catalog.json
-```
-
-Check the output for `KeyedPipeline`, `CumulativeSum`, `Count`, and `VectorCompose` in the program JSON.
-
-**Verify expression de-duplication (Bollinger Bands):**
-
-```bash
-dist/bin/apps/cli/rtbot-sql --file examples/queries/bollinger.sql --catalog examples/catalog.json
-```
-
-In the output, `MOVING_AVERAGE(price, 20)` appears 3 times in the SQL but compiles to a single `MovingAverage` operator. Similarly, `STDDEV(price, 20)` appears twice but compiles to one `StandardDeviation` operator.
-
-**Verify error reporting:**
-
-```bash
-# Unknown column
-echo "SELECT foo FROM trades LIMIT 10" | dist/bin/apps/cli/rtbot-sql --catalog examples/catalog.json
-
-# Unbounded stream query
-echo "SELECT * FROM trades" | dist/bin/apps/cli/rtbot-sql --catalog examples/catalog.json
-
-# Parse error
-echo "SELEC FROM WHERE" | dist/bin/apps/cli/rtbot-sql
-```
-
-All error cases exit with code 1 and include an `errors` array in the output.
-
-**Pipe into jq for inspection:**
-
-```bash
-dist/bin/apps/cli/rtbot-sql --file examples/queries/bollinger.sql --catalog examples/catalog.json \
-  | jq '.program.operators[] | select(.type == "Prototype") | .operators[].type'
-```
+No code to rewrite. No JVM to configure. No cluster to orchestrate. See the [full deployment guide](https://rtbot.dev/docs/user-guide/from-notebook-to-production) for details.
 
 ## Supported SQL
 
@@ -190,7 +117,7 @@ dist/bin/apps/cli/rtbot-sql --file examples/queries/bollinger.sql --catalog exam
 
 | Statement | Status |
 |-----------|--------|
-| `CREATE TABLE` (stream) | Supported |
+| `CREATE TABLE` / `CREATE STREAM` | Supported |
 | `CREATE MATERIALIZED VIEW` | Supported |
 | `INSERT INTO ... VALUES` | Supported |
 | `SELECT ... FROM ... [WHERE] [GROUP BY] [HAVING] [LIMIT]` | Supported |
@@ -213,6 +140,81 @@ dist/bin/apps/cli/rtbot-sql --file examples/queries/bollinger.sql --catalog exam
 | `IIR(expr, ARRAY[...], ARRAY[...])` | DSP | Infinite impulse response filter |
 | `RESAMPLE(expr, N)` | DSP | Constant-rate resampling |
 | `PEAK_DETECT(expr, N)` | DSP | Peak detection |
+
+## Development
+
+### Build and test
+
+```bash
+bazel build //apps/cli:rtbot-sql
+bazel test //tests/...
+```
+
+Build artifacts go to `dist/` (not `bazel-bin/`), configured in `.bazelrc`.
+
+### Project structure
+
+```
+libs/
+  api/          Top-level compile_sql() function and types
+  parser/       SQL parsing via libpg_query, AST conversion
+  analyzer/     Scope and name resolution
+  catalog/      Stream/view/table schema registry
+  compiler/     Expression, function, SELECT, WHERE, GROUP BY compilation
+  planner/      Tier classification and query planning
+
+apps/
+  cli/          Command-line SQL compiler
+
+runtimes/
+  python/       Python bindings (pybind11) and runtime API
+  wasm/         WebAssembly bindings for browser/Node.js
+
+tests/
+  unit/         Per-module unit tests
+  integration/  End-to-end compiler integration tests
+
+examples/
+  catalog.json          Sample stream catalog
+  queries/              Example SQL files
+```
+
+### CLI usage
+
+The CLI compiles SQL into RTBot program JSON. It accepts SQL via positional argument, `--file`, or stdin pipe.
+
+```bash
+# Positional argument
+dist/bin/apps/cli/rtbot-sql "CREATE TABLE orders (id DOUBLE PRECISION, price DOUBLE PRECISION)"
+
+# From file with catalog
+dist/bin/apps/cli/rtbot-sql --file examples/queries/bollinger.sql --catalog examples/catalog.json
+
+# Pipe from stdin
+echo "SELECT instrument_id, price FROM trades LIMIT 10" | dist/bin/apps/cli/rtbot-sql --catalog examples/catalog.json
+```
+
+### Testing
+
+```bash
+# All tests
+bazel test //tests/...
+
+# Unit tests only
+bazel test //tests/unit/...
+
+# Integration tests only
+bazel test //tests/integration/...
+
+# Single test with debug output
+bazel test --config=debug //tests/unit:expression_test
+```
+
+## Documentation
+
+- [Getting Started](https://rtbot.dev/docs/user-guide/getting-started)
+- [Python Quickstart](https://rtbot.dev/docs/user-guide/quickstart-python)
+- [SQL Reference](https://rtbot.dev/docs/reference/rtbot-sql/overview)
 
 ## License
 
