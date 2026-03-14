@@ -23,6 +23,7 @@ build:macos --host_cxxopt=-stdlib=libc++
 build:macos --linkopt=-stdlib=libc++
 
 # Windows (explicit config also used in CI)
+build:windows --workspace_status_command=tools/workspace_status.bat
 build:windows --cxxopt=/std:c++17
 build:windows --host_cxxopt=/std:c++17
 build:windows --enable_runfiles
