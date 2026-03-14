@@ -187,7 +187,7 @@ _WHEEL_MATRIX = [
         "Source": "https://github.com/rtbot-dev/rtbot-sql",
     },
     python_tag = _entry["tag"],
-    requires_python = ">=3.12",
+    python_requires = ">=3.12",
     strip_path_prefixes = [
         "runtimes/python/%s" % _entry["tag"],
         "runtimes/python",
