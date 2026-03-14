@@ -410,16 +410,23 @@ class RtBotSql:
     )
 
   def _execute_with_pipeline(self, sql: str, result: native.CompilationResult):
+    original_field_map = dict(result.field_map)
     runtime_result = result
     if not runtime_result.program_json:
       runtime_result = compile_select_to_program(sql, self._catalog.snapshot())
       if runtime_result.has_errors():
         raise SqlError(runtime_result.errors)
 
+    effective_field_map = dict(runtime_result.field_map)
+    if not effective_field_map:
+      effective_field_map = original_field_map
+    if not effective_field_map and runtime_result.source_streams:
+      effective_field_map = self._resolve_field_map(runtime_result.source_streams[0], {})
+
     if not runtime_result.source_streams:
       return format_rows(
           [],
-          dict(runtime_result.field_map),
+          effective_field_map,
           timestamps=[],
           time_values=[],
           time_column=self._time_column_name,
@@ -463,7 +470,7 @@ class RtBotSql:
 
     return format_rows(
         rows,
-        dict(runtime_result.field_map),
+        effective_field_map,
         timestamps=timestamps,
         time_values=self._format_time_values(timestamps),
         time_column=self._time_column_name,
