@@ -1,3 +1,4 @@
+import math
 import unittest
 
 import rtbot_sql
@@ -205,6 +206,53 @@ class RuntimeLifecycleTest(unittest.TestCase):
         [row[1:] for row in rows],
         [[100.0, 95.0, 5.0], [102.0, 95.0, 7.0], [102.0, 97.0, 5.0]],
     )
+
+  def test_filtered_select_on_materialized_view(self):
+    sql = rtbot_sql.RtBotSql()
+    sql.configure_time_format(formatter=lambda ts: ts)
+
+    sql.execute("CREATE STREAM sensors (temperature DOUBLE)")
+    sql.execute(
+        "CREATE MATERIALIZED VIEW stats AS "
+        "SELECT temperature, "
+        "MOVING_AVERAGE(temperature, 50) AS avg_temp, "
+        "MOVING_STD(temperature, 50) AS std_temp "
+        "FROM sensors"
+    )
+
+    readings = []
+    for i in range(200):
+      temp = 20.0 + 2.0 * math.sin(i * 2 * math.pi / 60) + 0.3 * math.sin(i * 7.1)
+      if i == 80:
+        temp = 35.0
+      elif i == 130:
+        temp = 5.0
+      elif i == 170:
+        temp = 38.0
+      readings.append({"time": i, "temperature": temp})
+
+    sql.insert_dataframe("sensors", readings)
+
+    result = sql.execute(
+        "SELECT * FROM stats "
+        "WHERE ABS(temperature - avg_temp) > 2 * std_temp"
+    )
+    columns, rows = _columns_and_rows(result)
+
+    self.assertEqual(columns, ["time", "temperature", "avg_temp", "std_temp"])
+
+    self.assertEqual([row[0] for row in rows], [80.0, 130.0, 170.0])
+
+    self.assertEqual(len(rows), 3)
+    for row in rows:
+      self.assertEqual(len(row), 4, f"Expected 4 values per row, got {len(row)}: {row}")
+      temperature = row[1]
+      avg_temp = row[2]
+      std_temp = row[3]
+      self.assertGreater(
+          abs(temperature - avg_temp), 2 * std_temp,
+          f"Row {row} should satisfy the WHERE condition",
+      )
 
   def test_configure_time_format_override(self):
     sql = rtbot_sql.RtBotSql()
