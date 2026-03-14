@@ -116,8 +116,8 @@ _WHEEL_PLATFORM = select({
 })
 
 _WHEEL_MATRIX = [
-    {"tag": "cp312", "python_repo": "@python_3_12"},
     {"tag": "cp313", "python_repo": "@python_3_13"},
+    {"tag": "cp314", "python_repo": "@python_3_14"},
 ]
 
 [cc_binary(
@@ -177,8 +177,8 @@ _WHEEL_MATRIX = [
         "License :: Other/Proprietary License",
         "Operating System :: OS Independent",
         "Programming Language :: Python :: 3",
-        "Programming Language :: Python :: 3.12",
         "Programming Language :: Python :: 3.13",
+        "Programming Language :: Python :: 3.14",
         "Topic :: Scientific/Engineering",
     ],
     description_file = "//runtimes/python:DESCRIPTION.md",
@@ -191,7 +191,7 @@ _WHEEL_MATRIX = [
         "Source": "https://github.com/rtbot-dev/rtbot-sql",
     },
     python_tag = _entry["tag"],
-    python_requires = ">=3.12",
+    python_requires = ">=3.13",
     strip_path_prefixes = [
         "runtimes/python/%s" % _entry["tag"],
         "runtimes/python",

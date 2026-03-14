@@ -15,7 +15,7 @@ jobs:
     name: Build wheel (${{ matrix.target.platform }}-${{ matrix.target.arch }}, py${{ matrix.python-version }})
     strategy:
       matrix:
-        python-version: ["3.12", "3.13"]
+        python-version: ["3.13", "3.14"]
         target:
           - os: ubuntu-latest
             arch: x86_64
