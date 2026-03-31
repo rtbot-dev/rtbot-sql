@@ -96,14 +96,130 @@ json connection_to_json(const Connection& c) {
           {"toPort", c.to_port}};
 }
 
-json prototype_to_json(const PrototypeDef& proto) {
+// Forward declaration needed for mutual recursion between pipeline_native_from_proto
+// and prototype_to_json.
+json prototype_to_json(const PrototypeDef& proto,
+                      const std::map<std::string, const PrototypeDef*>& proto_map);
+
+// Convert a PrototypeDef into the native Pipeline JSON format expected by
+// OperatorJson::read_op (i.e. with input_port_types, output_port_types,
+// entryOperator, outputMappings).  This is used for Pipeline operators that
+// should NOT be expanded by PrototypeHandler.
+json pipeline_native_from_proto(const PrototypeDef& proto,
+                                const std::map<std::string, const PrototypeDef*>& proto_map) {
+  json j;
+
+  // Derive input/output port types from the prototype's Input/Output operators.
+  json input_port_types = json::array({"vector_number"});
+  json output_port_types = json::array({"vector_number"});
+  for (const auto& op : proto.operators) {
+    if (op.id == proto.entry_id && op.type == "Input") {
+      int num_ports = 1;
+      auto it = op.params.find("numInputPorts");
+      if (it != op.params.end()) num_ports = static_cast<int>(it->second);
+      input_port_types = json::array();
+      for (int i = 0; i < num_ports; ++i) input_port_types.push_back("vector_number");
+    }
+    if (op.id == proto.output_id && op.type == "Output") {
+      output_port_types = json::array({"vector_number"});
+    }
+  }
+  j["input_port_types"] = input_port_types;
+  j["output_port_types"] = output_port_types;
+
+  // All prototype operators (including Input/Output) become Pipeline internals.
+  j["operators"] = json::array();
+  for (const auto& op : proto.operators) {
+    if (op.type == "Pipeline") {
+      // Nested Pipeline: emit in native format too
+      json op_j = operator_to_json(op);
+      op_j.erase("prototype");
+      auto proto_it = op.string_params.find("prototype");
+      if (proto_it != op.string_params.end()) {
+        auto pm_it = proto_map.find(proto_it->second);
+        if (pm_it != proto_map.end()) {
+          // Merge the native Pipeline fields into the operator JSON
+          json native = pipeline_native_from_proto(*pm_it->second, proto_map);
+          for (auto it2 = native.begin(); it2 != native.end(); ++it2) {
+            op_j[it2.key()] = it2.value();
+          }
+        }
+      }
+      j["operators"].push_back(op_j);
+    } else if (op.type == "KeyedPipeline") {
+      // KeyedPipeline keeps prototype format (OperatorJson expects it)
+      json op_j = operator_to_json(op);
+      op_j.erase("prototype");
+      auto proto_it = op.string_params.find("prototype");
+      if (proto_it != op.string_params.end()) {
+        auto pm_it = proto_map.find(proto_it->second);
+        if (pm_it != proto_map.end()) {
+          op_j["prototype"] = prototype_to_json(*pm_it->second, proto_map);
+        }
+      }
+      j["operators"].push_back(op_j);
+    } else {
+      j["operators"].push_back(operator_to_json(op));
+    }
+  }
+
+  // All prototype connections.
+  j["connections"] = json::array();
+  for (const auto& c : proto.connections) {
+    j["connections"].push_back(connection_to_json(c));
+  }
+
+  // Entry operator is the prototype's entry (typically "proto_in" Input).
+  j["entryOperator"] = proto.entry_id;
+
+  // Output mapping: the Output operator's o1 maps to pipeline o1.
+  j["outputMappings"] = json::object();
+  j["outputMappings"][proto.output_id] = {{"o1", "o1"}};
+
+  return j;
+}
+
+json prototype_to_json(const PrototypeDef& proto,
+                      const std::map<std::string, const PrototypeDef*>& proto_map) {
   json j;
   j["entry"] = {{"operator", proto.entry_id}};
   j["output"] = {{"operator", proto.output_id}};
 
   j["operators"] = json::array();
   for (const auto& op : proto.operators) {
-    j["operators"].push_back(operator_to_json(op));
+    if (op.type == "KeyedPipeline") {
+      // KeyedPipeline keeps prototype format
+      json op_j = operator_to_json(op);
+      op_j.erase("prototype");
+
+      auto proto_it = op.string_params.find("prototype");
+      if (proto_it != op.string_params.end()) {
+        auto pm_it = proto_map.find(proto_it->second);
+        if (pm_it != proto_map.end()) {
+          op_j["prototype"] = prototype_to_json(*pm_it->second, proto_map);
+        }
+      }
+      j["operators"].push_back(op_j);
+    } else if (op.type == "Pipeline") {
+      // Pipeline emits in native format (no "prototype" field) so that
+      // OperatorJson::read_op can construct it directly.
+      json op_j = operator_to_json(op);
+      op_j.erase("prototype");
+
+      auto proto_it = op.string_params.find("prototype");
+      if (proto_it != op.string_params.end()) {
+        auto pm_it = proto_map.find(proto_it->second);
+        if (pm_it != proto_map.end()) {
+          json native = pipeline_native_from_proto(*pm_it->second, proto_map);
+          for (auto it2 = native.begin(); it2 != native.end(); ++it2) {
+            op_j[it2.key()] = it2.value();
+          }
+        }
+      }
+      j["operators"].push_back(op_j);
+    } else {
+      j["operators"].push_back(operator_to_json(op));
+    }
   }
 
   j["connections"] = json::array();
@@ -131,7 +247,10 @@ static OperatorDef operator_from_json(const json& j) {
   }
 
   static const std::set<std::string> skip = {
-      "id", "type", "portTypes", "prototype"};
+      "id", "type", "portTypes", "prototype",
+      // Pipeline native format fields (handled by Pipeline-specific code)
+      "input_port_types", "output_port_types", "operators", "connections",
+      "entryOperator", "outputMappings"};
 
   for (auto it = j.begin(); it != j.end(); ++it) {
     if (skip.count(it.key())) continue;
@@ -156,14 +275,57 @@ static OperatorDef operator_from_json(const json& j) {
 }
 
 static PrototypeDef prototype_from_json(const std::string& proto_id,
-                                        const json& j) {
+                                        const json& j,
+                                        int& id_counter,
+                                        std::vector<PrototypeDef>& extra_protos) {
   PrototypeDef proto;
   proto.id        = proto_id;
   proto.entry_id  = j.at("entry").at("operator").get<std::string>();
   proto.output_id = j.at("output").at("operator").get<std::string>();
 
   for (const auto& op_j : j.at("operators")) {
-    proto.operators.push_back(operator_from_json(op_j));
+    OperatorDef op = operator_from_json(op_j);
+
+    // Handle nested KeyedPipeline with inlined prototypes
+    if (op.type == "KeyedPipeline" &&
+        op_j.contains("prototype") && op_j["prototype"].is_object()) {
+      std::string nested_proto_id = "proto_" + std::to_string(id_counter++);
+      op.string_params["prototype"] = nested_proto_id;
+      extra_protos.push_back(
+          prototype_from_json(nested_proto_id, op_j.at("prototype"),
+                              id_counter, extra_protos));
+    }
+    // Handle nested Pipeline in native format
+    else if (op.type == "Pipeline" && op_j.contains("entryOperator")) {
+      std::string nested_proto_id = "proto_" + std::to_string(id_counter++);
+      op.string_params["prototype"] = nested_proto_id;
+      // Build a synthetic prototype JSON from native Pipeline fields
+      json nested_proto_j;
+      nested_proto_j["entry"] = {{"operator", op_j.at("entryOperator")}};
+      std::string nested_out;
+      for (auto om_it = op_j.at("outputMappings").begin();
+           om_it != op_j.at("outputMappings").end(); ++om_it) {
+        nested_out = om_it.key();
+        break;
+      }
+      nested_proto_j["output"] = {{"operator", nested_out}};
+      nested_proto_j["operators"] = op_j.at("operators");
+      nested_proto_j["connections"] = op_j.at("connections");
+      extra_protos.push_back(
+          prototype_from_json(nested_proto_id, nested_proto_j,
+                              id_counter, extra_protos));
+    }
+    // Handle nested Pipeline with legacy prototype format
+    else if (op.type == "Pipeline" &&
+             op_j.contains("prototype") && op_j["prototype"].is_object()) {
+      std::string nested_proto_id = "proto_" + std::to_string(id_counter++);
+      op.string_params["prototype"] = nested_proto_id;
+      extra_protos.push_back(
+          prototype_from_json(nested_proto_id, op_j.at("prototype"),
+                              id_counter, extra_protos));
+    }
+
+    proto.operators.push_back(std::move(op));
   }
   for (const auto& c_j : j.at("connections")) {
     proto.connections.push_back({c_j.at("from").get<std::string>(),
@@ -205,7 +367,7 @@ static PortSig output_sig(const OperatorDef& op) {
 
   // Operators that output VectorNumber
   if (t == "Input" || t == "Output" || t == "VectorCompose" ||
-      t == "VectorProject" || t == "KeyedPipeline")
+      t == "VectorProject" || t == "KeyedPipeline" || t == "Pipeline")
     return {DataType::VECTOR_NUMBER};
 
   // Operators that output Number
@@ -269,6 +431,14 @@ static PortSig input_sig(const OperatorDef& op, const std::string& port) {
   if (t == "KeyedVariable") {
     if (port == "i1") return {DataType::VECTOR_NUMBER};
     return {DataType::NUMBER};  // c1 and c2
+  }
+
+  // Pipeline has non-standard port types:
+  //   i1 (data port): VectorNumber
+  //   c1 (control port): Boolean (comparison/predicate outputs)
+  if (t == "Pipeline") {
+    if (port == "i1") return {DataType::VECTOR_NUMBER};
+    if (port == "c1") return {DataType::BOOLEAN};
   }
 
   // Control ports always expect Boolean
@@ -394,6 +564,9 @@ static void validate_graph(const std::vector<OperatorDef>& ops,
       require_param(op, "key_index");
       require_string_param(op, "prototype");
     }
+    else if (op.type == "Pipeline") {
+      require_string_param(op, "prototype");
+    }
   }
 
   // --- 3. Check port type compatibility on connections ---
@@ -467,8 +640,11 @@ std::string GraphBuilder::to_json() const {
 
   program["operators"] = json::array();
   for (const auto& op : operators_) {
-    if (op.type == "KeyedPipeline") {
-      // Build operator JSON, inlining the referenced prototype
+    if (op.type == "Pipeline") {
+      // Pipeline emits in native format (input_port_types, output_port_types,
+      // operators, connections, entryOperator, outputMappings) so that
+      // OperatorJson::read_op can construct it directly and PrototypeHandler
+      // does not try to expand it.
       json j = operator_to_json(op);
       j.erase("prototype");  // remove the string ref
 
@@ -476,7 +652,24 @@ std::string GraphBuilder::to_json() const {
       if (proto_it != op.string_params.end()) {
         auto pm_it = proto_map.find(proto_it->second);
         if (pm_it != proto_map.end()) {
-          j["prototype"] = prototype_to_json(*pm_it->second);
+          json native = pipeline_native_from_proto(*pm_it->second, proto_map);
+          for (auto it = native.begin(); it != native.end(); ++it) {
+            j[it.key()] = it.value();
+          }
+        }
+      }
+      program["operators"].push_back(j);
+    } else if (op.type == "KeyedPipeline") {
+      // KeyedPipeline keeps prototype format (OperatorJson expects inline
+      // prototype for its factory function).
+      json j = operator_to_json(op);
+      j.erase("prototype");  // remove the string ref
+
+      auto proto_it = op.string_params.find("prototype");
+      if (proto_it != op.string_params.end()) {
+        auto pm_it = proto_map.find(proto_it->second);
+        if (pm_it != proto_map.end()) {
+          j["prototype"] = prototype_to_json(*pm_it->second, proto_map);
         }
       }
       program["operators"].push_back(j);
@@ -536,10 +729,97 @@ std::pair<GraphBuilder, Endpoint> GraphBuilder::from_json_for_augmentation(
     OperatorDef op = operator_from_json(op_j);
 
     if (op.type == "KeyedPipeline" && op_j.contains("prototype")) {
+      // KeyedPipeline: prototype format (inline object with entry/output)
       std::string proto_id = "proto_" + std::to_string(max_counter++);
       op.string_params["prototype"] = proto_id;
+      std::vector<PrototypeDef> extra_protos;
       builder.prototypes_.push_back(
-          prototype_from_json(proto_id, op_j.at("prototype")));
+          prototype_from_json(proto_id, op_j.at("prototype"),
+                              max_counter, extra_protos));
+      for (auto& ep : extra_protos) {
+        builder.prototypes_.push_back(std::move(ep));
+      }
+    } else if (op.type == "Pipeline" && op_j.contains("entryOperator")) {
+      // Pipeline: native format (entryOperator, outputMappings, operators, connections).
+      // Convert back to PrototypeDef for internal storage.
+      std::string proto_id = "proto_" + std::to_string(max_counter++);
+      op.string_params["prototype"] = proto_id;
+
+      PrototypeDef proto;
+      proto.id = proto_id;
+      proto.entry_id = op_j.at("entryOperator").get<std::string>();
+
+      // Derive output_id from outputMappings (the first mapped operator).
+      // In our convention, the Output operator's id is the key.
+      for (auto om_it = op_j.at("outputMappings").begin();
+           om_it != op_j.at("outputMappings").end(); ++om_it) {
+        proto.output_id = om_it.key();
+        break;
+      }
+
+      // Load internal operators (may contain nested Pipeline/KeyedPipeline)
+      for (const auto& inner_op_j : op_j.at("operators")) {
+        OperatorDef inner_op = operator_from_json(inner_op_j);
+        if (inner_op.type == "Pipeline" && inner_op_j.contains("entryOperator")) {
+          // Recursively handle nested Pipeline
+          std::string nested_proto_id = "proto_" + std::to_string(max_counter++);
+          inner_op.string_params["prototype"] = nested_proto_id;
+          // Build a synthetic prototype JSON from native fields
+          json nested_proto_j;
+          nested_proto_j["entry"] = {{"operator", inner_op_j.at("entryOperator")}};
+          // Derive output from outputMappings
+          std::string nested_out;
+          for (auto nm_it = inner_op_j.at("outputMappings").begin();
+               nm_it != inner_op_j.at("outputMappings").end(); ++nm_it) {
+            nested_out = nm_it.key();
+            break;
+          }
+          nested_proto_j["output"] = {{"operator", nested_out}};
+          nested_proto_j["operators"] = inner_op_j.at("operators");
+          nested_proto_j["connections"] = inner_op_j.at("connections");
+          std::vector<PrototypeDef> extra_protos;
+          builder.prototypes_.push_back(
+              prototype_from_json(nested_proto_id, nested_proto_j,
+                                  max_counter, extra_protos));
+          for (auto& ep2 : extra_protos) {
+            builder.prototypes_.push_back(std::move(ep2));
+          }
+        } else if ((inner_op.type == "KeyedPipeline") &&
+                   inner_op_j.contains("prototype")) {
+          std::string nested_proto_id = "proto_" + std::to_string(max_counter++);
+          inner_op.string_params["prototype"] = nested_proto_id;
+          std::vector<PrototypeDef> extra_protos;
+          builder.prototypes_.push_back(
+              prototype_from_json(nested_proto_id, inner_op_j.at("prototype"),
+                                  max_counter, extra_protos));
+          for (auto& ep2 : extra_protos) {
+            builder.prototypes_.push_back(std::move(ep2));
+          }
+        }
+        proto.operators.push_back(std::move(inner_op));
+      }
+
+      // Load internal connections
+      for (const auto& c_j2 : op_j.at("connections")) {
+        proto.connections.push_back({c_j2.at("from").get<std::string>(),
+                                     c_j2.at("fromPort").get<std::string>(),
+                                     c_j2.at("to").get<std::string>(),
+                                     c_j2.at("toPort").get<std::string>()});
+      }
+
+      builder.prototypes_.push_back(std::move(proto));
+    } else if ((op.type == "KeyedPipeline" || op.type == "Pipeline") &&
+               op_j.contains("prototype")) {
+      // Legacy/fallback: Pipeline with prototype format
+      std::string proto_id = "proto_" + std::to_string(max_counter++);
+      op.string_params["prototype"] = proto_id;
+      std::vector<PrototypeDef> extra_protos;
+      builder.prototypes_.push_back(
+          prototype_from_json(proto_id, op_j.at("prototype"),
+                              max_counter, extra_protos));
+      for (auto& ep : extra_protos) {
+        builder.prototypes_.push_back(std::move(ep));
+      }
     }
 
     builder.operators_.push_back(std::move(op));
