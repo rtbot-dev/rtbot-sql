@@ -59,6 +59,7 @@ bool is_aggregate_or_windowed(const std::string& name) {
   std::string upper = name;
   std::transform(upper.begin(), upper.end(), upper.begin(), ::toupper);
   return upper == "SUM" || upper == "COUNT" || upper == "AVG" ||
+         upper == "MIN" || upper == "MAX" ||
          upper == "MOVING_AVERAGE" || upper == "MOVING_SUM" ||
          upper == "MOVING_COUNT" || upper == "MOVING_STD" ||
          upper == "STDDEV" || upper == "MOVING_MIN" || upper == "MOVING_MAX" ||
@@ -125,6 +126,34 @@ Endpoint compile_function(const std::string& name,
     builder.connect({sum_id, "o1"}, {div_id, "i1"});
     builder.connect({cnt_id, "o1"}, {div_id, "i2"});
     return {div_id, "o1"};
+  }
+
+  if (upper == "MIN") {
+    if (args.size() != 1) {
+      throw std::runtime_error("MIN requires exactly 1 argument");
+    }
+    auto expr_ep = ensure_endpoint(
+        compile_expression(args[0], input_endpoint, scope, builder, cache,
+                           source_endpoints),
+        input_endpoint, builder);
+    auto id = builder.next_id("min");
+    builder.add_operator(id, "MinTracker");
+    builder.connect(expr_ep, {id, "i1"});
+    return {id, "o1"};
+  }
+
+  if (upper == "MAX") {
+    if (args.size() != 1) {
+      throw std::runtime_error("MAX requires exactly 1 argument");
+    }
+    auto expr_ep = ensure_endpoint(
+        compile_expression(args[0], input_endpoint, scope, builder, cache,
+                           source_endpoints),
+        input_endpoint, builder);
+    auto id = builder.next_id("max");
+    builder.add_operator(id, "MaxTracker");
+    builder.connect(expr_ep, {id, "i1"});
+    return {id, "o1"};
   }
 
   // --- Windowed functions ---
@@ -256,6 +285,20 @@ Endpoint compile_function(const std::string& name,
   }
 
   // --- DSP functions (stubs — generate operators, detailed testing in Phase 2) ---
+
+  if (upper == "DIFF") {
+    if (args.size() != 1) {
+      throw std::runtime_error("DIFF requires exactly 1 argument");
+    }
+    auto expr_ep = ensure_endpoint(
+        compile_expression(args[0], input_endpoint, scope, builder, cache,
+                           source_endpoints),
+        input_endpoint, builder);
+    auto diff_id = builder.next_id("diff");
+    builder.add_operator(diff_id, "Difference");
+    builder.connect(expr_ep, {diff_id, "i1"});
+    return {diff_id, "o1"};
+  }
 
   if (upper == "FIR") {
     if (args.size() != 2) {

@@ -313,5 +313,86 @@ TEST_F(FunctionTest, MovingMaxWrongArgCountThrows) {
                std::runtime_error);
 }
 
+// DIFF(quantity) → VectorExtract + Difference
+TEST_F(FunctionTest, DiffProducesDifference) {
+  std::vector<Expr> args;
+  args.push_back(col("quantity"));
+  auto ep = compile_function("DIFF", args, input, scope, builder);
+
+  ASSERT_EQ(builder.operators().size(), 2u);
+  auto& ext = builder.operators()[0];
+  auto& diff = builder.operators()[1];
+  EXPECT_EQ(ext.type, "VectorExtract");
+  EXPECT_EQ(ext.params.at("index"), 2.0);
+  EXPECT_EQ(diff.type, "Difference");
+  EXPECT_EQ(ep.operator_id, diff.id);
+  EXPECT_EQ(ep.port, "o1");
+
+  ASSERT_EQ(builder.connections().size(), 2u);
+  expect_conn(builder, "input_0", "o1", ext.id, "i1");
+  expect_conn(builder, ext.id, "o1", diff.id, "i1");
+}
+
+// DIFF wrong arg count → error
+TEST_F(FunctionTest, DiffWrongArgCountThrows) {
+  std::vector<Expr> args;  // empty
+  EXPECT_THROW(compile_function("DIFF", args, input, scope, builder),
+               std::runtime_error);
+}
+
+// MIN(price) → VectorExtract + MinTracker
+TEST_F(FunctionTest, MinProducesMinTracker) {
+  std::vector<Expr> args;
+  args.push_back(col("price"));
+  auto ep = compile_function("MIN", args, input, scope, builder);
+
+  ASSERT_EQ(builder.operators().size(), 2u);
+  auto& ext = builder.operators()[0];
+  auto& mn = builder.operators()[1];
+  EXPECT_EQ(ext.type, "VectorExtract");
+  EXPECT_EQ(ext.params.at("index"), 1.0);
+  EXPECT_EQ(mn.type, "MinTracker");
+  EXPECT_EQ(ep.operator_id, mn.id);
+  EXPECT_EQ(ep.port, "o1");
+
+  ASSERT_EQ(builder.connections().size(), 2u);
+  expect_conn(builder, "input_0", "o1", ext.id, "i1");
+  expect_conn(builder, ext.id, "o1", mn.id, "i1");
+}
+
+// MIN wrong arg count → error
+TEST_F(FunctionTest, MinWrongArgCountThrows) {
+  std::vector<Expr> args;  // empty
+  EXPECT_THROW(compile_function("MIN", args, input, scope, builder),
+               std::runtime_error);
+}
+
+// MAX(price) → VectorExtract + MaxTracker
+TEST_F(FunctionTest, MaxProducesMaxTracker) {
+  std::vector<Expr> args;
+  args.push_back(col("price"));
+  auto ep = compile_function("MAX", args, input, scope, builder);
+
+  ASSERT_EQ(builder.operators().size(), 2u);
+  auto& ext = builder.operators()[0];
+  auto& mx = builder.operators()[1];
+  EXPECT_EQ(ext.type, "VectorExtract");
+  EXPECT_EQ(ext.params.at("index"), 1.0);
+  EXPECT_EQ(mx.type, "MaxTracker");
+  EXPECT_EQ(ep.operator_id, mx.id);
+  EXPECT_EQ(ep.port, "o1");
+
+  ASSERT_EQ(builder.connections().size(), 2u);
+  expect_conn(builder, "input_0", "o1", ext.id, "i1");
+  expect_conn(builder, ext.id, "o1", mx.id, "i1");
+}
+
+// MAX wrong arg count → error
+TEST_F(FunctionTest, MaxWrongArgCountThrows) {
+  std::vector<Expr> args;  // empty
+  EXPECT_THROW(compile_function("MAX", args, input, scope, builder),
+               std::runtime_error);
+}
+
 }  // namespace
 }  // namespace rtbot_sql::compiler
