@@ -15,6 +15,7 @@ using FieldMap = std::map<std::string, int>;
 struct SelectResult {
   Endpoint endpoint;
   FieldMap field_map;
+  bool is_segment_only = false;  // true when GROUP BY has only segment expressions (no persistent keys)
 };
 
 // Compile a SELECT projection into operator graph nodes.

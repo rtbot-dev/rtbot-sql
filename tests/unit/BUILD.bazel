@@ -76,6 +76,7 @@ cc_test(
     deps = [
         "//libs/compiler",
         "@com_google_googletest//:gtest_main",
+        "@json-cpp//:lib",
     ],
 )
 

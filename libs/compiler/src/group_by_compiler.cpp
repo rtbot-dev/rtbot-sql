@@ -6,6 +6,7 @@
 
 #include "rtbot_sql/compiler/expr_cache.h"
 #include "rtbot_sql/compiler/expression_compiler.h"
+#include "rtbot_sql/compiler/where_compiler.h"
 
 namespace rtbot_sql::compiler {
 
@@ -266,6 +267,61 @@ Endpoint compile_having_predicate(const parser::ast::Expr& expr,
 
 }  // namespace
 
+// --- GroupByClassification helper methods ---
+
+bool GroupByClassification::has_persistent_keys() const {
+  for (const auto& item : items) {
+    if (item.kind == GroupByItemKind::PERSISTENT_KEY) return true;
+  }
+  return false;
+}
+
+bool GroupByClassification::has_segment_expressions() const {
+  for (const auto& item : items) {
+    if (item.kind == GroupByItemKind::SEGMENT_EXPRESSION) return true;
+  }
+  return false;
+}
+
+int GroupByClassification::persistent_key_count() const {
+  int count = 0;
+  for (const auto& item : items) {
+    if (item.kind == GroupByItemKind::PERSISTENT_KEY) ++count;
+  }
+  return count;
+}
+
+int GroupByClassification::segment_expression_count() const {
+  int count = 0;
+  for (const auto& item : items) {
+    if (item.kind == GroupByItemKind::SEGMENT_EXPRESSION) ++count;
+  }
+  return count;
+}
+
+// --- classify_group_by ---
+
+GroupByClassification classify_group_by(
+    const std::vector<parser::ast::Expr>& group_by,
+    const analyzer::Scope& scope) {
+  GroupByClassification result;
+  for (const auto& expr : group_by) {
+    auto* col_ref = std::get_if<parser::ast::ColumnRef>(&expr);
+    if (col_ref) {
+      // Attempt to resolve: if it resolves to a column, it's a persistent key
+      auto resolved = scope.resolve(*col_ref);
+      if (auto* binding = std::get_if<analyzer::ColumnBinding>(&resolved)) {
+        result.items.push_back(
+            {GroupByItemKind::PERSISTENT_KEY, binding->index, col_ref->column_name});
+        continue;
+      }
+    }
+    // Anything else is a segment expression
+    result.items.push_back({GroupByItemKind::SEGMENT_EXPRESSION, -1, ""});
+  }
+  return result;
+}
+
 SelectResult compile_group_by(
     const std::vector<parser::ast::SelectItem>& select_list,
     const std::vector<parser::ast::Expr>& group_by,
@@ -276,10 +332,316 @@ SelectResult compile_group_by(
     int num_input_cols) {
   using namespace parser::ast;
 
-  // --- Step 1: Identify key column(s) ---
+  // --- Step 0: Classify GROUP BY items ---
   if (group_by.empty()) {
     throw std::runtime_error("GROUP BY requires at least one column");
   }
+
+  auto classification = classify_group_by(group_by, scope);
+
+  // Mixed GROUP BY (persistent keys + segment expressions)
+  if (classification.has_persistent_keys() && classification.has_segment_expressions()) {
+    if (classification.segment_expression_count() > 1) {
+      throw std::runtime_error(
+          "multiple segment expressions in GROUP BY not yet supported");
+    }
+    if (having.has_value()) {
+      throw std::runtime_error(
+          "HAVING with mixed GROUP BY not yet supported");
+    }
+
+    // --- Collect all persistent keys ---
+    struct KeyInfo { int index; std::string name; };
+    std::vector<KeyInfo> keys;
+    for (const auto& gi : classification.items) {
+      if (gi.kind == GroupByItemKind::PERSISTENT_KEY) {
+        keys.push_back({gi.key_index, gi.key_name});
+      }
+    }
+
+    const bool composite = keys.size() > 1;
+
+    // --- Identify the segment expression ---
+    const Expr* segment_expr = nullptr;
+    for (size_t i = 0; i < group_by.size(); ++i) {
+      if (classification.items[i].kind == GroupByItemKind::SEGMENT_EXPRESSION) {
+        segment_expr = &group_by[i];
+        break;
+      }
+    }
+
+    // --- For composite keys: build hash-augmented vector in outer graph ---
+    Endpoint keyed_input = input_endpoint;
+    int keyed_key_index = keys[0].index;  // single-key default
+
+    if (composite) {
+      if (num_input_cols <= 0) {
+        throw std::runtime_error(
+            "composite GROUP BY with segment expression requires stream column count "
+            "(internal error)");
+      }
+
+      static const double PRIME = 1000003.0;
+
+      // Extract all columns from input vector
+      std::vector<std::string> extract_ids;
+      extract_ids.reserve(num_input_cols);
+      for (int c = 0; c < num_input_cols; ++c) {
+        auto eid = builder.next_id("extract");
+        builder.add_operator(eid, "VectorExtract",
+                             {{"index", static_cast<double>(c)}});
+        builder.connect(input_endpoint, {eid, "i1"});
+        extract_ids.push_back(eid);
+      }
+
+      // Compute hash = PRIME * key0 + key1 (+ ... for more keys via chaining)
+      std::string hash_ep_id = extract_ids[keys[0].index];
+      for (size_t ki = 1; ki < keys.size(); ++ki) {
+        auto lin_id = builder.next_id("linear");
+        builder.add_operator(lin_id, "Linear", {},
+                             {}, {{"coefficients", {PRIME, 1.0}}});
+        builder.connect({hash_ep_id, "o1"}, {lin_id, "i1"});
+        builder.connect({extract_ids[keys[ki].index], "o1"}, {lin_id, "i2"});
+        hash_ep_id = lin_id;
+      }
+
+      // Compose augmented vector: [original cols..., hash]
+      int compose_n = num_input_cols + 1;
+      auto compose_id = builder.next_id("augment");
+      builder.add_operator(compose_id, "VectorCompose",
+                           {{"numPorts", static_cast<double>(compose_n)}});
+      for (int c = 0; c < num_input_cols; ++c) {
+        builder.connect({extract_ids[c], "o1"},
+                        {compose_id, "i" + std::to_string(c + 1)});
+      }
+      builder.connect({hash_ep_id, "o1"},
+                      {compose_id, "i" + std::to_string(compose_n)});
+
+      keyed_input = {compose_id, "o1"};
+      keyed_key_index = num_input_cols;  // hash column at end of augmented vector
+    }
+
+    // --- Build inner prototype (aggregates for Pipeline) ---
+    GraphBuilder inner_proto_builder;
+    ExprCache inner_cache;
+    inner_proto_builder.add_operator("proto_in", "Input");
+    Endpoint inner_input_ep{"proto_in", "o1"};
+
+    std::vector<Endpoint> inner_endpoints;
+    std::vector<std::string> field_names;
+
+    if (composite) {
+      // For composite keys: extract ALL key columns explicitly in inner prototype
+      // (KeyedPipeline prepends the hash key at index 0, so prototype outputs
+      //  start at index 1 in the final output)
+      for (const auto& ki : keys) {
+        auto ve_id = inner_proto_builder.next_id("extract");
+        inner_proto_builder.add_operator(
+            ve_id, "VectorExtract",
+            {{"index", static_cast<double>(ki.index)}});
+        inner_proto_builder.connect(inner_input_ep, {ve_id, "i1"});
+        inner_endpoints.push_back({ve_id, "o1"});
+        field_names.push_back(ki.name);
+      }
+    } else {
+      // Single key: KeyedPipeline prepends it at index 0
+      field_names.push_back(keys[0].name);
+    }
+
+    for (const auto& select_item : select_list) {
+      // Skip if it's a GROUP BY persistent key
+      bool is_key = false;
+      for (const auto& gbe : group_by) {
+        if (is_group_by_key(select_item, gbe, scope)) { is_key = true; break; }
+      }
+      if (is_key) continue;
+
+      auto result = compile_expression_cached(
+          select_item.expr, inner_input_ep, scope, inner_proto_builder, inner_cache);
+      auto ep = ensure_endpoint(std::move(result), inner_input_ep, inner_proto_builder);
+      inner_endpoints.push_back(ep);
+      field_names.push_back(
+          select_item.alias.value_or(default_alias(select_item.expr)));
+    }
+
+    // Compose inner prototype outputs
+    auto inner_compose_id = inner_proto_builder.next_id("compose");
+    inner_proto_builder.add_operator(
+        inner_compose_id, "VectorCompose",
+        {{"numPorts", static_cast<double>(inner_endpoints.size())}});
+    for (size_t i = 0; i < inner_endpoints.size(); ++i) {
+      inner_proto_builder.connect(inner_endpoints[i],
+                                  {inner_compose_id, "i" + std::to_string(i + 1)});
+    }
+
+    inner_proto_builder.add_operator("proto_out", "Output");
+    inner_proto_builder.connect({inner_compose_id, "o1"}, {"proto_out", "i1"});
+
+    auto inner_proto_id = builder.next_id("proto");
+    PrototypeDef inner_proto_def;
+    inner_proto_def.id = inner_proto_id;
+    inner_proto_def.entry_id = "proto_in";
+    inner_proto_def.output_id = "proto_out";
+    inner_proto_def.operators = inner_proto_builder.operators();
+    inner_proto_def.connections = inner_proto_builder.connections();
+    builder.add_prototype(inner_proto_def);
+
+    // --- Build outer prototype (segment expression + Pipeline) ---
+    GraphBuilder outer_proto_builder;
+    Endpoint outer_input_ep{"proto_in", "o1"};
+    outer_proto_builder.add_operator("proto_in", "Input");
+
+    // Compile segment expression as a predicate inside the outer prototype
+    auto bool_ep =
+        compile_predicate(*segment_expr, outer_input_ep, scope, outer_proto_builder);
+
+    // Add Pipeline operator inside the outer prototype
+    auto pipeline_id = outer_proto_builder.next_id("pipeline");
+    outer_proto_builder.add_operator(pipeline_id, "Pipeline",
+                                     /*params=*/{},
+                                     /*string_params=*/{{"prototype", inner_proto_id}});
+    outer_proto_builder.connect(outer_input_ep, {pipeline_id, "i1"});
+    outer_proto_builder.connect(bool_ep, {pipeline_id, "c1"});
+
+    outer_proto_builder.add_operator("proto_out", "Output");
+    outer_proto_builder.connect({pipeline_id, "o1"}, {"proto_out", "i1"});
+
+    auto outer_proto_id = builder.next_id("proto");
+    PrototypeDef outer_proto_def;
+    outer_proto_def.id = outer_proto_id;
+    outer_proto_def.entry_id = "proto_in";
+    outer_proto_def.output_id = "proto_out";
+    outer_proto_def.operators = outer_proto_builder.operators();
+    outer_proto_def.connections = outer_proto_builder.connections();
+    builder.add_prototype(outer_proto_def);
+
+    // --- Add KeyedPipeline to outer graph ---
+    auto keyed_id = builder.next_id("keyed");
+    builder.add_operator(keyed_id, "KeyedPipeline",
+                         {{"key_index", static_cast<double>(keyed_key_index)}},
+                         {{"prototype", outer_proto_id}});
+    builder.connect(keyed_input, {keyed_id, "i1"});
+
+    // --- Build field map ---
+    if (composite) {
+      // KeyedPipeline prepends hash key at index 0, shifting prototype outputs by 1.
+      // field_map: key0→1, key1→2, agg0→3, agg1→4, ...
+      FieldMap field_map;
+      for (size_t i = 0; i < field_names.size(); ++i) {
+        field_map[field_names[i]] = static_cast<int>(i + 1);
+      }
+      return {{keyed_id, "o1"}, field_map, /*is_segment_only=*/false};
+    } else {
+      // Single key: key at index 0 (prepended by KeyedPipeline), aggregates at 1, 2, ...
+      FieldMap field_map;
+      for (size_t i = 0; i < field_names.size(); ++i) {
+        field_map[field_names[i]] = static_cast<int>(i);
+      }
+      return {{keyed_id, "o1"}, field_map, /*is_segment_only=*/false};
+    }
+  }
+
+  // --- Segment-only GROUP BY → Pipeline with control port ---
+  if (classification.has_segment_expressions()) {
+    if (classification.segment_expression_count() > 1) {
+      throw std::runtime_error(
+          "multiple segment expressions in GROUP BY not yet supported");
+    }
+
+    // Compile the segment expression as a predicate (BOOLEAN output)
+    // in the outer graph.
+    auto bool_ep =
+        compile_predicate(group_by[0], input_endpoint, scope, builder);
+
+    // Build prototype sub-graph for aggregates
+    GraphBuilder proto_builder;
+    ExprCache cache;
+    proto_builder.add_operator("proto_in", "Input");
+    Endpoint proto_input_ep{"proto_in", "o1"};
+
+    std::vector<Endpoint> proto_endpoints;
+    std::vector<std::string> field_names;
+
+    for (const auto& select_item : select_list) {
+      auto result = compile_expression_cached(
+          select_item.expr, proto_input_ep, scope, proto_builder, cache);
+      auto ep = ensure_endpoint(std::move(result), proto_input_ep, proto_builder);
+      proto_endpoints.push_back(ep);
+      field_names.push_back(
+          select_item.alias.value_or(default_alias(select_item.expr)));
+    }
+
+    // Compose prototype outputs into a vector
+    auto compose_id = proto_builder.next_id("compose");
+    proto_builder.add_operator(
+        compose_id, "VectorCompose",
+        {{"numPorts", static_cast<double>(proto_endpoints.size())}});
+    for (size_t i = 0; i < proto_endpoints.size(); ++i) {
+      proto_builder.connect(proto_endpoints[i],
+                            {compose_id, "i" + std::to_string(i + 1)});
+    }
+    Endpoint proto_output_ep = {compose_id, "o1"};
+
+    // Finalize prototype
+    proto_builder.add_operator("proto_out", "Output");
+    proto_builder.connect(proto_output_ep, {"proto_out", "i1"});
+
+    auto proto_id = builder.next_id("proto");
+    PrototypeDef proto_def;
+    proto_def.id = proto_id;
+    proto_def.entry_id = "proto_in";
+    proto_def.output_id = "proto_out";
+    proto_def.operators = proto_builder.operators();
+    proto_def.connections = proto_builder.connections();
+    builder.add_prototype(proto_def);
+
+    // Add Pipeline to outer graph with control port
+    auto pipeline_id = builder.next_id("pipeline");
+    builder.add_operator(pipeline_id, "Pipeline",
+                         /*params=*/{},
+                         /*string_params=*/{{"prototype", proto_id}});
+    builder.connect(input_endpoint, {pipeline_id, "i1"});
+    builder.connect(bool_ep, {pipeline_id, "c1"});
+
+    // --- HAVING (if present): post-Pipeline filter ---
+    Endpoint pipeline_output{pipeline_id, "o1"};
+    if (having.has_value()) {
+      // Pre-populate cache with VectorExtract endpoints from Pipeline output.
+      // Each SELECT item at index i maps to VectorExtract(index=i) on the
+      // Pipeline's vector output.  This way, when compile_having_predicate
+      // encounters e.g. SUM(quantity), the cache returns the extracted scalar
+      // instead of creating a new accumulator operator.
+      ExprCache having_cache;
+      for (size_t i = 0; i < select_list.size(); ++i) {
+        auto ve_id = builder.next_id("having_extract");
+        builder.add_operator(ve_id, "VectorExtract",
+                             {{"index", static_cast<double>(i)}});
+        builder.connect(pipeline_output, {ve_id, "i1"});
+        having_cache.store(select_list[i].expr, {ve_id, "o1"});
+      }
+
+      auto having_bool_ep = compile_having_predicate(
+          *having, pipeline_output, scope, builder, having_cache);
+
+      auto demux_id = builder.next_id("demux");
+      builder.add_operator(demux_id, "Demultiplexer", {{"numPorts", 1}},
+                           {{"portType", "vector_number"}});
+      builder.connect(having_bool_ep, {demux_id, "c1"});
+      builder.connect(pipeline_output, {demux_id, "i1"});
+
+      pipeline_output = {demux_id, "o1"};
+    }
+
+    // Build field map: no key column, just aggregate aliases
+    FieldMap field_map;
+    for (size_t i = 0; i < field_names.size(); ++i) {
+      field_map[field_names[i]] = static_cast<int>(i);
+    }
+
+    return {pipeline_output, field_map, /*is_segment_only=*/true};
+  }
+
+  // --- Step 1: Identify key column(s) (persistent keys only) ---
 
   // --- Composite GROUP BY (2+ keys) ---
   if (group_by.size() > 1) {

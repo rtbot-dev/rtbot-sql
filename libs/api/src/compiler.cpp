@@ -141,7 +141,7 @@ CompilationResult compile_stream_cross_select(
     return make_error("GROUP BY with multiple FROM sources is not yet supported");
   }
 
-  auto [ep, field_map] = compiler::compile_select_projection(
+  auto [ep, field_map, _seg] = compiler::compile_select_projection(
       expanded_select, current, scope, builder, &source_ports);
   current = ep;
 
@@ -231,6 +231,13 @@ CompilationResult compile_select_to_program(
   if (stmt.having.has_value()) {
     expanded_having = compiler::expand_aliases(*stmt.having, alias_map);
   }
+
+  // Expand GROUP BY items (resolve SELECT aliases — MySQL-style resolution)
+  std::vector<parser::ast::Expr> expanded_group_by;
+  expanded_group_by.reserve(stmt.group_by.size());
+  for (const auto& gb : stmt.group_by) {
+    expanded_group_by.push_back(compiler::expand_aliases(gb, alias_map));
+  }
   // ─────────────────────────────────────────────────────────────────────────
 
   // WHERE clause
@@ -265,15 +272,17 @@ CompilationResult compile_select_to_program(
   compiler::FieldMap field_map;
 
   // GROUP BY
-  if (!stmt.group_by.empty()) {
-    auto [ep, fm] = compiler::compile_group_by(
-        expanded_select, stmt.group_by, expanded_having, current, scope,
+  bool is_segment_only_group_by = false;
+  if (!expanded_group_by.empty()) {
+    auto [ep, fm, seg_only] = compiler::compile_group_by(
+        expanded_select, expanded_group_by, expanded_having, current, scope,
         builder, num_input_cols);
     current = ep;
     field_map = fm;
+    is_segment_only_group_by = seg_only;
   } else {
     // SELECT projection
-    auto [ep, fm] =
+    auto [ep, fm, _seg2] =
         compiler::compile_select_projection(expanded_select, current, scope,
                                             builder);
     current = ep;
@@ -321,9 +330,15 @@ CompilationResult compile_select_to_program(
   result.source_streams = {stmt.from_table};
 
   // Determine view type
-  if (!stmt.group_by.empty()) {
+  if (!stmt.group_by.empty() && !is_segment_only_group_by) {
     result.view_type = ViewType::KEYED;
-    if (stmt.group_by.size() == 1) {
+    // Count only persistent partition keys (bare column references), ignoring
+    // segment expressions. Mixed GROUP BY (e.g., device_id, ABS(x) > 0) has
+    // group_by.size() > 1 but only 1 persistent key.
+    auto classification =
+        compiler::classify_group_by(expanded_group_by, scope);
+    int num_persistent = classification.persistent_key_count();
+    if (num_persistent == 1) {
       // Single-key GROUP BY outputs the key at position 0 in the keyed view
       // payload (see compile_group_by field_map contract). Runtime key tracking
       // and tier-1 keyed reads must use the keyed-view output index, not the
@@ -334,6 +349,7 @@ CompilationResult compile_select_to_program(
       result.key_index = -1;
     }
   } else {
+    // No GROUP BY, or segment-only GROUP BY (no persistent partition key)
     result.view_type = ViewType::SCALAR;
     result.key_index = -1;
   }
@@ -621,7 +637,7 @@ CompilationResult compile_table_join(
   // SELECT projection (or pass-through for SELECT *)
   compiler::FieldMap field_map;
   if (!stmt.select_list.empty()) {
-    auto [ep, fm] = compiler::compile_select_projection(
+    auto [ep, fm, _seg3] = compiler::compile_select_projection(
         stmt.select_list, current, scope, builder);
     current = ep;
     field_map = fm;
@@ -735,7 +751,7 @@ CompilationResult handle_select_from_view(const parser::ast::SelectStmt& stmt,
   // Apply SELECT projection (if not SELECT *).
   compiler::FieldMap field_map = view_meta.field_map;
   if (!stmt.select_list.empty()) {
-    auto [ep, fm] = compiler::compile_select_projection(
+    auto [ep, fm, _seg4] = compiler::compile_select_projection(
         stmt.select_list, current, scope, builder);
     current = ep;
     field_map = fm;
