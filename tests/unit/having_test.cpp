@@ -58,7 +58,7 @@ TEST_F(HavingTest, HavingWithSharedCount) {
   // HAVING COUNT(*) > 5
   Expr having = cmp(">", func_expr("COUNT", {}), num(5));
 
-  auto [ep, field_map] =
+  auto [ep, field_map, _seg1] =
       compile_group_by(select_list, group_by, std::move(having), input, scope,
                        builder);
 
@@ -106,7 +106,7 @@ TEST_F(HavingTest, HavingWithSharedSum) {
   sum_args2.push_back(col("quantity"));
   Expr having = cmp(">", func_expr("SUM", std::move(sum_args2)), num(1000));
 
-  auto [ep, field_map] =
+  auto [ep, field_map, _seg2] =
       compile_group_by(select_list, group_by, std::move(having), input, scope,
                        builder);
 
@@ -153,7 +153,7 @@ TEST_F(HavingTest, VelocityPatternBuildsOuterPrefilter) {
   mc_args.push_back(num(5));
   Expr having = cmp(">", func_expr("MOVING_COUNT", std::move(mc_args)), num(3));
 
-  auto [ep, field_map] =
+  auto [ep, field_map, _seg3] =
       compile_group_by(select_list, group_by, std::move(having), input, scope,
                        builder);
 
@@ -303,6 +303,106 @@ TEST_F(HavingTest, HavingDeviationFromBaseline) {
     if (op.type == "CompareGT") has_compare = true;
   }
   EXPECT_TRUE(has_compare) << "Expected CompareGT for deviation > constant";
+}
+
+// Test: Segment-only HAVING is a POST-PIPELINE filter (Demux in outer graph)
+//
+// SELECT SUM(quantity) AS total, COUNT(*) AS cnt
+// FROM trades
+// GROUP BY ABS(price) > 0
+// HAVING SUM(quantity) > 100
+//
+// Expected operator graph:
+//   input → [ABS+CompareGT(0)] → bool_ep
+//   input → Pipeline.i1, bool_ep → Pipeline.c1
+//   Pipeline.o1 → VectorExtract(0) → CompareGT(100) → Demux.c1
+//   Pipeline.o1 → Demux.i1
+//   Demux.o1 → returned endpoint
+TEST_F(HavingTest, SegmentHavingPostPipelineFilter) {
+  std::vector<SelectItem> select_list;
+  // SUM(quantity) AS total
+  std::vector<Expr> sum_args;
+  sum_args.push_back(col("quantity"));
+  select_list.push_back(item(func_expr("SUM", std::move(sum_args)), "total"));
+  // COUNT(*) AS cnt
+  select_list.push_back(item(func_expr("COUNT", {}), "cnt"));
+
+  std::vector<Expr> group_by;
+  // ABS(price) > 0  (segment expression)
+  std::vector<Expr> abs_args;
+  abs_args.push_back(col("price"));
+  group_by.push_back(cmp(">", func_expr("ABS", std::move(abs_args)), num(0)));
+
+  // HAVING SUM(quantity) > 100
+  std::vector<Expr> having_sum_args;
+  having_sum_args.push_back(col("quantity"));
+  Expr having = cmp(">", func_expr("SUM", std::move(having_sum_args)), num(100));
+
+  auto [ep, field_map, is_seg] =
+      compile_group_by(select_list, group_by, std::move(having), input, scope,
+                       builder);
+
+  // 1. is_segment_only should be true
+  EXPECT_TRUE(is_seg) << "segment-only GROUP BY with HAVING should still be segment_only";
+
+  // 2. Pipeline exists in the outer graph
+  bool has_pipeline = false;
+  for (const auto& op : builder.operators()) {
+    if (op.type == "Pipeline") has_pipeline = true;
+  }
+  EXPECT_TRUE(has_pipeline) << "Pipeline should be in outer graph";
+
+  // 3. Demultiplexer exists in the outer graph (post-filter)
+  bool has_demux = false;
+  std::string demux_id;
+  for (const auto& op : builder.operators()) {
+    if (op.type == "Demultiplexer") {
+      has_demux = true;
+      demux_id = op.id;
+    }
+  }
+  EXPECT_TRUE(has_demux) << "Demultiplexer should be in outer graph (post-Pipeline filter)";
+
+  // 4. CompareGT(100) exists in the outer graph (for HAVING threshold)
+  //    Note: ABS(price) > 0 also creates a CompareGT(0), so check for at least
+  //    one with value 100.
+  bool has_having_cmp = false;
+  for (const auto& op : builder.operators()) {
+    if (op.type == "CompareGT" && op.params.count("value") &&
+        op.params.at("value") == 100.0) {
+      has_having_cmp = true;
+    }
+  }
+  EXPECT_TRUE(has_having_cmp) << "CompareGT(100) should be in outer graph for HAVING";
+
+  // 5. VectorExtract exists in outer graph (to extract SUM from Pipeline output)
+  bool has_extract = false;
+  for (const auto& op : builder.operators()) {
+    if (op.type == "VectorExtract") {
+      // At least one extract with index 0 (SUM(quantity) is first SELECT item)
+      if (op.params.count("index") && op.params.at("index") == 0.0) {
+        has_extract = true;
+      }
+    }
+  }
+  EXPECT_TRUE(has_extract) << "VectorExtract(0) should be in outer graph for HAVING";
+
+  // 6. No Demultiplexer inside the Pipeline's prototype (HAVING is post-filter)
+  ASSERT_GE(builder.prototypes().size(), 1u);
+  for (const auto& proto : builder.prototypes()) {
+    for (const auto& op : proto.operators) {
+      EXPECT_NE(op.type, "Demultiplexer")
+          << "Demultiplexer should NOT be inside prototype for segment HAVING";
+    }
+  }
+
+  // 7. field_map is correct
+  EXPECT_EQ(field_map.at("total"), 0);
+  EXPECT_EQ(field_map.at("cnt"), 1);
+
+  // 8. The returned endpoint should come from the Demux, not directly from Pipeline
+  EXPECT_EQ(ep.operator_id, demux_id) << "returned endpoint should be from Demultiplexer";
+  EXPECT_EQ(ep.port, "o1");
 }
 
 }  // namespace

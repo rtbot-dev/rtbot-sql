@@ -819,5 +819,443 @@ TEST_F(E2eRuntimeTest, MultiStreamCrossJoinTimeSeries) {
       << "Multi-stream cross-join must produce at least one output row";
 }
 
+// ===========================================================================
+// Segment GROUP BY end-to-end tests
+//
+// These tests verify the FULL pipeline: SQL → compiler → operator graph JSON
+// → rtbot runtime → actual data processing with segment-scoped computation.
+//
+// Pipeline with control port behavior:
+//   - Control port receives the segment key (numeric value from the segment
+//     expression, e.g. 1.0 for true, 0.0 for false).
+//   - While control value stays the same: accumulate in internal operators.
+//   - When control value changes: emit buffered accumulated result, reset
+//     internals, start new segment with the new key.
+//   - First message always starts a segment (no emission).
+//   - Pipeline only emits at KEY TRANSITIONS.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// T14: Segment-only GROUP BY — burst data pattern
+//
+// SQL: SELECT SUM(amplitude) AS total, COUNT(*) AS cnt
+//      FROM vibration
+//      GROUP BY ABS(amplitude) > 0
+//
+// Data: active → silence → active
+// Expected emissions only at segment boundary transitions.
+// ---------------------------------------------------------------------------
+
+TEST_F(E2eRuntimeTest, SegmentGroupByBurstData) {
+  // Register vibration stream
+  StreamSchema vibration{
+      "vibration", {{"device_id", 0}, {"amplitude", 1}, {"frequency", 2}}};
+  catalog.streams["vibration"] = vibration;
+
+  auto r = compile(
+      "CREATE MATERIALIZED VIEW burst_stats AS "
+      "SELECT SUM(amplitude) AS total, COUNT(*) AS cnt "
+      "FROM vibration "
+      "GROUP BY ABS(amplitude) > 0");
+
+  EXPECT_EQ(r.view_type, ViewType::SCALAR)
+      << "Segment-only GROUP BY should produce SCALAR view";
+  EXPECT_EQ(r.key_index, -1);
+
+  int total_idx = r.field_map.at("total");
+  int cnt_idx = r.field_map.at("cnt");
+
+  rtbot::Program program(r.program_json);
+
+  // Collect all outputs as (timestamp, values) pairs for flexible validation
+  struct OutputRow {
+    rtbot::timestamp_t time;
+    std::vector<double> values;
+  };
+  std::vector<OutputRow> all_outputs;
+
+  // Helper to collect outputs from a batch
+  auto collect = [&](const rtbot::ProgramMsgBatch& batch) {
+    for (const auto& [op_id, op_batch] : batch) {
+      for (const auto& [port, msgs] : op_batch) {
+        for (const auto& msg : msgs) {
+          auto* vec_msg =
+              dynamic_cast<rtbot::Message<rtbot::VectorNumberData>*>(msg.get());
+          if (vec_msg) {
+            all_outputs.push_back({vec_msg->time, vec_msg->data.values});
+          }
+        }
+      }
+    }
+  };
+
+  // Feed burst data: active → silence → active
+  //
+  // vibration columns: [device_id=0, amplitude=1, frequency=2]
+  //
+  // t=1: amplitude=5.0  → ABS(5)>0  = 1.0 (active) → first msg, key=1.0
+  // t=2: amplitude=3.0  → ABS(3)>0  = 1.0           → same key, accumulate
+  // t=3: amplitude=2.0  → ABS(2)>0  = 1.0           → same key, accumulate
+  // t=4: amplitude=0.0  → ABS(0)>0  = 0.0 (silence) → KEY CHANGE! emit, reset
+  // t=5: amplitude=0.0  → ABS(0)>0  = 0.0           → same key, accumulate
+  // t=6: amplitude=4.0  → ABS(4)>0  = 1.0 (active)  → KEY CHANGE! emit, reset
+  // t=7: amplitude=6.0  → ABS(6)>0  = 1.0           → same key, accumulate
+  // t=8: amplitude=0.0  → ABS(0)>0  = 0.0 (silence) → KEY CHANGE! emit, reset
+
+  struct InputRow {
+    rtbot::timestamp_t t;
+    double device_id, amplitude, frequency;
+  };
+  std::vector<InputRow> inputs = {
+      {1, 1, 5.0, 100},  // active segment starts
+      {2, 1, 3.0, 100},  // accumulating
+      {3, 1, 2.0, 100},  // accumulating
+      {4, 1, 0.0, 100},  // silence → boundary!
+      {5, 1, 0.0, 100},  // silence continues
+      {6, 1, 4.0, 100},  // active again → boundary!
+      {7, 1, 6.0, 100},  // accumulating
+      {8, 1, 0.0, 100},  // silence → boundary!
+  };
+
+  for (const auto& row : inputs) {
+    auto batch =
+        send(program, row.t, {row.device_id, row.amplitude, row.frequency});
+    collect(batch);
+  }
+
+  // Pipeline emits at key transitions only.
+  // Expected 3 emissions:
+  //   1. At t=4: SUM(5+3+2)=10, COUNT=3  (active segment t=1,2,3)
+  //   2. At t=6: SUM(0+0)=0, COUNT=2     (silence segment t=4,5)
+  //   3. At t=8: SUM(4+6)=10, COUNT=2    (active segment t=6,7)
+  ASSERT_EQ(all_outputs.size(), 3u)
+      << "Pipeline should emit exactly 3 times at segment boundaries";
+
+  // Emission 1: active segment (t=1,2,3) emitted at boundary t=4
+  {
+    SCOPED_TRACE("Emission 1: active segment t=1..3");
+    const auto& out = all_outputs[0];
+    EXPECT_EQ(out.time, 4u);
+    EXPECT_DOUBLE_EQ(out.values[total_idx], 10.0);  // SUM(5+3+2)
+    EXPECT_DOUBLE_EQ(out.values[cnt_idx], 3.0);
+  }
+
+  // Emission 2: silence segment (t=4,5) emitted at boundary t=6
+  {
+    SCOPED_TRACE("Emission 2: silence segment t=4..5");
+    const auto& out = all_outputs[1];
+    EXPECT_EQ(out.time, 6u);
+    EXPECT_DOUBLE_EQ(out.values[total_idx], 0.0);  // SUM(0+0)
+    EXPECT_DOUBLE_EQ(out.values[cnt_idx], 2.0);
+  }
+
+  // Emission 3: active segment (t=6,7) emitted at boundary t=8
+  {
+    SCOPED_TRACE("Emission 3: active segment t=6..7");
+    const auto& out = all_outputs[2];
+    EXPECT_EQ(out.time, 8u);
+    EXPECT_DOUBLE_EQ(out.values[total_idx], 10.0);  // SUM(4+6)
+    EXPECT_DOUBLE_EQ(out.values[cnt_idx], 2.0);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// T15: Segment-only GROUP BY — single transition
+//
+// Minimal test: just two messages with one key change.
+// Verifies that the boundary emission contains the first segment's data.
+// ---------------------------------------------------------------------------
+
+TEST_F(E2eRuntimeTest, SegmentGroupBySingleTransition) {
+  StreamSchema vibration{
+      "vibration", {{"device_id", 0}, {"amplitude", 1}, {"frequency", 2}}};
+  catalog.streams["vibration"] = vibration;
+
+  auto r = compile(
+      "CREATE MATERIALIZED VIEW single_transition AS "
+      "SELECT SUM(amplitude) AS total, COUNT(*) AS cnt "
+      "FROM vibration "
+      "GROUP BY ABS(amplitude) > 0");
+
+  int total_idx = r.field_map.at("total");
+  int cnt_idx = r.field_map.at("cnt");
+
+  rtbot::Program program(r.program_json);
+
+  // t=1: amplitude=7 → active (key=1.0), first msg, no output
+  auto b1 = send(program, 1, {1, 7.0, 100});
+  EXPECT_EQ(count_outputs(b1), 0u) << "First message should not emit";
+
+  // t=2: amplitude=0 → silence (key=0.0), KEY CHANGE → emit active segment
+  auto b2 = send(program, 2, {1, 0.0, 100});
+  ASSERT_GT(count_outputs(b2), 0u)
+      << "Key transition should produce output";
+  auto out2 = extract_output(b2);
+  ASSERT_FALSE(out2.empty());
+  EXPECT_DOUBLE_EQ(out2[total_idx], 7.0);  // SUM(7)
+  EXPECT_DOUBLE_EQ(out2[cnt_idx], 1.0);    // COUNT=1
+}
+
+// ---------------------------------------------------------------------------
+// T16: Mixed GROUP BY — persistent key + segment expression
+//
+// SQL: SELECT device_id, SUM(amplitude) AS total, COUNT(*) AS cnt
+//      FROM vibration
+//      GROUP BY device_id, ABS(amplitude) > 0
+//
+// Verifies per-device isolation + correct segment accumulation.
+// Two devices with interleaved data and different burst patterns.
+// ---------------------------------------------------------------------------
+
+TEST_F(E2eRuntimeTest, MixedGroupByBurstData) {
+  StreamSchema vibration{
+      "vibration", {{"device_id", 0}, {"amplitude", 1}, {"frequency", 2}}};
+  catalog.streams["vibration"] = vibration;
+
+  auto r = compile(
+      "CREATE MATERIALIZED VIEW device_burst_stats AS "
+      "SELECT device_id, SUM(amplitude) AS total, COUNT(*) AS cnt "
+      "FROM vibration "
+      "GROUP BY device_id, ABS(amplitude) > 0");
+
+  EXPECT_EQ(r.view_type, ViewType::KEYED)
+      << "Mixed GROUP BY should produce KEYED view";
+
+  // Field map: KeyedPipeline prepends hash key at index 0
+  // device_id at index 1, then aggregates
+  int device_id_idx = r.field_map.at("device_id");
+  int total_idx = r.field_map.at("total");
+  int cnt_idx = r.field_map.at("cnt");
+
+  rtbot::Program program(r.program_json);
+
+  // Collect all outputs
+  struct OutputRow {
+    rtbot::timestamp_t time;
+    std::vector<double> values;
+  };
+  std::vector<OutputRow> all_outputs;
+
+  auto collect = [&](const rtbot::ProgramMsgBatch& batch) {
+    for (const auto& [op_id, op_batch] : batch) {
+      for (const auto& [port, msgs] : op_batch) {
+        for (const auto& msg : msgs) {
+          auto* vec_msg =
+              dynamic_cast<rtbot::Message<rtbot::VectorNumberData>*>(msg.get());
+          if (vec_msg) {
+            all_outputs.push_back({vec_msg->time, vec_msg->data.values});
+          }
+        }
+      }
+    }
+  };
+
+  // Feed interleaved data for two devices:
+  //
+  // Device 1: active(5, 3) → silence(0) → active(4)
+  //   t=1: [1, 5.0, 100] active (key changes)
+  //   t=3: [1, 3.0, 100] active
+  //   t=5: [1, 0.0, 100] silence → emit dev1 active segment: SUM=8, CNT=2
+  //   t=7: [1, 4.0, 100] active → emit dev1 silence segment: SUM=0, CNT=1
+  //
+  // Device 2: active(10) → silence(0, 0) → active(6)
+  //   t=2: [2, 10.0, 200] active
+  //   t=4: [2, 0.0, 200]  silence → emit dev2 active segment: SUM=10, CNT=1
+  //   t=6: [2, 0.0, 200]  silence
+  //   t=8: [2, 6.0, 200]  active → emit dev2 silence segment: SUM=0, CNT=2
+
+  collect(send(program, 1, {1, 5.0, 100}));   // dev1: active start
+  collect(send(program, 2, {2, 10.0, 200}));  // dev2: active start
+  collect(send(program, 3, {1, 3.0, 100}));   // dev1: accumulate
+  collect(send(program, 4, {2, 0.0, 200}));   // dev2: silence → emit
+  collect(send(program, 5, {1, 0.0, 100}));   // dev1: silence → emit
+  collect(send(program, 6, {2, 0.0, 200}));   // dev2: silence continue
+  collect(send(program, 7, {1, 4.0, 100}));   // dev1: active → emit
+  collect(send(program, 8, {2, 6.0, 200}));   // dev2: active → emit
+
+  // Expected 4 emissions total (2 per device)
+  ASSERT_EQ(all_outputs.size(), 4u)
+      << "Should have 4 segment boundary emissions (2 per device)";
+
+  // Sort by time for stable verification
+  std::sort(all_outputs.begin(), all_outputs.end(),
+            [](const auto& a, const auto& b) { return a.time < b.time; });
+
+  // t=4: device 2 active segment (SUM=10, CNT=1)
+  {
+    SCOPED_TRACE("t=4: device 2 active segment");
+    const auto& out = all_outputs[0];
+    EXPECT_EQ(out.time, 4u);
+    EXPECT_DOUBLE_EQ(out.values[device_id_idx], 2);
+    EXPECT_DOUBLE_EQ(out.values[total_idx], 10.0);
+    EXPECT_DOUBLE_EQ(out.values[cnt_idx], 1.0);
+  }
+
+  // t=5: device 1 active segment (SUM=8, CNT=2)
+  {
+    SCOPED_TRACE("t=5: device 1 active segment");
+    const auto& out = all_outputs[1];
+    EXPECT_EQ(out.time, 5u);
+    EXPECT_DOUBLE_EQ(out.values[device_id_idx], 1);
+    EXPECT_DOUBLE_EQ(out.values[total_idx], 8.0);
+    EXPECT_DOUBLE_EQ(out.values[cnt_idx], 2.0);
+  }
+
+  // t=7: device 1 silence segment (SUM=0, CNT=1)
+  {
+    SCOPED_TRACE("t=7: device 1 silence segment");
+    const auto& out = all_outputs[2];
+    EXPECT_EQ(out.time, 7u);
+    EXPECT_DOUBLE_EQ(out.values[device_id_idx], 1);
+    EXPECT_DOUBLE_EQ(out.values[total_idx], 0.0);
+    EXPECT_DOUBLE_EQ(out.values[cnt_idx], 1.0);
+  }
+
+  // t=8: device 2 silence segment (SUM=0, CNT=2)
+  {
+    SCOPED_TRACE("t=8: device 2 silence segment");
+    const auto& out = all_outputs[3];
+    EXPECT_EQ(out.time, 8u);
+    EXPECT_DOUBLE_EQ(out.values[device_id_idx], 2);
+    EXPECT_DOUBLE_EQ(out.values[total_idx], 0.0);
+    EXPECT_DOUBLE_EQ(out.values[cnt_idx], 2.0);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// T17: Segment GROUP BY with HAVING
+//
+// SQL: SELECT SUM(amplitude) AS total, COUNT(*) AS cnt
+//      FROM vibration
+//      GROUP BY ABS(amplitude) > 0
+//      HAVING SUM(amplitude) > 5
+//
+// Only segment boundary emissions where total > 5 pass through.
+// ---------------------------------------------------------------------------
+
+TEST_F(E2eRuntimeTest, SegmentGroupByWithHaving) {
+  StreamSchema vibration{
+      "vibration", {{"device_id", 0}, {"amplitude", 1}, {"frequency", 2}}};
+  catalog.streams["vibration"] = vibration;
+
+  auto r = compile(
+      "CREATE MATERIALIZED VIEW filtered_bursts AS "
+      "SELECT SUM(amplitude) AS total, COUNT(*) AS cnt "
+      "FROM vibration "
+      "GROUP BY ABS(amplitude) > 0 "
+      "HAVING SUM(amplitude) > 5");
+
+  EXPECT_EQ(r.view_type, ViewType::SCALAR);
+  EXPECT_EQ(r.key_index, -1);
+
+  int total_idx = r.field_map.at("total");
+  int cnt_idx = r.field_map.at("cnt");
+
+  rtbot::Program program(r.program_json);
+
+  // Collect all outputs
+  struct OutputRow {
+    rtbot::timestamp_t time;
+    std::vector<double> values;
+  };
+  std::vector<OutputRow> all_outputs;
+
+  auto collect = [&](const rtbot::ProgramMsgBatch& batch) {
+    for (const auto& [op_id, op_batch] : batch) {
+      for (const auto& [port, msgs] : op_batch) {
+        for (const auto& msg : msgs) {
+          auto* vec_msg =
+              dynamic_cast<rtbot::Message<rtbot::VectorNumberData>*>(msg.get());
+          if (vec_msg) {
+            all_outputs.push_back({vec_msg->time, vec_msg->data.values});
+          }
+        }
+      }
+    }
+  };
+
+  // Burst pattern: two active segments with different totals
+  //
+  // Active segment 1 (small): amplitude=[2, 1] → SUM=3 (< 5, filtered out)
+  //   t=1: [1, 2.0, 100] active
+  //   t=2: [1, 1.0, 100] active
+  //   t=3: [1, 0.0, 100] silence → emit SUM=3, CNT=2 → HAVING filters it
+  //
+  // Silence segment: amplitude=[0] → SUM=0 (< 5, filtered out)
+  //   t=4: [1, 0.0, 100] silence
+  //
+  // Active segment 2 (large): amplitude=[4, 6] → SUM=10 (> 5, passes HAVING)
+  //   t=5: [1, 4.0, 100] active → emit silence SUM=0, CNT=2 → filtered
+  //   t=6: [1, 6.0, 100] active
+  //   t=7: [1, 0.0, 100] silence → emit SUM=10, CNT=2 → PASSES HAVING
+
+  collect(send(program, 1, {1, 2.0, 100}));
+  collect(send(program, 2, {1, 1.0, 100}));
+  collect(send(program, 3, {1, 0.0, 100}));
+  collect(send(program, 4, {1, 0.0, 100}));
+  collect(send(program, 5, {1, 4.0, 100}));
+  collect(send(program, 6, {1, 6.0, 100}));
+  collect(send(program, 7, {1, 0.0, 100}));
+
+  // Only 1 emission should pass HAVING (SUM=10 > 5)
+  // The other emissions (SUM=3, SUM=0) are filtered out
+  ASSERT_EQ(all_outputs.size(), 1u)
+      << "Only segments with SUM > 5 should pass HAVING";
+
+  {
+    SCOPED_TRACE("HAVING-filtered emission: active segment 2");
+    const auto& out = all_outputs[0];
+    EXPECT_EQ(out.time, 7u);
+    EXPECT_DOUBLE_EQ(out.values[total_idx], 10.0);  // SUM(4+6)
+    EXPECT_DOUBLE_EQ(out.values[cnt_idx], 2.0);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// T18: Segment GROUP BY — long sustained segment
+//
+// Verifies accumulation over many messages within a single segment,
+// then correct emission at the boundary.
+// ---------------------------------------------------------------------------
+
+TEST_F(E2eRuntimeTest, SegmentGroupByLongSegment) {
+  StreamSchema vibration{
+      "vibration", {{"device_id", 0}, {"amplitude", 1}, {"frequency", 2}}};
+  catalog.streams["vibration"] = vibration;
+
+  auto r = compile(
+      "CREATE MATERIALIZED VIEW long_burst AS "
+      "SELECT SUM(amplitude) AS total, COUNT(*) AS cnt "
+      "FROM vibration "
+      "GROUP BY ABS(amplitude) > 0");
+
+  int total_idx = r.field_map.at("total");
+  int cnt_idx = r.field_map.at("cnt");
+
+  rtbot::Program program(r.program_json);
+
+  // Feed 100 active messages (amplitude=1.0), then one silence to trigger emit
+  double expected_sum = 0.0;
+  int num_active = 100;
+  for (int i = 1; i <= num_active; ++i) {
+    auto batch = send(program, static_cast<rtbot::timestamp_t>(i),
+                      {1, 1.0, 100});
+    // No output expected during active accumulation (no key change)
+    EXPECT_EQ(count_outputs(batch), 0u)
+        << "No output expected during accumulation at t=" << i;
+    expected_sum += 1.0;
+  }
+
+  // Trigger boundary: amplitude=0 → key change from 1.0 to 0.0
+  auto boundary_batch = send(program, num_active + 1, {1, 0.0, 100});
+  ASSERT_GT(count_outputs(boundary_batch), 0u)
+      << "Boundary transition should emit accumulated result";
+
+  auto out = extract_output(boundary_batch);
+  ASSERT_FALSE(out.empty());
+  EXPECT_DOUBLE_EQ(out[total_idx], expected_sum);     // SUM of 100 × 1.0
+  EXPECT_DOUBLE_EQ(out[cnt_idx], (double)num_active);  // COUNT = 100
+}
+
 }  // namespace
 }  // namespace rtbot_sql::api

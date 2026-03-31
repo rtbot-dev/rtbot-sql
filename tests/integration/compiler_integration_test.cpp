@@ -733,5 +733,259 @@ TEST_F(CompilerIntegrationTest, HavingDeviationFromMeanGreaterThanConstant) {
   EXPECT_EQ(r.entity_name, "thermal_alerts");
 }
 
+// --- Test: Alias expansion in GROUP BY ---
+
+// GROUP BY should resolve SELECT aliases to their underlying expressions.
+// Here "dev" is an alias for "instrument_id" (a plain ColumnRef), so the
+// GROUP BY compiler should see the resolved ColumnRef and work correctly.
+TEST_F(CompilerIntegrationTest, AliasInGroupBy) {
+  auto r = compile_sql(
+      "SELECT instrument_id AS dev, SUM(quantity) AS total "
+      "FROM trades GROUP BY dev",
+      catalog);
+
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  EXPECT_EQ(r.select_tier, SelectTier::TIER3_EPHEMERAL);
+  EXPECT_EQ(r.view_type, ViewType::KEYED);
+
+  // The GROUP BY key column appears in field_map under its original column
+  // name (instrument_id), and the aggregate uses its SELECT alias (total).
+  // This matches the behavior of non-aliased GROUP BY queries.
+  EXPECT_EQ(r.field_map.at("instrument_id"), 0);
+  EXPECT_EQ(r.field_map.at("total"), 1);
+
+  // Verify KeyedPipeline exists in the program
+  auto program = json::parse(r.program_json);
+  bool has_keyed = false;
+  for (const auto& op : program["operators"]) {
+    if (op["type"] == "KeyedPipeline") {
+      has_keyed = true;
+      EXPECT_EQ(op["key_index"], 0);
+    }
+  }
+  EXPECT_TRUE(has_keyed) << "should have KeyedPipeline for GROUP BY";
+}
+
+// --- Segment-only GROUP BY produces SCALAR view type ---
+
+TEST_F(CompilerIntegrationTest, SegmentOnlyGroupByProducesScalarView) {
+  // Register a vibration stream for segment GROUP BY test
+  StreamSchema vibration{
+      "vibration", {{"device_id", 0}, {"amplitude", 1}, {"frequency", 2}}};
+  catalog.streams["vibration"] = vibration;
+
+  auto r = compile_sql(
+      "CREATE MATERIALIZED VIEW burst_stats AS "
+      "SELECT SUM(amplitude) AS total, COUNT(*) AS cnt "
+      "FROM vibration "
+      "GROUP BY ABS(amplitude) > 0",
+      catalog);
+
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  EXPECT_EQ(r.view_type, ViewType::SCALAR)
+      << "Segment-only GROUP BY should produce SCALAR view";
+  EXPECT_EQ(r.key_index, -1);
+
+  // Verify Pipeline (not KeyedPipeline) in the program
+  auto program = json::parse(r.program_json);
+  bool has_pipeline = false;
+  bool has_keyed_pipeline = false;
+  for (const auto& op : program["operators"]) {
+    if (op["type"] == "Pipeline") has_pipeline = true;
+    if (op["type"] == "KeyedPipeline") has_keyed_pipeline = true;
+  }
+  EXPECT_TRUE(has_pipeline) << "should have Pipeline for segment GROUP BY";
+  EXPECT_FALSE(has_keyed_pipeline)
+      << "segment-only should NOT have KeyedPipeline";
+}
+
+// --- Mixed GROUP BY produces KEYED view type ---
+
+TEST_F(CompilerIntegrationTest, MixedGroupByProducesKeyedView) {
+  StreamSchema vibration{
+      "vibration", {{"device_id", 0}, {"amplitude", 1}, {"frequency", 2}}};
+  catalog.streams["vibration"] = vibration;
+
+  auto r = compile_sql(
+      "CREATE MATERIALIZED VIEW burst_stats AS "
+      "SELECT device_id, SUM(amplitude) AS total, COUNT(*) AS cnt "
+      "FROM vibration "
+      "GROUP BY device_id, ABS(amplitude) > 0",
+      catalog);
+
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  EXPECT_EQ(r.view_type, ViewType::KEYED)
+      << "Mixed GROUP BY should produce KEYED view";
+  EXPECT_EQ(r.key_index, 0);
+
+  // Verify KeyedPipeline with nested Pipeline in the program
+  auto program = json::parse(r.program_json);
+  bool has_keyed_pipeline = false;
+  bool has_nested_pipeline = false;
+  for (const auto& op : program["operators"]) {
+    if (op["type"] == "KeyedPipeline") {
+      has_keyed_pipeline = true;
+      // Check that prototype contains a Pipeline
+      if (op.contains("prototype") && op["prototype"].contains("operators")) {
+        for (const auto& proto_op : op["prototype"]["operators"]) {
+          if (proto_op["type"] == "Pipeline") has_nested_pipeline = true;
+        }
+      }
+    }
+  }
+  EXPECT_TRUE(has_keyed_pipeline) << "should have KeyedPipeline";
+  EXPECT_TRUE(has_nested_pipeline)
+      << "KeyedPipeline prototype should contain Pipeline";
+}
+
+// --- Segment-only HAVING → post-Pipeline filter ---
+
+TEST_F(CompilerIntegrationTest, SegmentHavingPostFilter) {
+  StreamSchema vibration{
+      "vibration", {{"device_id", 0}, {"amplitude", 1}, {"frequency", 2}}};
+  catalog.streams["vibration"] = vibration;
+
+  auto r = compile_sql(
+      "CREATE MATERIALIZED VIEW filtered_bursts AS "
+      "SELECT SUM(amplitude) AS total, COUNT(*) AS cnt "
+      "FROM vibration "
+      "GROUP BY ABS(amplitude) > 0 "
+      "HAVING SUM(amplitude) > 50",
+      catalog);
+
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  EXPECT_EQ(r.view_type, ViewType::SCALAR)
+      << "Segment-only GROUP BY with HAVING should produce SCALAR view";
+  EXPECT_EQ(r.key_index, -1);
+
+  // Verify Pipeline + Demultiplexer in the program (outer graph)
+  auto program = json::parse(r.program_json);
+  bool has_pipeline = false;
+  bool has_demux = false;
+  bool has_keyed_pipeline = false;
+  for (const auto& op : program["operators"]) {
+    if (op["type"] == "Pipeline") has_pipeline = true;
+    if (op["type"] == "Demultiplexer") has_demux = true;
+    if (op["type"] == "KeyedPipeline") has_keyed_pipeline = true;
+  }
+  EXPECT_TRUE(has_pipeline) << "should have Pipeline for segment GROUP BY";
+  EXPECT_TRUE(has_demux) << "should have Demultiplexer for HAVING post-filter";
+  EXPECT_FALSE(has_keyed_pipeline)
+      << "segment-only should NOT have KeyedPipeline";
+
+  // field_map
+  EXPECT_EQ(r.field_map.at("total"), 0);
+  EXPECT_EQ(r.field_map.at("cnt"), 1);
+}
+
+// --- Composite persistent keys + segment expression ---
+
+TEST_F(CompilerIntegrationTest, CompositeKeysWithSegmentExpression) {
+  StreamSchema vibration{
+      "vibration",
+      {{"device_id", 0}, {"channel_id", 1}, {"amplitude", 2}}};
+  catalog.streams["vibration"] = vibration;
+
+  auto r = compile_sql(
+      "CREATE MATERIALIZED VIEW channel_stats AS "
+      "SELECT device_id, channel_id, SUM(amplitude) AS total, COUNT(*) AS cnt "
+      "FROM vibration "
+      "GROUP BY device_id, channel_id, ABS(amplitude) > 0",
+      catalog);
+
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  EXPECT_EQ(r.view_type, ViewType::KEYED)
+      << "Composite keys + segment should produce KEYED view";
+
+  // Verify KeyedPipeline with nested Pipeline in the program
+  auto program = json::parse(r.program_json);
+  bool has_keyed_pipeline = false;
+  bool has_nested_pipeline = false;
+  bool has_linear = false;
+  for (const auto& op : program["operators"]) {
+    if (op["type"] == "Linear") has_linear = true;
+    if (op["type"] == "KeyedPipeline") {
+      has_keyed_pipeline = true;
+      // key_index should be num_input_cols (= 3, the hash column)
+      EXPECT_EQ(op["key_index"], 3);
+      // Check that prototype contains a Pipeline
+      if (op.contains("prototype") && op["prototype"].contains("operators")) {
+        for (const auto& proto_op : op["prototype"]["operators"]) {
+          if (proto_op["type"] == "Pipeline") has_nested_pipeline = true;
+        }
+      }
+    }
+  }
+  EXPECT_TRUE(has_linear) << "should have Linear for hash computation";
+  EXPECT_TRUE(has_keyed_pipeline) << "should have KeyedPipeline";
+  EXPECT_TRUE(has_nested_pipeline)
+      << "KeyedPipeline prototype should contain Pipeline";
+
+  // Field map: hash at 0 (prepended by KeyedPipeline), then key cols, then aggs
+  EXPECT_EQ(r.field_map.at("device_id"), 1);
+  EXPECT_EQ(r.field_map.at("channel_id"), 2);
+  EXPECT_EQ(r.field_map.at("total"), 3);
+  EXPECT_EQ(r.field_map.at("cnt"), 4);
+}
+
+// --- Preset-style: RMS trend pattern ---
+
+TEST_F(CompilerIntegrationTest, PresetRmsTrendPattern) {
+  StreamSchema vibration{
+      "vibration",
+      {{"device_id", 0}, {"channel_id", 1}, {"amplitude", 2}}};
+  catalog.streams["vibration"] = vibration;
+
+  // Pattern from rotating machinery presets:
+  // RMS trend by device+channel, reset on zero-crossing
+  auto r = compile_sql(
+      "CREATE MATERIALIZED VIEW rms_trend AS "
+      "SELECT device_id, channel_id, "
+      "       MOVING_AVERAGE(amplitude, 50) AS rms_ma, "
+      "       COUNT(*) AS sample_count "
+      "FROM vibration "
+      "GROUP BY device_id, channel_id, ABS(amplitude) > 0",
+      catalog);
+
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  EXPECT_EQ(r.statement_type, StatementType::CREATE_MATERIALIZED_VIEW);
+  EXPECT_EQ(r.entity_name, "rms_trend");
+  EXPECT_EQ(r.view_type, ViewType::KEYED);
+
+  // Verify structure: KeyedPipeline with nested Pipeline
+  auto program = json::parse(r.program_json);
+  bool has_keyed = false;
+  bool has_inner_pipeline = false;
+  bool has_inner_ma = false;
+  for (const auto& op : program["operators"]) {
+    if (op["type"] == "KeyedPipeline") {
+      has_keyed = true;
+      if (op.contains("prototype") && op["prototype"].contains("operators")) {
+        for (const auto& proto_op : op["prototype"]["operators"]) {
+          if (proto_op["type"] == "Pipeline") {
+            has_inner_pipeline = true;
+            // Pipeline now uses native format (operators at top level, not
+            // nested under "prototype")
+            if (proto_op.contains("operators")) {
+              for (const auto& inner_op : proto_op["operators"]) {
+                if (inner_op["type"] == "MovingAverage") has_inner_ma = true;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  EXPECT_TRUE(has_keyed) << "should have KeyedPipeline";
+  EXPECT_TRUE(has_inner_pipeline) << "should have nested Pipeline";
+  EXPECT_TRUE(has_inner_ma) << "inner prototype should have MovingAverage";
+
+  // Field map
+  EXPECT_EQ(r.field_map.at("device_id"), 1);
+  EXPECT_EQ(r.field_map.at("channel_id"), 2);
+  EXPECT_EQ(r.field_map.at("rms_ma"), 3);
+  EXPECT_EQ(r.field_map.at("sample_count"), 4);
+}
+
 }  // namespace
 }  // namespace rtbot_sql::api
