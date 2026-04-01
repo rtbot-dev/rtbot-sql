@@ -383,6 +383,7 @@ static PortSig output_sig(const OperatorDef& op) {
       t == "Floor" || t == "Ceil" || t == "Round" ||
       t == "Identity" || t == "TimeShift" || t == "Variable" ||
       t == "Replace" || t == "MovingKeyCount" ||
+      t == "BooleanToNumber" ||
       t == "MinTracker" || t == "MaxTracker" || t == "WindowMinMax")
     return {DataType::NUMBER};
 
@@ -435,11 +436,14 @@ static PortSig input_sig(const OperatorDef& op, const std::string& port) {
 
   // Pipeline has non-standard port types:
   //   i1 (data port): VectorNumber
-  //   c1 (control port): Boolean (comparison/predicate outputs)
+  //   c1 (control port): Number (segment key)
   if (t == "Pipeline") {
     if (port == "i1") return {DataType::VECTOR_NUMBER};
-    if (port == "c1") return {DataType::BOOLEAN};
+    if (port == "c1") return {DataType::NUMBER};
   }
+
+  // BooleanToNumber accepts Boolean on its data port
+  if (t == "BooleanToNumber") return {DataType::BOOLEAN};
 
   // Control ports always expect Boolean
   if (!port.empty() && port[0] == 'c')

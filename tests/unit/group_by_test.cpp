@@ -400,8 +400,8 @@ TEST(PipelineGraphBuilderTest, PipelineMissingPrototypeFails) {
       << "Should report missing prototype for Pipeline";
 }
 
-// Test that Pipeline control port rejects NUMBER (requires BOOLEAN)
-TEST(PipelineGraphBuilderTest, PipelineControlPortRejectsNumber) {
+// Test that Pipeline control port accepts NUMBER (segment key)
+TEST(PipelineGraphBuilderTest, PipelineControlPortAcceptsNumber) {
   GraphBuilder builder;
   builder.add_operator("input_0", "Input");
   builder.add_operator("pipeline_0", "Pipeline",
@@ -424,24 +424,24 @@ TEST(PipelineGraphBuilderTest, PipelineControlPortRejectsNumber) {
   // Input(VECTOR_NUMBER) -> Pipeline i1 (data)
   builder.connect({"input_0", "o1"}, {"pipeline_0", "i1"});
   builder.connect({"input_0", "o1"}, {"extract_0", "i1"});
-  // VectorExtract outputs NUMBER, connect to Pipeline control port (now BOOLEAN)
+  // VectorExtract outputs NUMBER — Pipeline c1 expects NUMBER (segment key)
   builder.connect({"extract_0", "o1"}, {"pipeline_0", "c1"});
   builder.connect({"pipeline_0", "o1"}, {"output_0", "i1"});
 
   auto errors = builder.validate();
-  // Should HAVE a type mismatch: NUMBER → BOOLEAN c1
-  bool has_mismatch = false;
+  // Should NOT have a type mismatch — Pipeline c1 accepts NUMBER
   for (const auto& e : errors) {
-    if (e.find("type mismatch") != std::string::npos) has_mismatch = true;
+    EXPECT_TRUE(e.find("type mismatch") == std::string::npos)
+        << "Unexpected type mismatch: " << e;
   }
-  EXPECT_TRUE(has_mismatch)
-      << "Expected type mismatch: NUMBER cannot connect to BOOLEAN c1";
 }
 
 // ---------------------------------------------------------------------------
-// Pipeline control port: CompareGT (BOOLEAN) → Pipeline.c1 should validate
+// Pipeline control port: CompareGT (BOOLEAN) -> Pipeline.c1 should be
+// rejected because Pipeline c1 expects NUMBER (segment key), not BOOLEAN.
+// The compiler inserts a BooleanToNumber conversion for this case.
 // ---------------------------------------------------------------------------
-TEST(PipelineGraphBuilderTest, PipelineControlPortAcceptsBooleanFromCompare) {
+TEST(PipelineGraphBuilderTest, PipelineControlPortRejectsBooleanFromCompare) {
   GraphBuilder builder;
   builder.add_operator("input_0", "Input");
   builder.add_operator("extract_0", "VectorExtract", {{"index", 0.0}});
@@ -460,7 +460,7 @@ TEST(PipelineGraphBuilderTest, PipelineControlPortAcceptsBooleanFromCompare) {
   proto.connections.push_back({"proto_in", "o1", "proto_out", "i1"});
   builder.add_prototype(proto);
 
-  // Input → VectorExtract → CompareGT(BOOLEAN) → Pipeline.c1
+  // Input -> VectorExtract -> CompareGT(BOOLEAN) -> Pipeline.c1
   builder.connect({"input_0", "o1"}, {"extract_0", "i1"});
   builder.connect({"extract_0", "o1"}, {"cmp_0", "i1"});
   builder.connect({"cmp_0", "o1"}, {"pipeline_0", "c1"});
@@ -468,11 +468,75 @@ TEST(PipelineGraphBuilderTest, PipelineControlPortAcceptsBooleanFromCompare) {
   builder.connect({"pipeline_0", "o1"}, {"output_0", "i1"});
 
   auto errors = builder.validate();
-  // Should NOT have a type mismatch — Pipeline c1 must accept BOOLEAN
+  // Should HAVE a type mismatch: BOOLEAN -> NUMBER c1
+  bool has_mismatch = false;
+  for (const auto& e : errors) {
+    if (e.find("type mismatch") != std::string::npos) has_mismatch = true;
+  }
+  EXPECT_TRUE(has_mismatch)
+      << "Expected type mismatch: BOOLEAN cannot connect to NUMBER c1";
+}
+
+// ---------------------------------------------------------------------------
+// BooleanToNumber Graph Builder Type Validation
+// ---------------------------------------------------------------------------
+
+// BooleanToNumber: BOOLEAN input -> NUMBER output, validates correctly
+TEST(BooleanToNumberGraphBuilderTest, BooleanToNumberTypeValidation) {
+  GraphBuilder builder;
+  builder.add_operator("input_0", "Input");
+  builder.add_operator("extract_0", "VectorExtract", {{"index", 0.0}});
+  builder.add_operator("cmp_0", "CompareGT", {{"value", 0.0}});
+  builder.add_operator("b2n_0", "BooleanToNumber");
+  builder.add_operator("pipeline_0", "Pipeline",
+                       /*params=*/{},
+                       /*string_params=*/{{"prototype", "proto_0"}});
+  builder.add_operator("output_0", "Output");
+
+  PrototypeDef proto;
+  proto.id = "proto_0";
+  proto.entry_id = "proto_in";
+  proto.output_id = "proto_out";
+  proto.operators.push_back({"proto_in", "Input", {}, {}, {}, {}});
+  proto.operators.push_back({"proto_out", "Output", {}, {}, {}, {}});
+  proto.connections.push_back({"proto_in", "o1", "proto_out", "i1"});
+  builder.add_prototype(proto);
+
+  // Input -> VectorExtract -> CompareGT(BOOLEAN) -> BooleanToNumber(NUMBER) -> Pipeline.c1
+  builder.connect({"input_0", "o1"}, {"extract_0", "i1"});
+  builder.connect({"extract_0", "o1"}, {"cmp_0", "i1"});
+  builder.connect({"cmp_0", "o1"}, {"b2n_0", "i1"});
+  builder.connect({"b2n_0", "o1"}, {"pipeline_0", "c1"});
+  builder.connect({"input_0", "o1"}, {"pipeline_0", "i1"});
+  builder.connect({"pipeline_0", "o1"}, {"output_0", "i1"});
+
+  auto errors = builder.validate();
   for (const auto& e : errors) {
     EXPECT_TRUE(e.find("type mismatch") == std::string::npos)
         << "Unexpected type mismatch: " << e;
   }
+}
+
+// BooleanToNumber rejects NUMBER input (must receive BOOLEAN)
+TEST(BooleanToNumberGraphBuilderTest, BooleanToNumberRejectsNumberInput) {
+  GraphBuilder builder;
+  builder.add_operator("input_0", "Input");
+  builder.add_operator("extract_0", "VectorExtract", {{"index", 0.0}});
+  builder.add_operator("b2n_0", "BooleanToNumber");
+  builder.add_operator("output_0", "Output");
+
+  // VectorExtract outputs NUMBER, BooleanToNumber expects BOOLEAN
+  builder.connect({"input_0", "o1"}, {"extract_0", "i1"});
+  builder.connect({"extract_0", "o1"}, {"b2n_0", "i1"});
+  builder.connect({"input_0", "o1"}, {"output_0", "i1"});
+
+  auto errors = builder.validate();
+  bool has_mismatch = false;
+  for (const auto& e : errors) {
+    if (e.find("type mismatch") != std::string::npos) has_mismatch = true;
+  }
+  EXPECT_TRUE(has_mismatch)
+      << "Expected type mismatch: NUMBER cannot connect to BooleanToNumber (expects BOOLEAN)";
 }
 
 // ---------------------------------------------------------------------------
@@ -637,6 +701,47 @@ TEST_F(SegmentGroupByTest, SegmentOnlyGroupBy) {
   EXPECT_TRUE(has_cmp_gt)
       << "Expected CompareGT in outer graph for segment expression";
 
+  // Outer graph should contain BooleanToNumber (converts predicate for Pipeline c1)
+  bool has_b2n = false;
+  std::string b2n_id;
+  for (const auto& op : builder.operators()) {
+    if (op.type == "BooleanToNumber") {
+      has_b2n = true;
+      b2n_id = op.id;
+    }
+  }
+  EXPECT_TRUE(has_b2n)
+      << "Expected BooleanToNumber in outer graph between predicate and Pipeline c1";
+
+  // Verify connection chain: CompareGT -> BooleanToNumber -> Pipeline.c1
+  if (has_b2n) {
+    bool cmp_to_b2n = false;
+    bool b2n_to_pipeline_c1 = false;
+    for (const auto& conn : builder.connections()) {
+      if (conn.to_id == b2n_id && conn.to_port == "i1") {
+        // The source should be the CompareGT operator
+        for (const auto& op : builder.operators()) {
+          if (op.id == conn.from_id && op.type == "CompareGT") {
+            cmp_to_b2n = true;
+          }
+        }
+      }
+      if (conn.from_id == b2n_id && conn.from_port == "o1" &&
+          conn.to_port == "c1") {
+        // The target should be the Pipeline operator
+        for (const auto& op : builder.operators()) {
+          if (op.id == conn.to_id && op.type == "Pipeline") {
+            b2n_to_pipeline_c1 = true;
+          }
+        }
+      }
+    }
+    EXPECT_TRUE(cmp_to_b2n)
+        << "CompareGT output should connect to BooleanToNumber input";
+    EXPECT_TRUE(b2n_to_pipeline_c1)
+        << "BooleanToNumber output should connect to Pipeline c1";
+  }
+
   // Prototype should contain aggregates: CumulativeSum, CountNumber
   ASSERT_EQ(builder.prototypes().size(), 1u);
   const auto& proto = builder.prototypes()[0];
@@ -729,6 +834,45 @@ TEST_F(SegmentGroupByTest, MixedGroupBy) {
   EXPECT_TRUE(proto_has_abs) << "Outer prototype should have Abs for segment expr";
   EXPECT_TRUE(proto_has_cmp) << "Outer prototype should have CompareGT for segment expr";
   EXPECT_TRUE(proto_has_pipeline) << "Outer prototype should have Pipeline";
+
+  // Outer prototype should contain BooleanToNumber between predicate and Pipeline c1
+  bool proto_has_b2n = false;
+  std::string b2n_id;
+  for (const auto& op : outer_proto->operators) {
+    if (op.type == "BooleanToNumber") {
+      proto_has_b2n = true;
+      b2n_id = op.id;
+    }
+  }
+  EXPECT_TRUE(proto_has_b2n)
+      << "Outer prototype should have BooleanToNumber between predicate and Pipeline c1";
+
+  // Verify connection chain in outer prototype: CompareGT -> BooleanToNumber -> Pipeline.c1
+  if (proto_has_b2n) {
+    bool cmp_to_b2n = false;
+    bool b2n_to_pipeline_c1 = false;
+    for (const auto& conn : outer_proto->connections) {
+      if (conn.to_id == b2n_id && conn.to_port == "i1") {
+        for (const auto& op : outer_proto->operators) {
+          if (op.id == conn.from_id && op.type == "CompareGT") {
+            cmp_to_b2n = true;
+          }
+        }
+      }
+      if (conn.from_id == b2n_id && conn.from_port == "o1" &&
+          conn.to_port == "c1") {
+        for (const auto& op : outer_proto->operators) {
+          if (op.id == conn.to_id && op.type == "Pipeline") {
+            b2n_to_pipeline_c1 = true;
+          }
+        }
+      }
+    }
+    EXPECT_TRUE(cmp_to_b2n)
+        << "CompareGT should connect to BooleanToNumber in outer prototype";
+    EXPECT_TRUE(b2n_to_pipeline_c1)
+        << "BooleanToNumber should connect to Pipeline c1 in outer prototype";
+  }
 
   // Inner prototype should have CumulativeSum, CountNumber, VectorCompose
   bool has_cumsum = false, has_count = false, has_compose = false;
@@ -830,6 +974,14 @@ TEST_F(SegmentGroupByTest, CompositeKeysWithSegmentExpression) {
   EXPECT_TRUE(proto_has_abs) << "Outer prototype should have Abs for segment expr";
   EXPECT_TRUE(proto_has_cmp) << "Outer prototype should have CompareGT for segment expr";
   EXPECT_TRUE(proto_has_pipeline) << "Outer prototype should have Pipeline";
+
+  // Outer prototype should contain BooleanToNumber between predicate and Pipeline c1
+  bool proto_has_b2n = false;
+  for (const auto& op : outer_proto->operators) {
+    if (op.type == "BooleanToNumber") proto_has_b2n = true;
+  }
+  EXPECT_TRUE(proto_has_b2n)
+      << "Outer prototype should have BooleanToNumber for segment predicate conversion";
 
   // Inner prototype should have key column extraction + aggregates
   bool has_cumsum = false, has_count = false, has_compose = false;

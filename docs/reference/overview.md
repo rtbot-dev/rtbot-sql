@@ -100,5 +100,6 @@ It extends standard SQL with streaming-specific features:
 - DSP functions — `FIR()`, `IIR()`, `RESAMPLE()`, `PEAK_DETECT()`
 - `SUBSCRIBE` — streaming output subscription
 - Multi-source `FROM` — automatic time-aligned joins across streams
+- Segment `GROUP BY` — `GROUP BY SEGMENT(expr, size)` partitions a stream into fixed-size time segments for windowed aggregation
 
 See [Statements](/docs/reference/rtbot-sql/statements), [Clauses](/docs/reference/rtbot-sql/clauses), and [Functions](/docs/reference/rtbot-sql/functions) for the complete reference.

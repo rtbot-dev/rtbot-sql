@@ -495,13 +495,19 @@ SelectResult compile_group_by(
     auto bool_ep =
         compile_predicate(*segment_expr, outer_input_ep, scope, outer_proto_builder);
 
+    // Convert boolean predicate to numeric segment key (Pipeline c1 expects NumberData)
+    auto b2n_id = outer_proto_builder.next_id("b2n");
+    outer_proto_builder.add_operator(b2n_id, "BooleanToNumber");
+    outer_proto_builder.connect(bool_ep, {b2n_id, "i1"});
+    Endpoint num_ep{b2n_id, "o1"};
+
     // Add Pipeline operator inside the outer prototype
     auto pipeline_id = outer_proto_builder.next_id("pipeline");
     outer_proto_builder.add_operator(pipeline_id, "Pipeline",
                                      /*params=*/{},
                                      /*string_params=*/{{"prototype", inner_proto_id}});
     outer_proto_builder.connect(outer_input_ep, {pipeline_id, "i1"});
-    outer_proto_builder.connect(bool_ep, {pipeline_id, "c1"});
+    outer_proto_builder.connect(num_ep, {pipeline_id, "c1"});
 
     outer_proto_builder.add_operator("proto_out", "Output");
     outer_proto_builder.connect({pipeline_id, "o1"}, {"proto_out", "i1"});
@@ -549,9 +555,14 @@ SelectResult compile_group_by(
     }
 
     // Compile the segment expression as a predicate (BOOLEAN output)
-    // in the outer graph.
+    // in the outer graph, then convert to Number for the Pipeline control port.
     auto bool_ep =
         compile_predicate(group_by[0], input_endpoint, scope, builder);
+
+    auto b2n_id = builder.next_id("b2n");
+    builder.add_operator(b2n_id, "BooleanToNumber");
+    builder.connect(bool_ep, {b2n_id, "i1"});
+    Endpoint num_ep{b2n_id, "o1"};
 
     // Build prototype sub-graph for aggregates
     GraphBuilder proto_builder;
@@ -601,7 +612,7 @@ SelectResult compile_group_by(
                          /*params=*/{},
                          /*string_params=*/{{"prototype", proto_id}});
     builder.connect(input_endpoint, {pipeline_id, "i1"});
-    builder.connect(bool_ep, {pipeline_id, "c1"});
+    builder.connect(num_ep, {pipeline_id, "c1"});
 
     // --- HAVING (if present): post-Pipeline filter ---
     Endpoint pipeline_output{pipeline_id, "o1"};

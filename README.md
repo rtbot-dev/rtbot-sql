@@ -125,7 +125,7 @@ No code to rewrite. No JVM to configure. No cluster to orchestrate. See the [ful
 | `CREATE TABLE` / `CREATE STREAM` | Supported |
 | `CREATE MATERIALIZED VIEW` | Supported |
 | `INSERT INTO ... VALUES` | Supported |
-| `SELECT ... FROM ... [WHERE] [GROUP BY] [HAVING] [LIMIT]` | Supported |
+| `SELECT ... FROM ... [WHERE] [GROUP BY] [HAVING] [LIMIT]` | Supported (GROUP BY includes segment expressions for time-based partitioning) |
 | `DROP MATERIALIZED VIEW` | Supported |
 | `CREATE VIEW` | Stub (Phase 2) |
 | `SUBSCRIBE` | Stub (Phase 2) |

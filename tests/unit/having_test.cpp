@@ -313,8 +313,8 @@ TEST_F(HavingTest, HavingDeviationFromBaseline) {
 // HAVING SUM(quantity) > 100
 //
 // Expected operator graph:
-//   input → [ABS+CompareGT(0)] → bool_ep
-//   input → Pipeline.i1, bool_ep → Pipeline.c1
+//   input → [ABS+CompareGT(0)] → bool_ep → BooleanToNumber → num_ep
+//   input → Pipeline.i1, num_ep → Pipeline.c1
 //   Pipeline.o1 → VectorExtract(0) → CompareGT(100) → Demux.c1
 //   Pipeline.o1 → Demux.i1
 //   Demux.o1 → returned endpoint
@@ -351,6 +351,14 @@ TEST_F(HavingTest, SegmentHavingPostPipelineFilter) {
     if (op.type == "Pipeline") has_pipeline = true;
   }
   EXPECT_TRUE(has_pipeline) << "Pipeline should be in outer graph";
+
+  // 2b. BooleanToNumber exists between predicate and Pipeline c1
+  bool has_b2n = false;
+  for (const auto& op : builder.operators()) {
+    if (op.type == "BooleanToNumber") has_b2n = true;
+  }
+  EXPECT_TRUE(has_b2n)
+      << "BooleanToNumber should be in outer graph between predicate and Pipeline c1";
 
   // 3. Demultiplexer exists in the outer graph (post-filter)
   bool has_demux = false;
