@@ -1,0 +1,28 @@
+# Rotating Machinery Preset Notebooks
+# =====================================
+# Pin minor versions, allow patch updates (~=).
+# Install into a dedicated venv — see setup.sh.
+
+# Core RtBot SQL engine (installed from the local wheel by setup.sh)
+# rtbot-sql is installed separately — see setup.sh
+
+# Data handling
+pandas~=2.2
+numpy~=1.26
+
+# Signal processing (filter design for preset 06, SES validation)
+scipy~=1.13
+
+# Dataset download and caching (download-on-first-use, outside repo)
+pooch~=1.8
+
+# Kaggle CLI for IMS dataset download (requires ~/.kaggle/kaggle.json)
+# Install manually if you need it: pip install kaggle
+# kaggle~=1.6
+
+# Visualisation (matches existing examples/notebooks style)
+plotly~=5.22
+
+# Jupyter environment
+jupyterlab~=4.2
+ipykernel~=6.29
