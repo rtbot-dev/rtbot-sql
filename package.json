@@ -1,6 +1,6 @@
 {
   "name": "@rtbot-dev/rtbot-sql",
-  "version": "0.1.0",
+  "version": "0.1.17",
   "private": true,
   "devDependencies": {
     "@types/jest": "^29.5.14",
