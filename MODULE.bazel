@@ -11,6 +11,8 @@ bazel_dep(name = "bazel_skylib", version = "1.8.1")
 bazel_dep(name = "googletest", version = "1.15.2", repo_name = "com_google_googletest")
 bazel_dep(name = "protobuf", version = "31.1", repo_name = "com_google_protobuf")
 bazel_dep(name = "rules_python", version = "1.9.0")
+bazel_dep(name = "rules_java", version = "9.6.1")
+bazel_dep(name = "rules_jvm_external", version = "6.10")
 
 # --- Python toolchain ---
 
@@ -155,6 +157,19 @@ npm.npm_translate_lock(
     verify_node_modules_ignored = "//:.bazelignore",
 )
 use_repo(npm, "rtbot_sql_npm")
+
+# --- Java / Maven — dependencies for the Java runtime ---
+maven = use_extension("@rules_jvm_external//:extensions.bzl", "maven")
+maven.install(
+    artifacts = [
+        "junit:junit:4.13.2",
+        "com.google.code.gson:gson:2.10.1",
+    ],
+    repositories = [
+        "https://repo1.maven.org/maven2",
+    ],
+)
+use_repo(maven, "maven")
 
 # --- rtbot dependency ---
 bazel_dep(name = "rtbot", version = "0.0.0")

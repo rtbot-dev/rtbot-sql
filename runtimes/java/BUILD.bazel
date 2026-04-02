@@ -1,0 +1,54 @@
+load("@rules_cc//cc:defs.bzl", "cc_binary")
+load("@rules_java//java:defs.bzl", "java_library", "java_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# ---------------------------------------------------------------------------
+# JNI shared library — SQL compiler + pipeline execution
+#
+# Compiles rtbot_sql_jni.cpp against the RTBot SQL compiler API, the RTBot
+# core API (for Program / VectorNumberData), nlohmann/json, and JNI headers.
+#
+# Produces librtbot_sql_jni.so (Linux) / librtbot_sql_jni.dylib (macOS).
+# ---------------------------------------------------------------------------
+cc_binary(
+    name = "rtbot_sql_jni",
+    srcs = ["rtbot_sql_jni.cpp"],
+    linkshared = True,
+    deps = [
+        "//libs/api:api_compiler",
+        "//libs/parser",
+        "@rtbot//libs/api:rtbot-api",
+        "@json-cpp//:lib",
+        "@bazel_tools//tools/jdk:jni",
+    ],
+)
+
+# ---------------------------------------------------------------------------
+# Java runtime library — the reusable RTBot SQL Java wrapper
+# Package: dev.rtbot.sql
+# ---------------------------------------------------------------------------
+java_library(
+    name = "rtbot-sql-java",
+    srcs = glob(["src/main/java/**/*.java"]),
+    visibility = ["//visibility:public"],
+    deps = [
+        "@maven//:com_google_code_gson_gson",
+    ],
+)
+
+# ---------------------------------------------------------------------------
+# Integration tests — exercises the full JNI bridge + runtime
+# ---------------------------------------------------------------------------
+java_test(
+    name = "rtbot-sql-java-test",
+    srcs = glob(["src/test/java/**/*.java"]),
+    test_class = "dev.rtbot.sql.RtBotSqlRuntimeTest",
+    jvm_flags = ["-Djava.library.path=runtimes/java"],
+    data = [":rtbot_sql_jni"],
+    deps = [
+        ":rtbot-sql-java",
+        "@maven//:junit_junit",
+        "@maven//:com_google_code_gson_gson",
+    ],
+)
