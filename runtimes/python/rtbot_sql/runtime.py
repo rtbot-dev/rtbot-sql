@@ -16,6 +16,12 @@ from .jupyter import show_graph as display_graph
 from .pipeline_runner import LocalPipelineRunner
 from .stream_store import InMemoryStreamStore
 
+try:
+  import numpy as np
+  _HAS_NUMPY = True
+except ImportError:
+  _HAS_NUMPY = False
+
 
 class SqlError(RuntimeError):
   def __init__(self, errors: Sequence[Any]):
@@ -281,15 +287,23 @@ class RtBotSql:
     return outputs
 
   def _append_and_propagate(self, stream_name: str, timestamp: int, values: List[float]) -> None:
-    self._store.append(stream_name, timestamp, values)
-
+    # Only store output for streams and materialized views.
+    # Plain VIEWs are building blocks — they propagate to dependents but
+    # don't persist output (SELECT FROM VIEW uses Tier 3 ephemeral replay).
     view = self._catalog.lookup_view(stream_name)
-    if (
+    is_plain_view = (
         view is not None
-        and view.view_type == native.ViewType.KEYED
-        and 0 <= view.key_index < len(values)
-    ):
-      self._catalog.add_key(stream_name, float(values[view.key_index]))
+        and view.entity_type == native.EntityType.VIEW
+    )
+
+    if not is_plain_view:
+      self._store.append(stream_name, timestamp, values)
+      if (
+          view is not None
+          and view.view_type == native.ViewType.KEYED
+          and 0 <= view.key_index < len(values)
+      ):
+        self._catalog.add_key(stream_name, float(values[view.key_index]))
 
     for dependent in list(self._dependencies.get(stream_name, set())):
       outputs = self._feed_dependent_pipeline(dependent, stream_name, timestamp, values)
@@ -539,51 +553,130 @@ class RtBotSql:
       stream_name: str,
       dataframe: Any,
       column_map: Optional[Dict[str, str]] = None,
+      *,
+      store_raw: bool = True,
   ) -> InsertResult:
     schema = self._catalog.lookup_stream(stream_name)
     if schema is None:
       raise SqlError([f"Unknown stream: {stream_name}"])
 
     cmap = column_map or {}
-
-    time_col = None
-    if hasattr(dataframe, "columns"):
-      for candidate in ("time", "timestamp", "ts"):
-        if candidate in dataframe.columns:
-          time_col = candidate
-          break
-
-    row_count = 0
     t0 = time.perf_counter()
 
-    if hasattr(dataframe, "iterrows"):
-      for _, row in dataframe.iterrows():
-        timestamp = int(row[time_col]) if time_col else self._next_timestamp()
-        values = [float(row[cmap.get(col.name, col.name)]) for col in schema.columns]
-        self._append_and_propagate(stream_name, timestamp, values)
-        row_count += 1
+    # --- Fast path: pandas DataFrame with numpy batch API ---
+    if _HAS_NUMPY and hasattr(dataframe, "values") and hasattr(dataframe, "columns"):
+      row_count = self._insert_dataframe_fast(
+          stream_name, dataframe, schema, cmap, store_raw,
+      )
     else:
-      for row in dataframe:
-        if isinstance(row, dict):
-          if time_col:
-            timestamp = int(row.get(time_col, self._next_timestamp()))
-          else:
-            dict_time_col = None
-            for candidate in ("time", "timestamp", "ts"):
-              if candidate in row:
-                dict_time_col = candidate
-                break
-            timestamp = int(row[dict_time_col]) if dict_time_col else self._next_timestamp()
-          values = [float(row[cmap.get(col.name, col.name)]) for col in schema.columns]
-        else:
-          timestamp = self._next_timestamp()
-          values = [float(v) for v in row]
-        self._append_and_propagate(stream_name, timestamp, values)
-        row_count += 1
+      row_count = self._insert_dataframe_slow(
+          stream_name, dataframe, schema, cmap, store_raw,
+      )
 
     elapsed = time.perf_counter() - t0
     rps = row_count / elapsed if elapsed > 0 else float('inf')
     return InsertResult(rows=row_count, elapsed_s=elapsed, rows_per_sec=rps)
+
+  def _insert_dataframe_fast(
+      self,
+      stream_name: str,
+      dataframe: Any,
+      schema: StreamSchema,
+      cmap: Dict[str, str],
+      store_raw: bool,
+  ) -> int:
+    """Optimized path for pandas DataFrames using numpy arrays + C++ batch feed."""
+    # Resolve time column
+    time_col = None
+    for candidate in ("time", "timestamp", "ts"):
+      if candidate in dataframe.columns:
+        time_col = candidate
+        break
+
+    # Build column index mapping: schema column order -> DataFrame column index
+    col_names = [cmap.get(col.name, col.name) for col in schema.columns]
+    value_cols = dataframe[col_names].to_numpy(dtype=np.float64)
+
+    if time_col is not None:
+      timestamps = dataframe[time_col].to_numpy(dtype=np.int64)
+    else:
+      base = self._next_timestamp()
+      timestamps = np.arange(base, base + len(dataframe), dtype=np.int64)
+      self._last_timestamp = int(timestamps[-1]) if len(timestamps) > 0 else base
+
+    row_count = len(timestamps)
+
+    # Store raw stream data if requested (needed for backfill on view creation
+    # and for multi-source ASOF correlation lookups).
+    if store_raw:
+      for i in range(row_count):
+        self._store.append(stream_name, int(timestamps[i]), value_cols[i].tolist())
+
+    # Classify dependents into single-source (batchable) and multi-source (row-by-row)
+    dependents = list(self._dependencies.get(stream_name, set()))
+    single_source_deps = []
+    multi_source_deps = []
+
+    for dep in dependents:
+      if self._uses_snapshot_sync(dep):
+        multi_source_deps.append(dep)
+      else:
+        single_source_deps.append(dep)
+
+    # Fast path: batch-feed single-source views (one C++ call per view)
+    for dep in single_source_deps:
+      pipeline_id = self._view_pipelines.get(dep)
+      if pipeline_id is None:
+        continue
+      port_map = self._view_port_maps.get(dep, {})
+      port = port_map.get(stream_name, "i1")
+      outputs = self._runner.feed_batch(pipeline_id, timestamps, value_cols, port=port)
+      for out in outputs:
+        self._append_and_propagate(dep, out.timestamp, out.values)
+
+    # Slow path: multi-source views need row-by-row for ASOF lookup
+    if multi_source_deps:
+      for i in range(row_count):
+        ts_i = int(timestamps[i])
+        vals_i = value_cols[i].tolist()
+        for dep in multi_source_deps:
+          outputs = self._feed_dependent_pipeline(dep, stream_name, ts_i, vals_i)
+          for out in outputs:
+            self._append_and_propagate(dep, out.timestamp, out.values)
+
+    return row_count
+
+  def _insert_dataframe_slow(
+      self,
+      stream_name: str,
+      dataframe: Any,
+      schema: StreamSchema,
+      cmap: Dict[str, str],
+      store_raw: bool,
+  ) -> int:
+    """Original row-by-row path for list-of-dicts and other iterables."""
+    time_col: Optional[str] = None
+    row_count = 0
+
+    for row in dataframe:
+      if isinstance(row, dict):
+        if time_col is None:
+          for candidate in ("time", "timestamp", "ts"):
+            if candidate in row:
+              time_col = candidate
+              break
+        if time_col and time_col in row:
+          timestamp = int(row[time_col])
+        else:
+          timestamp = self._next_timestamp()
+        values = [float(row[cmap.get(col.name, col.name)]) for col in schema.columns]
+      else:
+        timestamp = self._next_timestamp()
+        values = [float(v) for v in row]
+      self._append_and_propagate(stream_name, timestamp, values)
+      row_count += 1
+
+    return row_count
 
   def get_catalog(self) -> InMemoryCatalog:
     return self._catalog

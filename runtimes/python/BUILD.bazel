@@ -213,3 +213,11 @@ py_test(
     main = "test/rtbot_sql_test.py",
     deps = [":rtbot_sql"],
 )
+
+py_test(
+    name = "memory_profile_test",
+    srcs = ["test/memory_profile_test.py"],
+    main = "test/memory_profile_test.py",
+    timeout = "moderate",  # 300s — memory profiling needs headroom
+    deps = [":rtbot_sql"],
+)

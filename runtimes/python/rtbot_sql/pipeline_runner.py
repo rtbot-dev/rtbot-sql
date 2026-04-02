@@ -8,6 +8,12 @@ from typing import Any, Dict, Iterable, List
 from .compiler import native
 from .stream_store import Message
 
+try:
+  import numpy as np
+  _HAS_NUMPY = True
+except ImportError:
+  _HAS_NUMPY = False
+
 
 @dataclass
 class InputMessage:
@@ -68,6 +74,35 @@ class LocalPipelineRunner:
   ) -> List[PipelineOutput]:
     pipeline = self._pipelines[pipeline_id]
     native_outputs = pipeline.feed(int(timestamp), [float(v) for v in values], str(port))
+    return [
+        PipelineOutput(
+            timestamp=int(out.timestamp),
+            values=[float(v) for v in out.values],
+            operator_id=str(out.operator_id),
+            port=str(out.port),
+        )
+        for out in native_outputs
+    ]
+
+  def feed_batch(
+      self,
+      pipeline_id: str,
+      timestamps: Any,
+      values_2d: Any,
+      port: str = "i1",
+  ) -> List[PipelineOutput]:
+    """Feed a batch of rows via numpy arrays (one C++ call for all rows).
+
+    Requires numpy. Falls back to row-by-row ``feed`` when numpy is unavailable.
+    """
+    if not _HAS_NUMPY:
+      raise ImportError("feed_batch requires numpy")
+    pipeline = self._pipelines[pipeline_id]
+    native_outputs = pipeline.feed_batch(
+        np.ascontiguousarray(timestamps, dtype=np.int64),
+        np.ascontiguousarray(values_2d, dtype=np.float64),
+        str(port),
+    )
     return [
         PipelineOutput(
             timestamp=int(out.timestamp),

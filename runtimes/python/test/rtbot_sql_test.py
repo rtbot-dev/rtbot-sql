@@ -267,5 +267,98 @@ class RuntimeLifecycleTest(unittest.TestCase):
     self.assertEqual(rows[0][0], 1700000000000.0)
 
 
+class ViewStorageTest(unittest.TestCase):
+  """Verify that non-materialized VIEWs do not store outputs in the stream
+  store, while MATERIALIZED VIEWs do."""
+
+  def test_view_does_not_store_output(self):
+    """A CREATE VIEW should not accumulate rows in the stream store."""
+    sql = rtbot_sql.RtBotSql()
+    sql.execute("CREATE STREAM trades (instrument_id DOUBLE, price DOUBLE, quantity DOUBLE)")
+    sql.execute(
+        "CREATE VIEW trade_view AS "
+        "SELECT instrument_id, price FROM trades LIMIT 1"
+    )
+
+    sql.execute("INSERT INTO trades VALUES (1, 100.0, 10)")
+    sql.execute("INSERT INTO trades VALUES (2, 200.0, 20)")
+
+    # The raw stream should be stored
+    raw_msgs = sql._store.read("trades")
+    self.assertEqual(len(raw_msgs), 2)
+
+    # The VIEW output should NOT be stored
+    view_msgs = sql._store.read("trade_view")
+    self.assertEqual(len(view_msgs), 0,
+                     "Plain VIEW should not store output in stream store")
+
+  def test_materialized_view_stores_output(self):
+    """A CREATE MATERIALIZED VIEW should accumulate rows in the stream store."""
+    sql = rtbot_sql.RtBotSql()
+    sql.execute("CREATE STREAM trades (instrument_id DOUBLE, price DOUBLE, quantity DOUBLE)")
+    sql.execute(
+        "CREATE MATERIALIZED VIEW trade_stats AS "
+        "SELECT instrument_id, SUM(price) AS total_price, COUNT(*) AS cnt "
+        "FROM trades GROUP BY instrument_id"
+    )
+
+    sql.execute("INSERT INTO trades VALUES (1, 100.0, 10)")
+    sql.execute("INSERT INTO trades VALUES (2, 200.0, 20)")
+    sql.execute("INSERT INTO trades VALUES (1, 150.0, 5)")
+
+    # The MATERIALIZED VIEW output should be stored
+    mv_msgs = sql._store.read("trade_stats")
+    self.assertGreater(len(mv_msgs), 0,
+                       "MATERIALIZED VIEW should store output in stream store")
+
+  def test_view_chain_propagates_without_storing_intermediate(self):
+    """A VIEW → MATERIALIZED VIEW chain should propagate data correctly
+    while only storing the final materialized output, not the intermediate
+    VIEW output."""
+    sql = rtbot_sql.RtBotSql()
+    sql.execute("CREATE STREAM trades (instrument_id DOUBLE, price DOUBLE, quantity DOUBLE)")
+
+    # Intermediate VIEW: computes a derived column
+    sql.execute(
+        "CREATE VIEW enriched AS "
+        "SELECT instrument_id, price * quantity AS notional "
+        "FROM trades LIMIT 1"
+    )
+
+    # Final MATERIALIZED VIEW: aggregates from the VIEW
+    sql.execute(
+        "CREATE MATERIALIZED VIEW totals AS "
+        "SELECT instrument_id, SUM(notional) AS total_notional, COUNT(*) AS cnt "
+        "FROM enriched GROUP BY instrument_id"
+    )
+
+    sql.execute("INSERT INTO trades VALUES (1, 100.0, 10)")
+    sql.execute("INSERT INTO trades VALUES (2, 200.0, 5)")
+    sql.execute("INSERT INTO trades VALUES (1, 150.0, 3)")
+
+    # Raw stream: stored
+    self.assertEqual(len(sql._store.read("trades")), 3)
+
+    # Intermediate VIEW: NOT stored
+    self.assertEqual(len(sql._store.read("enriched")), 0,
+                     "Intermediate VIEW should not store output")
+
+    # Final MATERIALIZED VIEW: stored and correct
+    mv_msgs = sql._store.read("totals")
+    self.assertGreater(len(mv_msgs), 0,
+                       "Downstream MATERIALIZED VIEW should store output")
+
+    # Verify correctness via SELECT
+    result = sql.execute("SELECT * FROM totals")
+    columns, rows = _columns_and_rows(result)
+    self.assertEqual(columns, ["time", "instrument_id", "total_notional", "cnt"])
+
+    actual = {row[1]: row[1:] for row in rows}
+    # instrument 1: (100*10) + (150*3) = 1450, count=2
+    self.assertEqual(actual[1.0], [1.0, 1450.0, 2.0])
+    # instrument 2: (200*5) = 1000, count=1
+    self.assertEqual(actual[2.0], [2.0, 1000.0, 1.0])
+
+
 if __name__ == "__main__":
   unittest.main()

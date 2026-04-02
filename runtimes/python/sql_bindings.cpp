@@ -3,6 +3,7 @@
 #include <tuple>
 #include <vector>
 
+#include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
@@ -105,6 +106,38 @@ class NativePipeline {
       out.insert(out.end(), chunk.begin(), chunk.end());
     }
     return out;
+  }
+
+  std::vector<RuntimeOutputMessage> feed_batch(
+      py::array_t<int64_t, py::array::c_style> timestamps,
+      py::array_t<double, py::array::c_style> values,
+      const std::string& port = "i1") {
+    auto ts = timestamps.template unchecked<1>();
+    auto vals = values.template unchecked<2>();
+
+    if (ts.shape(0) != vals.shape(0)) {
+      throw std::invalid_argument(
+          "timestamps and values must have the same number of rows");
+    }
+
+    std::vector<RuntimeOutputMessage> all_outputs;
+    auto ncols = static_cast<size_t>(vals.shape(1));
+
+    for (py::ssize_t i = 0; i < ts.shape(0); ++i) {
+      std::vector<double> row(ncols);
+      for (size_t j = 0; j < ncols; ++j) {
+        row[j] = vals(i, static_cast<py::ssize_t>(j));
+      }
+      auto msg = rtbot::create_message<rtbot::VectorNumberData>(
+          static_cast<rtbot::timestamp_t>(ts(i)),
+          rtbot::VectorNumberData{std::move(row)});
+      auto batch = program_.receive(std::move(msg), port);
+      auto decoded = decode_batch(batch);
+      all_outputs.insert(all_outputs.end(),
+                         std::make_move_iterator(decoded.begin()),
+                         std::make_move_iterator(decoded.end()));
+    }
+    return all_outputs;
   }
 
  private:
@@ -224,6 +257,10 @@ PYBIND11_MODULE(_rtbot_sql_native, m) {
       .def(py::init<const std::string&>(), py::arg("program_json"))
       .def("feed", &NativePipeline::feed,
            py::arg("timestamp"),
+           py::arg("values"),
+           py::arg("port") = "i1")
+      .def("feed_batch", &NativePipeline::feed_batch,
+           py::arg("timestamps"),
            py::arg("values"),
            py::arg("port") = "i1")
       .def("run", &NativePipeline::run, py::arg("inputs"));
