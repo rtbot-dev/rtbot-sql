@@ -42,10 +42,32 @@ java_library(
 # ---------------------------------------------------------------------------
 java_test(
     name = "rtbot-sql-java-test",
-    srcs = glob(["src/test/java/**/*.java"]),
+    srcs = ["src/test/java/dev/rtbot/sql/RtBotSqlRuntimeTest.java"],
     test_class = "dev.rtbot.sql.RtBotSqlRuntimeTest",
     jvm_flags = ["-Djava.library.path=runtimes/java"],
     data = [":rtbot_sql_jni"],
+    deps = [
+        ":rtbot-sql-java",
+        "@maven//:junit_junit",
+        "@maven//:com_google_code_gson_gson",
+    ],
+)
+
+# ---------------------------------------------------------------------------
+# Load test — bearing preset throughput benchmark
+#
+# Measures msgs/sec, memory, and CPU utilization by feeding synthetic
+# vibration bursts through the full rotating-machinery preset pipeline.
+#
+# Run:  bazel test //runtimes/java:bearing-load-test --test_output=all
+# ---------------------------------------------------------------------------
+java_test(
+    name = "bearing-load-test",
+    srcs = ["src/test/java/dev/rtbot/sql/BearingLoadTest.java"],
+    test_class = "dev.rtbot.sql.BearingLoadTest",
+    jvm_flags = ["-Djava.library.path=runtimes/java"],
+    data = [":rtbot_sql_jni"],
+    timeout = "long",
     deps = [
         ":rtbot-sql-java",
         "@maven//:junit_junit",
