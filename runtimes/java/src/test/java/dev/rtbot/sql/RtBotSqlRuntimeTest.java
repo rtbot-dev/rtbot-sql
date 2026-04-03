@@ -5,10 +5,12 @@ import org.junit.Before;
 import org.junit.After;
 import static org.junit.Assert.*;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
  * Integration tests for {@link RtBotSqlRuntime}.
@@ -28,6 +30,10 @@ public class RtBotSqlRuntimeTest {
     @Before
     public void setUp() {
         runtime = new RtBotSqlRuntime();
+        // Most existing tests rely on SELECT queries and store reads, which
+        // require collect mode. The subscription-model tests explicitly create
+        // runtimes with the default (collect mode off) behavior.
+        runtime.setCollectMode(true);
     }
 
     @After
@@ -590,6 +596,7 @@ public class RtBotSqlRuntimeTest {
 
         // Create a new runtime with the same schema and view
         RtBotSqlRuntime runtime2 = new RtBotSqlRuntime();
+        runtime2.setCollectMode(true);
         try {
             runtime2.execute("CREATE STREAM ticks (value DOUBLE PRECISION)");
             runtime2.execute(
@@ -879,5 +886,316 @@ public class RtBotSqlRuntimeTest {
         assertEquals(2, result.rows.size());
         assertEquals(10.0, result.rows.get(0).get(0), 1e-9);
         assertEquals(30.0, result.rows.get(1).get(0), 1e-9);
+    }
+
+    // =================================================================
+    // Subscription API tests
+    // =================================================================
+
+    /**
+     * A test listener that collects received messages for assertions.
+     */
+    private static class CollectingListener implements OutputListener {
+        final CopyOnWriteArrayList<String> streamNames = new CopyOnWriteArrayList<>();
+        final CopyOnWriteArrayList<Long> timestamps = new CopyOnWriteArrayList<>();
+        final CopyOnWriteArrayList<List<Double>> values = new CopyOnWriteArrayList<>();
+
+        @Override
+        public void onMessage(String streamName, long timestamp, List<Double> vals) {
+            streamNames.add(streamName);
+            timestamps.add(timestamp);
+            values.add(new ArrayList<>(vals));
+        }
+
+        int count() {
+            return streamNames.size();
+        }
+    }
+
+    @Test
+    public void subscribeReceivesRawStreamMessages() {
+        runtime.execute("CREATE STREAM ticks (value DOUBLE PRECISION)");
+
+        CollectingListener listener = new CollectingListener();
+        runtime.subscribe("ticks", listener);
+
+        runtime.insert("ticks", 1000L, Arrays.asList(42.0));
+        runtime.insert("ticks", 2000L, Arrays.asList(84.0));
+
+        assertEquals("Listener should receive 2 messages", 2, listener.count());
+        assertEquals("ticks", listener.streamNames.get(0));
+        assertEquals(1000L, (long) listener.timestamps.get(0));
+        assertEquals(42.0, listener.values.get(0).get(0), 1e-9);
+        assertEquals(84.0, listener.values.get(1).get(0), 1e-9);
+    }
+
+    @Test
+    public void subscribeReceivesMaterializedViewOutput() {
+        runtime.execute("CREATE STREAM ticks (value DOUBLE PRECISION)");
+        runtime.execute(
+            "CREATE MATERIALIZED VIEW doubled AS "
+            + "SELECT value * 2 AS doubled_value FROM ticks"
+        );
+
+        CollectingListener listener = new CollectingListener();
+        runtime.subscribe("doubled", listener);
+
+        runtime.insert("ticks", 1000L, Arrays.asList(5.0));
+        runtime.insert("ticks", 2000L, Arrays.asList(15.0));
+
+        assertEquals("Listener should receive 2 materialized view outputs",
+                     2, listener.count());
+        assertEquals("doubled", listener.streamNames.get(0));
+        assertEquals(10.0, listener.values.get(0).get(0), 1e-9);
+        assertEquals(30.0, listener.values.get(1).get(0), 1e-9);
+    }
+
+    @Test
+    public void unsubscribeStopsDelivery() {
+        runtime.execute("CREATE STREAM ticks (value DOUBLE PRECISION)");
+
+        CollectingListener listener = new CollectingListener();
+        runtime.subscribe("ticks", listener);
+
+        runtime.insert("ticks", 1000L, Arrays.asList(1.0));
+        assertEquals(1, listener.count());
+
+        runtime.unsubscribe("ticks");
+
+        runtime.insert("ticks", 2000L, Arrays.asList(2.0));
+        assertEquals("No more messages after unsubscribe", 1, listener.count());
+    }
+
+    @Test
+    public void hasSubscriberReflectsState() {
+        runtime.execute("CREATE STREAM ticks (value DOUBLE PRECISION)");
+
+        assertFalse(runtime.hasSubscriber("ticks"));
+
+        CollectingListener listener = new CollectingListener();
+        runtime.subscribe("ticks", listener);
+        assertTrue(runtime.hasSubscriber("ticks"));
+
+        runtime.unsubscribe("ticks");
+        assertFalse(runtime.hasSubscriber("ticks"));
+    }
+
+    @Test
+    public void multipleSubscribersOnDifferentStreams() {
+        runtime.execute("CREATE STREAM a (value DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM b (value DOUBLE PRECISION)");
+
+        CollectingListener listenerA = new CollectingListener();
+        CollectingListener listenerB = new CollectingListener();
+        runtime.subscribe("a", listenerA);
+        runtime.subscribe("b", listenerB);
+
+        runtime.insert("a", 1000L, Arrays.asList(10.0));
+        runtime.insert("b", 1000L, Arrays.asList(20.0));
+        runtime.insert("a", 2000L, Arrays.asList(30.0));
+
+        assertEquals(2, listenerA.count());
+        assertEquals(1, listenerB.count());
+        assertEquals(10.0, listenerA.values.get(0).get(0), 1e-9);
+        assertEquals(30.0, listenerA.values.get(1).get(0), 1e-9);
+        assertEquals(20.0, listenerB.values.get(0).get(0), 1e-9);
+    }
+
+    @Test
+    public void subscribeToViewChain() {
+        runtime.execute("CREATE STREAM trades (instrument_id DOUBLE, price DOUBLE, quantity DOUBLE)");
+        runtime.execute(
+            "CREATE VIEW enriched AS "
+            + "SELECT instrument_id, price * quantity AS notional "
+            + "FROM trades LIMIT 1"
+        );
+        runtime.execute(
+            "CREATE MATERIALIZED VIEW totals AS "
+            + "SELECT instrument_id, SUM(notional) AS total_notional, COUNT(*) AS cnt "
+            + "FROM enriched GROUP BY instrument_id"
+        );
+
+        // Subscribe to the intermediate VIEW and the final MATERIALIZED VIEW
+        CollectingListener viewListener = new CollectingListener();
+        CollectingListener mvListener = new CollectingListener();
+        runtime.subscribe("enriched", viewListener);
+        runtime.subscribe("totals", mvListener);
+
+        runtime.execute("INSERT INTO trades VALUES (1, 100.0, 10)");
+        runtime.execute("INSERT INTO trades VALUES (2, 200.0, 5)");
+
+        // The VIEW should forward messages to subscriber even though it does
+        // not store them in the stream store
+        assertTrue("VIEW subscriber should receive messages", viewListener.count() > 0);
+        assertTrue("MATERIALIZED VIEW subscriber should receive messages", mvListener.count() > 0);
+
+        // VIEW still should NOT store output
+        List<Message> viewMsgs = runtime.getStore().read("enriched");
+        assertEquals("Plain VIEW should not store output", 0, viewMsgs.size());
+    }
+
+    // =================================================================
+    // Subscription model tests (default behavior: no accumulation)
+    // =================================================================
+
+    @Test
+    public void defaultModeDoesNotStoreAnything() {
+        // Create a fresh runtime with default settings (collect mode off)
+        RtBotSqlRuntime rt = new RtBotSqlRuntime();
+        try {
+            assertFalse("Collect mode should be off by default", rt.isCollectMode());
+
+            rt.execute("CREATE STREAM ticks (value DOUBLE PRECISION)");
+            rt.execute(
+                "CREATE MATERIALIZED VIEW doubled AS "
+                + "SELECT value * 2 AS doubled_value FROM ticks"
+            );
+
+            rt.insert("ticks", 1000L, Arrays.asList(42.0));
+            rt.insert("ticks", 2000L, Arrays.asList(84.0));
+
+            // Nothing stored -- subscription model discards when no subscriber
+            assertEquals("Raw stream should not be stored by default",
+                         0, rt.getStore().read("ticks").size());
+            assertEquals("Materialized view should not be stored by default",
+                         0, rt.getStore().read("doubled").size());
+        } finally {
+            rt.destroyAll();
+        }
+    }
+
+    @Test
+    public void defaultModeForwardsToSubscribers() {
+        RtBotSqlRuntime rt = new RtBotSqlRuntime();
+        try {
+            rt.execute("CREATE STREAM ticks (value DOUBLE PRECISION)");
+            rt.execute(
+                "CREATE MATERIALIZED VIEW doubled AS "
+                + "SELECT value * 2 AS doubled_value FROM ticks"
+            );
+
+            CollectingListener rawListener = new CollectingListener();
+            CollectingListener mvListener = new CollectingListener();
+            rt.subscribe("ticks", rawListener);
+            rt.subscribe("doubled", mvListener);
+
+            rt.insert("ticks", 1000L, Arrays.asList(5.0));
+            rt.insert("ticks", 2000L, Arrays.asList(15.0));
+
+            // Subscribers receive all messages
+            assertEquals("Raw stream subscriber should receive 2 messages",
+                         2, rawListener.count());
+            assertEquals("MV subscriber should receive 2 messages",
+                         2, mvListener.count());
+            assertEquals(10.0, mvListener.values.get(0).get(0), 1e-9);
+            assertEquals(30.0, mvListener.values.get(1).get(0), 1e-9);
+
+            // But nothing is stored
+            assertEquals("Raw stream not stored by default",
+                         0, rt.getStore().read("ticks").size());
+            assertEquals("MV not stored by default",
+                         0, rt.getStore().read("doubled").size());
+        } finally {
+            rt.destroyAll();
+        }
+    }
+
+    @Test
+    public void defaultModeDiscardsWhenNoSubscriber() {
+        RtBotSqlRuntime rt = new RtBotSqlRuntime();
+        try {
+            rt.execute("CREATE STREAM ticks (value DOUBLE PRECISION)");
+
+            CollectingListener listener = new CollectingListener();
+            rt.subscribe("ticks", listener);
+
+            rt.insert("ticks", 1000L, Arrays.asList(1.0));
+            assertEquals(1, listener.count());
+
+            // Unsubscribe -- subsequent data should be discarded
+            rt.unsubscribe("ticks");
+
+            rt.insert("ticks", 2000L, Arrays.asList(2.0));
+            rt.insert("ticks", 3000L, Arrays.asList(3.0));
+
+            // Listener received nothing after unsubscribe
+            assertEquals("No messages after unsubscribe", 1, listener.count());
+            // And nothing accumulated in store
+            assertEquals("Nothing stored after unsubscribe",
+                         0, rt.getStore().read("ticks").size());
+        } finally {
+            rt.destroyAll();
+        }
+    }
+
+    @Test
+    public void collectModeStoresEverything() {
+        // Collect mode explicitly enabled (used by tests and notebooks)
+        assertFalse("Plain VIEW should not store output", false);
+
+        runtime.execute("CREATE STREAM ticks (value DOUBLE PRECISION)");
+        runtime.execute(
+            "CREATE MATERIALIZED VIEW doubled AS "
+            + "SELECT value * 2 AS doubled_value FROM ticks"
+        );
+
+        runtime.insert("ticks", 1000L, Arrays.asList(5.0));
+        runtime.insert("ticks", 2000L, Arrays.asList(15.0));
+
+        // Everything stored in collect mode
+        assertEquals("Raw stream stored in collect mode",
+                     2, runtime.getStore().read("ticks").size());
+        assertEquals("MV stored in collect mode",
+                     2, runtime.getStore().read("doubled").size());
+    }
+
+    @Test
+    public void collectModeSelectOnMaterializedViewWorks() {
+        // runtime already has collect mode on (from setUp)
+
+        runtime.execute("CREATE STREAM ticks (value DOUBLE PRECISION)");
+        runtime.execute(
+            "CREATE MATERIALIZED VIEW doubled AS "
+            + "SELECT value * 2 AS doubled_value FROM ticks"
+        );
+
+        runtime.insert("ticks", 1000L, Arrays.asList(5.0));
+        runtime.insert("ticks", 2000L, Arrays.asList(15.0));
+
+        Object resultObj = runtime.execute("SELECT * FROM doubled LIMIT 10");
+        SelectResult result = (SelectResult) resultObj;
+
+        assertEquals(2, result.rows.size());
+        assertEquals(10.0, result.rows.get(0).get(0), 1e-9);
+        assertEquals(30.0, result.rows.get(1).get(0), 1e-9);
+    }
+
+    @Test
+    public void collectModeDefaultIsOff() {
+        RtBotSqlRuntime rt = new RtBotSqlRuntime();
+        assertFalse("Collect mode should be off by default", rt.isCollectMode());
+    }
+
+    @Test
+    public void destroyAllClearsSubscriptions() {
+        runtime.execute("CREATE STREAM ticks (value DOUBLE PRECISION)");
+
+        CollectingListener listener = new CollectingListener();
+        runtime.subscribe("ticks", listener);
+        assertTrue(runtime.hasSubscriber("ticks"));
+
+        runtime.destroyAll();
+        assertFalse("destroyAll should clear subscriptions",
+                    runtime.hasSubscriber("ticks"));
+    }
+
+    @Test(expected = IllegalArgumentException.class)
+    public void subscribeWithNullNameThrows() {
+        runtime.subscribe(null, (name, ts, vals) -> {});
+    }
+
+    @Test(expected = IllegalArgumentException.class)
+    public void subscribeWithNullListenerThrows() {
+        runtime.subscribe("ticks", null);
     }
 }

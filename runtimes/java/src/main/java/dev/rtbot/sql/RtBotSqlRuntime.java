@@ -11,6 +11,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -44,6 +45,24 @@ public class RtBotSqlRuntime {
     private final Map<String, Map<String, String>> viewPortMaps = new HashMap<>();
     /** source stream name -> set of dependent view names */
     private final Map<String, Set<String>> dependencies = new HashMap<>();
+
+    /** stream/view name -> active output listener (subscription registry) */
+    private final Map<String, OutputListener> subscriptions = new ConcurrentHashMap<>();
+
+    /**
+     * When true, all messages (raw streams and materialized views) are stored
+     * in the in-memory store — suitable for notebooks, testing, and scenarios
+     * where SELECT queries need access to historical data.
+     *
+     * <p>When false (default), data is only forwarded to active subscribers
+     * and discarded otherwise. This is the production-grade subscription model:
+     * no internal lists grow over time, providing stable memory behavior for
+     * long-running processes.
+     *
+     * <p>Plain VIEWs (non-materialized) never store output regardless of this
+     * setting — they only propagate to dependents and subscribers.
+     */
+    private boolean collectMode = false;
 
     private long lastTimestamp = System.currentTimeMillis();
     private final Gson gson = new Gson();
@@ -129,6 +148,91 @@ public class RtBotSqlRuntime {
         }
 
         appendAndPropagate(streamName, timestamp, payload);
+    }
+
+    // =================================================================
+    // Subscription API
+    // =================================================================
+
+    /**
+     * Subscribe to output messages from a stream or view.
+     *
+     * <p>When a listener is registered, every message produced for the given
+     * stream/view is forwarded to the listener. In streaming mode, this is the
+     * only way to observe output — data is not accumulated in memory.
+     *
+     * <p>Follows the rtbot-redis pattern: output is only delivered when there
+     * is an active subscriber. If no subscriber exists and streaming mode is
+     * enabled, output is discarded to maintain memory stability.
+     *
+     * @param streamOrViewName the stream or view to subscribe to
+     * @param listener         the callback to receive output messages
+     * @throws IllegalArgumentException if streamOrViewName or listener is null
+     */
+    public void subscribe(String streamOrViewName, OutputListener listener) {
+        if (streamOrViewName == null || listener == null) {
+            throw new IllegalArgumentException("streamOrViewName and listener must not be null");
+        }
+        subscriptions.put(streamOrViewName, listener);
+    }
+
+    /**
+     * Remove the subscription for a stream or view.
+     *
+     * <p>After unsubscribing, no further messages are forwarded to the
+     * previously registered listener. In streaming mode, subsequent output
+     * for this stream/view will be discarded.
+     *
+     * @param streamOrViewName the stream or view to unsubscribe from
+     */
+    public void unsubscribe(String streamOrViewName) {
+        if (streamOrViewName != null) {
+            subscriptions.remove(streamOrViewName);
+        }
+    }
+
+    /**
+     * Check whether a stream or view has an active subscriber.
+     *
+     * @param streamOrViewName the stream or view name
+     * @return true if there is an active listener
+     */
+    public boolean hasSubscriber(String streamOrViewName) {
+        return subscriptions.containsKey(streamOrViewName);
+    }
+
+    /**
+     * Enable or disable collect mode.
+     *
+     * <p>In collect mode:
+     * <ul>
+     *   <li>All messages (raw streams and materialized views) are stored in
+     *       the in-memory store</li>
+     *   <li>SELECT queries work on accumulated historical data</li>
+     *   <li>Suitable for notebooks, testing, and interactive exploration</li>
+     * </ul>
+     *
+     * <p>When collect mode is disabled (default), the runtime uses a
+     * subscription model: output is forwarded only to active subscribers
+     * and discarded otherwise. No internal lists grow over time, providing
+     * production-grade memory stability.
+     *
+     * <p>Plain VIEWs (non-materialized) never store output regardless of
+     * this setting.
+     *
+     * @param enabled true to enable collect mode (store all data)
+     */
+    public void setCollectMode(boolean enabled) {
+        this.collectMode = enabled;
+    }
+
+    /**
+     * Returns whether collect mode is enabled.
+     *
+     * @return true if collect mode is active (all data stored in memory)
+     */
+    public boolean isCollectMode() {
+        return collectMode;
     }
 
     // =================================================================
@@ -411,17 +515,31 @@ public class RtBotSqlRuntime {
     // =================================================================
 
     /**
-     * Append a message to a stream/view and propagate to all dependents.
+     * Append a message to a stream/view, notify subscribers, and propagate
+     * to all dependents.
      *
-     * <p>Plain VIEWs (non-materialized) do NOT store output — they only propagate
-     * to dependents. Only streams and MATERIALIZED VIEWs persist their output.
+     * <p>Storage behavior depends on collect mode:
+     * <ul>
+     *   <li><b>Collect mode ON:</b> All messages are stored in the in-memory
+     *       store. Suitable for notebooks and testing where SELECT queries
+     *       need access to all historical data.</li>
+     *   <li><b>Collect mode OFF (default):</b> Messages are forwarded to
+     *       active subscribers and discarded. No internal lists grow over
+     *       time — production-grade memory stability.</li>
+     * </ul>
+     *
+     * <p>When a subscriber is registered for a stream/view, the message is
+     * always forwarded to the listener — regardless of collect mode.
+     *
+     * <p>Plain VIEWs (non-materialized) never store output — they only
+     * propagate to dependents and subscribers.
      */
     private void appendAndPropagate(String streamName, long timestamp, List<Double> values) {
         ViewMeta view = catalog.lookupView(streamName);
         boolean isPlainView = (view != null
                 && EntityType.VIEW.name().equals(view.entityType));
 
-        if (!isPlainView) {
+        if (!isPlainView && collectMode) {
             store.append(streamName, timestamp, values);
 
             // Track keys for keyed views
@@ -431,6 +549,14 @@ public class RtBotSqlRuntime {
                     && view.keyIndex < values.size()) {
                 catalog.addKey(streamName, values.get(view.keyIndex));
             }
+        }
+
+        // Notify subscriber if one is registered for this stream/view.
+        // This follows the rtbot-redis pattern: output is forwarded to
+        // active subscribers in real time.
+        OutputListener listener = subscriptions.get(streamName);
+        if (listener != null) {
+            listener.onMessage(streamName, timestamp, values);
         }
 
         // Propagate to all dependent views
@@ -840,7 +966,7 @@ public class RtBotSqlRuntime {
     }
 
     /**
-     * Destroy all deployed pipelines and reset state.
+     * Destroy all deployed pipelines, clear subscriptions, and reset state.
      */
     public void destroyAll() {
         for (String pipelineId : viewPipelines.values()) {
@@ -853,5 +979,6 @@ public class RtBotSqlRuntime {
         viewPipelines.clear();
         viewPortMaps.clear();
         dependencies.clear();
+        subscriptions.clear();
     }
 }
