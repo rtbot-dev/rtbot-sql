@@ -1,6 +1,7 @@
 #include <emscripten/bind.h>
 
 #include <nlohmann/json.hpp>
+#include <regex>
 #include <string>
 
 #include "rtbot_sql/api/compiler.h"
@@ -11,6 +12,20 @@ using json = nlohmann::json;
 using namespace rtbot_sql;
 
 namespace {
+
+// Normalize RTBot SQL dialect keywords to their PostgreSQL equivalents so that
+// libpg_query (a PostgreSQL 17 grammar wrapper) can parse them successfully.
+// CREATE STREAM → CREATE TABLE, DROP STREAM → DROP TABLE.
+std::string normalize_sql(const std::string& sql) {
+  std::string out = sql;
+  static const std::regex kCreateStream(R"(\bCREATE\s+STREAM\b)",
+                                        std::regex::icase);
+  out = std::regex_replace(out, kCreateStream, "CREATE TABLE");
+  static const std::regex kDropStream(R"(\bDROP\s+STREAM\b)",
+                                      std::regex::icase);
+  out = std::regex_replace(out, kDropStream, "DROP TABLE");
+  return out;
+}
 
 // --- JSON serialization for CatalogSnapshot (input) ---
 
@@ -217,6 +232,7 @@ std::string compile_sql_json(const std::string& sql,
                              const std::string& catalog_json) {
   try {
     auto catalog = catalog_from_json(catalog_json);
+    // compile_sql already calls normalize_sql internally, so pass sql directly.
     auto result = api::compile_sql(sql, catalog);
     return result_to_json(result).dump();
   } catch (const std::exception& e) {
@@ -228,7 +244,7 @@ std::string compile_sql_json(const std::string& sql,
 
 std::string validate_sql(const std::string& sql) {
   try {
-    auto parse_result = parser::parse(sql);
+    auto parse_result = parser::parse(normalize_sql(sql));
     json j;
     j["valid"] = parse_result.ok();
     json errs = json::array();

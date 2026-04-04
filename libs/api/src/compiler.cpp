@@ -4,6 +4,7 @@
 #include <cmath>
 #include <limits>
 #include <map>
+#include <regex>
 #include <stdexcept>
 #include <string>
 #include <variant>
@@ -23,6 +24,17 @@
 namespace rtbot_sql::api {
 
 namespace {
+
+std::string normalize_sql(const std::string& sql) {
+  std::string out = sql;
+  static const std::regex kCreateStream(R"(\bCREATE\s+STREAM\b)",
+                                        std::regex::icase);
+  out = std::regex_replace(out, kCreateStream, "CREATE TABLE");
+  static const std::regex kDropStream(R"(\bDROP\s+STREAM\b)",
+                                      std::regex::icase);
+  out = std::regex_replace(out, kDropStream, "DROP TABLE");
+  return out;
+}
 
 CompilationResult make_error(const std::string& msg) {
   CompilationResult r{};
@@ -833,8 +845,10 @@ CompilationResult handle_drop(const parser::ast::DropStmt& stmt,
 
 CompilationResult compile_sql(const std::string& sql,
                               const CatalogSnapshot& catalog) {
+  const std::string normalized = normalize_sql(sql);
+
   // Step 1: Parse
-  auto parse_result = parser::parse(sql);
+  auto parse_result = parser::parse(normalized);
   if (!parse_result.ok()) {
     CompilationResult r{};
     for (const auto& err : parse_result.errors) {
@@ -845,7 +859,7 @@ CompilationResult compile_sql(const std::string& sql,
   }
 
   // Step 2: Get JSON parse tree and convert to AST
-  auto json_result = pg_query_parse(sql.c_str());
+  auto json_result = pg_query_parse(normalized.c_str());
   if (json_result.error) {
     auto r = make_error(json_result.error->message
                             ? json_result.error->message
@@ -903,8 +917,10 @@ Tier2FilterResult apply_tier2_filter(
     const std::vector<std::vector<double>>& input_rows, int limit) {
   Tier2FilterResult out;
 
+  const std::string normalized = normalize_sql(sql);
+
   // Parse and identify the statement
-  auto json_result = pg_query_parse(sql.c_str());
+  auto json_result = pg_query_parse(normalized.c_str());
   if (json_result.error) {
     pg_query_free_parse_result(json_result);
     out.rows = input_rows;

@@ -61,6 +61,17 @@ TEST(Parser, ParsesCreateMaterializedView) {
   free_result(r);
 }
 
+TEST(Parser, ParsesCreateStream) {
+  // The parser layer itself only wraps libpg_query; normalization lives in the
+  // compiler (compile_sql) and the browser bindings (validate_sql).  This test
+  // verifies that the normalized form ("CREATE TABLE") round-trips through the
+  // parser successfully — which is what callers produce after normalization.
+  auto r = parse("CREATE TABLE foo (t DOUBLE PRECISION)");
+  EXPECT_TRUE(r.ok());
+  EXPECT_GT(r.protobuf().len, 0u);
+  free_result(r);
+}
+
 TEST(Parser, ReturnsErrorForInvalidSQL) {
   auto r = parse("SELEC FROM WHERE");
   EXPECT_FALSE(r.ok());

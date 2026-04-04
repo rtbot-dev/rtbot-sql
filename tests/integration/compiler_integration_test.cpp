@@ -987,5 +987,26 @@ TEST_F(CompilerIntegrationTest, PresetRmsTrendPattern) {
   EXPECT_EQ(r.field_map.at("sample_count"), 4);
 }
 
+// --- CreateStreamSyntax: verify that the raw STREAM keyword is accepted ---
+
+TEST_F(CompilerIntegrationTest, CreateStreamSyntax) {
+  // compile_sql must normalize "CREATE STREAM" → "CREATE TABLE" internally
+  // before handing the SQL to libpg_query.  Pass the raw keyword directly
+  // (no external normalization) and assert the result is a CREATE_STREAM.
+  auto r = compile_sql(
+      "CREATE STREAM orders (id DOUBLE PRECISION, price DOUBLE PRECISION, "
+      "quantity DOUBLE PRECISION)",
+      catalog);
+
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  EXPECT_EQ(r.statement_type, StatementType::CREATE_STREAM);
+  EXPECT_EQ(r.entity_name, "orders");
+  ASSERT_EQ(r.stream_schema.columns.size(), 3u);
+  EXPECT_EQ(r.stream_schema.columns[0].name, "id");
+  EXPECT_EQ(r.stream_schema.columns[0].index, 0);
+  EXPECT_EQ(r.stream_schema.columns[1].name, "price");
+  EXPECT_EQ(r.stream_schema.columns[2].name, "quantity");
+}
+
 }  // namespace
 }  // namespace rtbot_sql::api
