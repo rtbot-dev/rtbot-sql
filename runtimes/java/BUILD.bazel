@@ -4,6 +4,49 @@ load("@rules_java//java:defs.bzl", "java_library", "java_test")
 package(default_visibility = ["//visibility:public"])
 
 # ---------------------------------------------------------------------------
+# Platform selectors used for native-resource classifier targets.
+# ---------------------------------------------------------------------------
+config_setting(
+    name = "is_linux_x86_64",
+    constraint_values = [
+        "@platforms//os:linux",
+        "@platforms//cpu:x86_64",
+    ],
+)
+
+config_setting(
+    name = "is_linux_aarch64",
+    constraint_values = [
+        "@platforms//os:linux",
+        "@platforms//cpu:aarch64",
+    ],
+)
+
+config_setting(
+    name = "is_macos_x86_64",
+    constraint_values = [
+        "@platforms//os:macos",
+        "@platforms//cpu:x86_64",
+    ],
+)
+
+config_setting(
+    name = "is_macos_aarch64",
+    constraint_values = [
+        "@platforms//os:macos",
+        "@platforms//cpu:aarch64",
+    ],
+)
+
+config_setting(
+    name = "is_windows_x86_64",
+    constraint_values = [
+        "@platforms//os:windows",
+        "@platforms//cpu:x86_64",
+    ],
+)
+
+# ---------------------------------------------------------------------------
 # JNI shared library — SQL compiler + pipeline execution
 #
 # Compiles rtbot_sql_jni.cpp against the RTBot SQL compiler API, the RTBot
@@ -25,6 +68,70 @@ cc_binary(
 )
 
 # ---------------------------------------------------------------------------
+# Native-resource "classifier" artifacts.
+#
+# These targets stage the JNI library into /native/<platform>/ inside a jar.
+# Publish pattern:
+#   - rtbot-sql-java            -> core API classes only
+#   - rtbot-sql-java-native-*   -> platform-specific native resources
+# Consumers include core + exactly one native target matching their platform.
+# ---------------------------------------------------------------------------
+genrule(
+    name = "rtbot_sql_jni_resource_linux_x86_64",
+    srcs = [":rtbot_sql_jni"],
+    outs = ["native/linux-x86_64/librtbot_sql_jni.so"],
+    cmd = "cp $< $@",
+    target_compatible_with = [
+        "@platforms//os:linux",
+        "@platforms//cpu:x86_64",
+    ],
+)
+
+genrule(
+    name = "rtbot_sql_jni_resource_linux_aarch64",
+    srcs = [":rtbot_sql_jni"],
+    outs = ["native/linux-aarch64/librtbot_sql_jni.so"],
+    cmd = "cp $< $@",
+    target_compatible_with = [
+        "@platforms//os:linux",
+        "@platforms//cpu:aarch64",
+    ],
+)
+
+genrule(
+    name = "rtbot_sql_jni_resource_mac_x86_64",
+    srcs = [":rtbot_sql_jni"],
+    outs = ["native/mac-x86_64/librtbot_sql_jni.dylib"],
+    cmd = "cp $< $@",
+    target_compatible_with = [
+        "@platforms//os:macos",
+        "@platforms//cpu:x86_64",
+    ],
+)
+
+genrule(
+    name = "rtbot_sql_jni_resource_mac_aarch64",
+    srcs = [":rtbot_sql_jni"],
+    outs = ["native/mac-aarch64/librtbot_sql_jni.dylib"],
+    cmd = "cp $< $@",
+    target_compatible_with = [
+        "@platforms//os:macos",
+        "@platforms//cpu:aarch64",
+    ],
+)
+
+genrule(
+    name = "rtbot_sql_jni_resource_win_x86_64",
+    srcs = [":rtbot_sql_jni"],
+    outs = ["native/win-x86_64/rtbot_sql_jni.dll"],
+    cmd = "cp $< $@",
+    target_compatible_with = [
+        "@platforms//os:windows",
+        "@platforms//cpu:x86_64",
+    ],
+)
+
+# ---------------------------------------------------------------------------
 # Java runtime library — the reusable RTBot SQL Java wrapper
 # Package: dev.rtbot.sql
 # ---------------------------------------------------------------------------
@@ -37,6 +144,92 @@ java_library(
     ],
 )
 
+java_library(
+    name = "rtbot-sql-java-native-linux-x86_64",
+    srcs = [],
+    resources = [":rtbot_sql_jni_resource_linux_x86_64"],
+    resource_strip_prefix = "runtimes/java",
+    target_compatible_with = [
+        "@platforms//os:linux",
+        "@platforms//cpu:x86_64",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+java_library(
+    name = "rtbot-sql-java-native-linux-aarch64",
+    srcs = [],
+    resources = [":rtbot_sql_jni_resource_linux_aarch64"],
+    resource_strip_prefix = "runtimes/java",
+    target_compatible_with = [
+        "@platforms//os:linux",
+        "@platforms//cpu:aarch64",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+java_library(
+    name = "rtbot-sql-java-native-mac-x86_64",
+    srcs = [],
+    resources = [":rtbot_sql_jni_resource_mac_x86_64"],
+    resource_strip_prefix = "runtimes/java",
+    target_compatible_with = [
+        "@platforms//os:macos",
+        "@platforms//cpu:x86_64",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+java_library(
+    name = "rtbot-sql-java-native-mac-aarch64",
+    srcs = [],
+    resources = [":rtbot_sql_jni_resource_mac_aarch64"],
+    resource_strip_prefix = "runtimes/java",
+    target_compatible_with = [
+        "@platforms//os:macos",
+        "@platforms//cpu:aarch64",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+java_library(
+    name = "rtbot-sql-java-native-win-x86_64",
+    srcs = [],
+    resources = [":rtbot_sql_jni_resource_win_x86_64"],
+    resource_strip_prefix = "runtimes/java",
+    target_compatible_with = [
+        "@platforms//os:windows",
+        "@platforms//cpu:x86_64",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+java_library(
+    name = "rtbot-sql-java-native-empty",
+    srcs = [],
+    visibility = ["//visibility:public"],
+)
+
+alias(
+    name = "rtbot-sql-java-native-host",
+    actual = select({
+        ":is_linux_x86_64": ":rtbot-sql-java-native-linux-x86_64",
+        ":is_linux_aarch64": ":rtbot-sql-java-native-linux-aarch64",
+        ":is_macos_x86_64": ":rtbot-sql-java-native-mac-x86_64",
+        ":is_macos_aarch64": ":rtbot-sql-java-native-mac-aarch64",
+        ":is_windows_x86_64": ":rtbot-sql-java-native-win-x86_64",
+        "//conditions:default": ":rtbot-sql-java-native-empty",
+    }),
+)
+
+java_library(
+    name = "rtbot-sql-java-runtime",
+    srcs = [],
+    exports = [":rtbot-sql-java"],
+    runtime_deps = [":rtbot-sql-java-native-host"],
+    visibility = ["//visibility:public"],
+)
+
 # ---------------------------------------------------------------------------
 # Integration tests — exercises the full JNI bridge + runtime
 # ---------------------------------------------------------------------------
@@ -44,10 +237,8 @@ java_test(
     name = "rtbot-sql-java-test",
     srcs = ["src/test/java/dev/rtbot/sql/RtBotSqlRuntimeTest.java"],
     test_class = "dev.rtbot.sql.RtBotSqlRuntimeTest",
-    jvm_flags = ["-Djava.library.path=runtimes/java"],
-    data = [":rtbot_sql_jni"],
     deps = [
-        ":rtbot-sql-java",
+        ":rtbot-sql-java-runtime",
         "@maven//:junit_junit",
         "@maven//:com_google_code_gson_gson",
     ],
@@ -65,11 +256,9 @@ java_test(
     name = "bearing-load-test",
     srcs = ["src/test/java/dev/rtbot/sql/BearingLoadTest.java"],
     test_class = "dev.rtbot.sql.BearingLoadTest",
-    jvm_flags = ["-Djava.library.path=runtimes/java"],
-    data = [":rtbot_sql_jni"],
     timeout = "long",
     deps = [
-        ":rtbot-sql-java",
+        ":rtbot-sql-java-runtime",
         "@maven//:junit_junit",
         "@maven//:com_google_code_gson_gson",
     ],
