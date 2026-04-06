@@ -1,6 +1,11 @@
 # Output to dist/ instead of bazel-bin/, bazel-out/, etc.
 build --symlink_prefix=dist/
 
+# Default to optimized binaries for all workflows.
+build --compilation_mode=opt
+test --compilation_mode=opt
+run --compilation_mode=opt
+
 # Workspace status: derive version metadata from git tags/commit
 build --workspace_status_command=./tools/workspace_status.sh
 
