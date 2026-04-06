@@ -16,6 +16,9 @@ scipy~=1.13
 # Dataset download and caching (download-on-first-use, outside repo)
 pooch~=1.8
 
+# OPC UA client for Ignition tag writes (IMS live demo publisher)
+asyncua~=1.1
+
 # Kaggle CLI for IMS dataset download (requires ~/.kaggle/kaggle.json)
 # Install manually if you need it: pip install kaggle
 # kaggle~=1.6
