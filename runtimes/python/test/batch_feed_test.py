@@ -306,8 +306,12 @@ class FeedBatchCorrectnessTest(unittest.TestCase):
         [[10.0, 1.5, 15.0, 1.0], [11.0, 2.5, 27.5, 0.0]],
     )
 
-  def test_multi_source_view_fallback(self):
-    """Multi-source ASOF views fall back to row-by-row correctly."""
+  def test_multi_source_view_non_matching_timestamps(self):
+    """Multi-source view with non-matching timestamps produces no output.
+
+    RTBot operators synchronize on timestamps internally. The runtime simply
+    routes each source's messages to the correct input port.
+    """
     sql = rtbot_sql.RtBotSql()
     sql.execute("CREATE STREAM btc (price DOUBLE)")
     sql.execute("CREATE STREAM eth (price DOUBLE)")
@@ -323,6 +327,34 @@ class FeedBatchCorrectnessTest(unittest.TestCase):
     })
     df_eth = pd.DataFrame({
         "time": [1700000002000, 1700000004000],
+        "price": [95.0, 95.0],
+    })
+    sql.insert_dataframe("btc", df_btc)
+    sql.insert_dataframe("eth", df_eth)
+
+    result = sql.execute("SELECT * FROM cross_stats LIMIT 10")
+    columns, rows = _columns_and_rows(result)
+
+    self.assertEqual(columns, ["time", "btc_price", "eth_price", "spread"])
+    self.assertEqual(rows, [])
+
+  def test_multi_source_view_matching_timestamps(self):
+    """Multi-source view with matching timestamps produces correct output."""
+    sql = rtbot_sql.RtBotSql()
+    sql.execute("CREATE STREAM btc (price DOUBLE)")
+    sql.execute("CREATE STREAM eth (price DOUBLE)")
+    sql.execute(
+        "CREATE MATERIALIZED VIEW cross_stats AS "
+        "SELECT b.price AS btc_price, e.price AS eth_price, b.price - e.price AS spread "
+        "FROM btc b, eth e"
+    )
+
+    df_btc = pd.DataFrame({
+        "time": [1700000001000, 1700000003000],
+        "price": [100.0, 101.0],
+    })
+    df_eth = pd.DataFrame({
+        "time": [1700000001000, 1700000003000],
         "price": [95.0, 95.0],
     })
     sql.insert_dataframe("btc", df_btc)

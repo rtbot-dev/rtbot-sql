@@ -56,25 +56,6 @@ public class InMemoryStreamStore {
     }
 
     /**
-     * Read the latest message with timestamp &le; the given timestamp.
-     *
-     * @param streamName the stream to search
-     * @param timestamp  upper bound (inclusive)
-     * @return the latest matching message, or {@code null} if none found
-     */
-    public Message readLatestBefore(String streamName, long timestamp) {
-        List<Message> data = streams.get(streamName);
-        if (data == null) return null;
-        for (int i = data.size() - 1; i >= 0; i--) {
-            Message msg = data.get(i);
-            if (msg.timestamp <= timestamp) {
-                return new Message(msg.timestamp, new ArrayList<>(msg.values));
-            }
-        }
-        return null;
-    }
-
-    /**
      * Read the latest message per key from a keyed view.
      *
      * <p>Scans backwards through the stream to find the most recent message

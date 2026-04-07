@@ -170,8 +170,8 @@ class RuntimeLifecycleTest(unittest.TestCase):
     sql.insert_dataframe(
         "eth",
         [
-            {"time": 1700000002000, "price": 95.0},
-            {"time": 1700000004000, "price": 95.0},
+            {"time": 1700000001000, "price": 95.0},
+            {"time": 1700000003000, "price": 95.0},
         ],
     )
 
@@ -184,7 +184,12 @@ class RuntimeLifecycleTest(unittest.TestCase):
         [[100.0, 95.0, 5.0], [101.0, 95.0, 6.0]],
     )
 
-  def test_multi_from_ephemeral_select_asof_correlation(self):
+  def test_multi_from_non_matching_timestamps_produce_no_output(self):
+    """Non-matching timestamps across streams produce no output.
+
+    RTBot operators synchronize on timestamps. When stream A sends at t=1000
+    and stream B at t=1200, no timestamp matches, so no output is produced.
+    """
     sql = rtbot_sql.RtBotSql()
 
     sql.execute("CREATE STREAM btc (price DOUBLE PRECISION)")
@@ -202,9 +207,34 @@ class RuntimeLifecycleTest(unittest.TestCase):
     columns, rows = _columns_and_rows(result)
 
     self.assertEqual(columns, ["time", "btc_price", "eth_price", "spread"])
+    self.assertEqual(rows, [])
+
+  def test_multi_from_matching_timestamps_produce_output(self):
+    """Matching timestamps across streams produce correct combined output."""
+    sql = rtbot_sql.RtBotSql()
+
+    sql.execute("CREATE STREAM btc (price DOUBLE PRECISION)")
+    sql.execute("CREATE STREAM eth (price DOUBLE PRECISION)")
+
+    sql.insert_dataframe("btc", [
+        {"time": 1000, "price": 100.0},
+        {"time": 2000, "price": 102.0},
+    ])
+    sql.insert_dataframe("eth", [
+        {"time": 1000, "price": 95.0},
+        {"time": 2000, "price": 97.0},
+    ])
+
+    result = sql.execute(
+        "SELECT b.price AS btc_price, e.price AS eth_price, "
+        "b.price - e.price AS spread FROM btc b, eth e LIMIT 10"
+    )
+    columns, rows = _columns_and_rows(result)
+
+    self.assertEqual(columns, ["time", "btc_price", "eth_price", "spread"])
     self.assertEqual(
         [row[1:] for row in rows],
-        [[100.0, 95.0, 5.0], [102.0, 95.0, 7.0], [102.0, 97.0, 5.0]],
+        [[100.0, 95.0, 5.0], [102.0, 97.0, 5.0]],
     )
 
   def test_filtered_select_on_materialized_view(self):

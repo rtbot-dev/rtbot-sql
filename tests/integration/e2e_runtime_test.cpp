@@ -1257,5 +1257,173 @@ TEST_F(E2eRuntimeTest, SegmentGroupByLongSegment) {
   EXPECT_DOUBLE_EQ(out[cnt_idx], (double)num_active);  // COUNT = 100
 }
 
+// ===========================================================================
+// Multi-stream timestamp synchronization tests
+//
+// These tests verify that the compiled RTBot program enforces strict timestamp
+// synchronization for multi-source views. When two streams feed into a
+// cross-join, output is produced ONLY when both streams send data at the SAME
+// timestamp. Messages at non-matching timestamps are buffered by the operator
+// and never combined — no output is produced.
+//
+// This is a critical architectural guarantee: the program controls time
+// alignment, not the runtime. If the user wants to combine streams with
+// different timestamps, they must explicitly declare how (windowing,
+// resampling, etc.) in their SQL.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// T-sync-1: Non-matching timestamps produce no output
+//
+// Stream A sends at t=300, t=500, t=700.
+// Stream B sends at t=400, t=600, t=800.
+// No timestamp ever matches → no output from the cross-join.
+// ---------------------------------------------------------------------------
+
+TEST_F(E2eRuntimeTest, MultiStreamNonMatchingTimestampsProduceNoOutput) {
+  StreamSchema stream_a{"stream_a", {{"value", 0}}};
+  StreamSchema stream_b{"stream_b", {{"value", 0}}};
+  catalog.streams["stream_a"] = stream_a;
+  catalog.streams["stream_b"] = stream_b;
+
+  auto r = compile(
+      "CREATE MATERIALIZED VIEW combined AS "
+      "SELECT a.value AS val_a, b.value AS val_b, "
+      "a.value + b.value AS total "
+      "FROM stream_a a, stream_b b");
+
+  ASSERT_EQ(r.source_streams.size(), 2u);
+  rtbot::Program program(r.program_json);
+
+  size_t total_outputs = 0;
+
+  // Interleave messages with non-matching timestamps
+  total_outputs += count_outputs(program.receive(make_msg(300, {10.0}), "i1"));
+  total_outputs += count_outputs(program.receive(make_msg(400, {20.0}), "i2"));
+  total_outputs += count_outputs(program.receive(make_msg(500, {30.0}), "i1"));
+  total_outputs += count_outputs(program.receive(make_msg(600, {40.0}), "i2"));
+  total_outputs += count_outputs(program.receive(make_msg(700, {50.0}), "i1"));
+  total_outputs += count_outputs(program.receive(make_msg(800, {60.0}), "i2"));
+
+  EXPECT_EQ(total_outputs, 0u)
+      << "Non-matching timestamps must never produce output. "
+         "The program synchronizes on timestamps — if stream A sends at t=300 "
+         "and stream B sends at t=400, the Addition operator waits for a "
+         "matching timestamp on the other port that never arrives.";
+}
+
+// ---------------------------------------------------------------------------
+// T-sync-2: Matching timestamps produce correct output
+//
+// Both streams send at the same timestamps (t=1000, t=2000, t=3000).
+// Each pair should produce output with the correct combined values.
+// ---------------------------------------------------------------------------
+
+TEST_F(E2eRuntimeTest, MultiStreamMatchingTimestampsProduceOutput) {
+  StreamSchema stream_a{"stream_a", {{"value", 0}}};
+  StreamSchema stream_b{"stream_b", {{"value", 0}}};
+  catalog.streams["stream_a"] = stream_a;
+  catalog.streams["stream_b"] = stream_b;
+
+  auto r = compile(
+      "CREATE MATERIALIZED VIEW combined AS "
+      "SELECT a.value AS val_a, b.value AS val_b, "
+      "a.value + b.value AS total "
+      "FROM stream_a a, stream_b b");
+
+  int a_idx = r.field_map.at("val_a");
+  int b_idx = r.field_map.at("val_b");
+  int total_idx = r.field_map.at("total");
+
+  rtbot::Program program(r.program_json);
+
+  struct TestCase {
+    rtbot::timestamp_t t;
+    double a_val;
+    double b_val;
+  };
+  std::vector<TestCase> cases = {
+      {1000, 10.0, 20.0},
+      {2000, 30.0, 40.0},
+      {3000, 50.0, 60.0},
+  };
+
+  for (const auto& tc : cases) {
+    auto batch_a = program.receive(make_msg(tc.t, {tc.a_val}), "i1");
+    auto batch_b = program.receive(make_msg(tc.t, {tc.b_val}), "i2");
+
+    size_t outputs = count_outputs(batch_a) + count_outputs(batch_b);
+    ASSERT_GT(outputs, 0u)
+        << "Matching timestamp t=" << tc.t << " must produce output";
+
+    auto out = extract_output(batch_b);
+    if (out.empty()) out = extract_output(batch_a);
+    ASSERT_FALSE(out.empty());
+
+    EXPECT_DOUBLE_EQ(out[a_idx], tc.a_val)
+        << "val_a mismatch at t=" << tc.t;
+    EXPECT_DOUBLE_EQ(out[b_idx], tc.b_val)
+        << "val_b mismatch at t=" << tc.t;
+    EXPECT_DOUBLE_EQ(out[total_idx], tc.a_val + tc.b_val)
+        << "total mismatch at t=" << tc.t;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// T-sync-3: Mixed matching and non-matching timestamps
+//
+// Only the timestamps where both streams have data should produce output.
+// Timestamps where only one stream fires should produce nothing.
+// ---------------------------------------------------------------------------
+
+TEST_F(E2eRuntimeTest, MultiStreamMixedTimestamps) {
+  StreamSchema stream_a{"stream_a", {{"value", 0}}};
+  StreamSchema stream_b{"stream_b", {{"value", 0}}};
+  catalog.streams["stream_a"] = stream_a;
+  catalog.streams["stream_b"] = stream_b;
+
+  auto r = compile(
+      "CREATE MATERIALIZED VIEW combined AS "
+      "SELECT a.value AS val_a, b.value AS val_b "
+      "FROM stream_a a, stream_b b");
+
+  int a_idx = r.field_map.at("val_a");
+  int b_idx = r.field_map.at("val_b");
+
+  rtbot::Program program(r.program_json);
+
+  // t=100: only A fires → no output
+  auto b1 = program.receive(make_msg(100, {1.0}), "i1");
+  EXPECT_EQ(count_outputs(b1), 0u) << "t=100: only A sent, no output expected";
+
+  // t=200: only B fires → no output
+  auto b2 = program.receive(make_msg(200, {2.0}), "i2");
+  EXPECT_EQ(count_outputs(b2), 0u) << "t=200: only B sent, no output expected";
+
+  // t=300: both fire → output expected
+  auto b3a = program.receive(make_msg(300, {3.0}), "i1");
+  auto b3b = program.receive(make_msg(300, {30.0}), "i2");
+  size_t out_300 = count_outputs(b3a) + count_outputs(b3b);
+  ASSERT_GT(out_300, 0u) << "t=300: both streams sent, output expected";
+  auto out3 = extract_output(b3b);
+  if (out3.empty()) out3 = extract_output(b3a);
+  EXPECT_DOUBLE_EQ(out3[a_idx], 3.0);
+  EXPECT_DOUBLE_EQ(out3[b_idx], 30.0);
+
+  // t=400: only A fires → no output
+  auto b4 = program.receive(make_msg(400, {4.0}), "i1");
+  EXPECT_EQ(count_outputs(b4), 0u) << "t=400: only A sent, no output expected";
+
+  // t=500: both fire → output expected
+  auto b5a = program.receive(make_msg(500, {5.0}), "i1");
+  auto b5b = program.receive(make_msg(500, {50.0}), "i2");
+  size_t out_500 = count_outputs(b5a) + count_outputs(b5b);
+  ASSERT_GT(out_500, 0u) << "t=500: both streams sent, output expected";
+  auto out5 = extract_output(b5b);
+  if (out5.empty()) out5 = extract_output(b5a);
+  EXPECT_DOUBLE_EQ(out5[a_idx], 5.0);
+  EXPECT_DOUBLE_EQ(out5[b_idx], 50.0);
+}
+
 }  // namespace
 }  // namespace rtbot_sql::api

@@ -172,54 +172,19 @@ class RtBotSql:
     self._view_port_maps[name] = source_port_map
 
     # Backfill the new view from already-known source data.
-    if self._uses_snapshot_sync(name):
-      source_rank = {source: i for i, source in enumerate(view_meta.source_streams)}
-      events = []
-      for source in view_meta.source_streams:
-        for msg in self._store.read(source):
-          events.append((msg.timestamp, source_rank[source], source, msg.values))
-      events.sort(key=lambda item: (item[0], item[1]))
+    # Uses interleaved replay (all sources sorted by global timestamp)
+    # to preserve temporal ordering that RTBot operators expect.
+    events = []
+    for i, source in enumerate(view_meta.source_streams):
+      port = source_port_map.get(source, f"i{i + 1}")
+      for msg in self._store.read(source):
+        events.append((msg.timestamp, i, port, msg.values))
+    events.sort(key=lambda item: (item[0], item[1]))
 
-      history: Dict[str, List[Any]] = {source: [] for source in view_meta.source_streams}
-      for timestamp, _, trigger_source, trigger_values in events:
-        history[trigger_source].append((timestamp, list(trigger_values)))
-
-        snapshot: Dict[str, List[float]] = {}
-        ready = True
-        for source in view_meta.source_streams:
-          if source == trigger_source:
-            snapshot[source] = list(trigger_values)
-            continue
-
-          prior = None
-          for prior_timestamp, prior_values in reversed(history[source]):
-            if prior_timestamp <= timestamp:
-              prior = prior_values
-              break
-
-          if prior is None:
-            ready = False
-            break
-
-          snapshot[source] = list(prior)
-
-        if not ready:
-          continue
-
-        outputs = []
-        for source in view_meta.source_streams:
-          port = source_port_map.get(source, "i1")
-          outputs.extend(self._runner.feed(pipeline_id, timestamp, snapshot[source], port=port))
-
-        for out in outputs:
-          self._append_and_propagate(name, out.timestamp, out.values)
-    else:
-      for i, source in enumerate(view_meta.source_streams):
-        port = f"i{i + 1}"
-        for msg in self._store.read(source):
-          outputs = self._runner.feed(pipeline_id, msg.timestamp, msg.values, port=port)
-          for out in outputs:
-            self._append_and_propagate(name, out.timestamp, out.values)
+    for timestamp, _, port, values in events:
+      outputs = self._runner.feed(pipeline_id, timestamp, values, port=port)
+      for out in outputs:
+        self._append_and_propagate(name, out.timestamp, out.values)
 
   def _handle_drop(self, result: native.CompilationResult) -> None:
     name = result.drop_entity_name
@@ -237,17 +202,6 @@ class RtBotSql:
 
     self._dependencies.pop(name, None)
 
-  def _uses_snapshot_sync(self, dependent: str) -> bool:
-    view = self._catalog.lookup_view(dependent)
-    if view is None or len(view.source_streams) <= 1:
-      return False
-
-    for source in view.source_streams:
-      if self._catalog.lookup_stream(source) is None:
-        return False
-
-    return True
-
   def _feed_dependent_pipeline(
       self,
       dependent: str,
@@ -255,36 +209,18 @@ class RtBotSql:
       timestamp: int,
       values: List[float],
   ) -> List[Any]:
+    """Feed a message to a dependent pipeline on its assigned input port.
+
+    The compiled RTBot program handles all time synchronization internally.
+    The runtime simply routes each source's messages to the correct port.
+    """
     pipeline_id = self._view_pipelines.get(dependent)
     if pipeline_id is None:
       return []
 
     port_map = self._view_port_maps.get(dependent, {})
-
-    if not self._uses_snapshot_sync(dependent):
-      port = port_map.get(stream_name, "i1")
-      return self._runner.feed(pipeline_id, timestamp, values, port=port)
-
-    view = self._catalog.lookup_view(dependent)
-    if view is None:
-      return []
-
-    snapshot: Dict[str, List[float]] = {}
-    for source in view.source_streams:
-      if source == stream_name:
-        snapshot[source] = list(values)
-        continue
-
-      prior = self._store.read_latest_before(source, timestamp)
-      if prior is None:
-        return []
-      snapshot[source] = list(prior.values)
-
-    outputs = []
-    for source in view.source_streams:
-      port = port_map.get(source, "i1")
-      outputs.extend(self._runner.feed(pipeline_id, timestamp, snapshot[source], port=port))
-    return outputs
+    port = port_map.get(stream_name, "i1")
+    return self._runner.feed(pipeline_id, timestamp, values, port=port)
 
   def _append_and_propagate(self, stream_name: str, timestamp: int, values: List[float]) -> None:
     # Only store output for streams and materialized views.
@@ -446,32 +382,18 @@ class RtBotSql:
           time_column=self._time_column_name,
       )
 
-    inputs: List[Tuple[int, List[float], str]] = []
-    uses_snapshot_sync = (
-        len(runtime_result.source_streams) > 1
-        and all(self._catalog.lookup_stream(source) is not None for source in runtime_result.source_streams)
-    )
-
-    if uses_snapshot_sync:
-      source_rank = {source: i for i, source in enumerate(runtime_result.source_streams)}
-      events: List[Tuple[int, int, str, List[float]]] = []
-      for source in runtime_result.source_streams:
-        for msg in self._store.read(source):
-          events.append((msg.timestamp, source_rank[source], source, list(msg.values)))
-      events.sort(key=lambda item: (item[0], item[1]))
-
-      latest_by_source: Dict[str, List[float]] = {}
-      for timestamp, _, trigger_source, trigger_values in events:
-        latest_by_source[trigger_source] = list(trigger_values)
-        if len(latest_by_source) < len(runtime_result.source_streams):
-          continue
-
-        for i, source in enumerate(runtime_result.source_streams):
-          inputs.append((timestamp, list(latest_by_source[source]), f"i{i + 1}"))
-    else:
-      for i, source in enumerate(runtime_result.source_streams):
-        port = f"i{i + 1}"
-        inputs.extend((msg.timestamp, msg.values, port) for msg in self._store.read(source))
+    # Interleaved replay: collect all source events sorted by (timestamp, source_rank).
+    # The compiled RTBot program handles timestamp synchronization internally —
+    # operators only combine values sharing the exact same timestamp.
+    events: List[Tuple[int, int, str, List[float]]] = []
+    for i, source in enumerate(runtime_result.source_streams):
+      port = f"i{i + 1}"
+      for msg in self._store.read(source):
+        events.append((msg.timestamp, i, port, list(msg.values)))
+    events.sort(key=lambda item: (item[0], item[1]))
+    inputs: List[Tuple[int, List[float], str]] = [
+        (ts, vals, port) for ts, _, port, vals in events
+    ]
 
     outputs = self._runner.run_once(runtime_result.program_json, inputs)
     timestamps = [out.timestamp for out in outputs]
@@ -607,40 +529,37 @@ class RtBotSql:
     row_count = len(timestamps)
 
     # Store raw stream data if requested (needed for backfill on view creation
-    # and for multi-source ASOF correlation lookups).
+    # and for multi-source interleaved replay).
     if store_raw:
       for i in range(row_count):
         self._store.append(stream_name, int(timestamps[i]), value_cols[i].tolist())
 
-    # Classify dependents into single-source (batchable) and multi-source (row-by-row)
+    # Feed all dependent views. Single-source views use batch path (one C++
+    # call). Multi-source views use row-by-row since each row must be routed
+    # to the correct input port independently.
     dependents = list(self._dependencies.get(stream_name, set()))
-    single_source_deps = []
-    multi_source_deps = []
 
     for dep in dependents:
-      if self._uses_snapshot_sync(dep):
-        multi_source_deps.append(dep)
-      else:
-        single_source_deps.append(dep)
-
-    # Fast path: batch-feed single-source views (one C++ call per view)
-    for dep in single_source_deps:
       pipeline_id = self._view_pipelines.get(dep)
       if pipeline_id is None:
         continue
       port_map = self._view_port_maps.get(dep, {})
       port = port_map.get(stream_name, "i1")
-      outputs = self._runner.feed_batch(pipeline_id, timestamps, value_cols, port=port)
-      for out in outputs:
-        self._append_and_propagate(dep, out.timestamp, out.values)
 
-    # Slow path: multi-source views need row-by-row for ASOF lookup
-    if multi_source_deps:
-      for i in range(row_count):
-        ts_i = int(timestamps[i])
-        vals_i = value_cols[i].tolist()
-        for dep in multi_source_deps:
-          outputs = self._feed_dependent_pipeline(dep, stream_name, ts_i, vals_i)
+      view = self._catalog.lookup_view(dep)
+      is_multi_source = view is not None and len(view.source_streams) > 1
+
+      if not is_multi_source:
+        # Batch path: one C++ call for all rows
+        outputs = self._runner.feed_batch(pipeline_id, timestamps, value_cols, port=port)
+        for out in outputs:
+          self._append_and_propagate(dep, out.timestamp, out.values)
+      else:
+        # Row-by-row: each message routed to its port independently
+        for i in range(row_count):
+          ts_i = int(timestamps[i])
+          vals_i = value_cols[i].tolist()
+          outputs = self._runner.feed(pipeline_id, ts_i, vals_i, port=port)
           for out in outputs:
             self._append_and_propagate(dep, out.timestamp, out.values)
 

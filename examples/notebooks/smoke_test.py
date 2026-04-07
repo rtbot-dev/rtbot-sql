@@ -240,8 +240,12 @@ def test_multi_column_group_by_scenario():
     print("PASS\n")
 
 
-def test_multi_from_correlation_asof():
-    """Cross-stream SQL should correlate with latest values from both streams."""
+def test_multi_from_non_matching_timestamps():
+    """Non-matching timestamps across streams produce no output.
+
+    RTBot operators synchronize on timestamps. When stream A sends at t=1000
+    and stream B at t=1200, no timestamp matches, so no output is produced.
+    """
     sql = RtBotSql()
 
     sql.execute("CREATE STREAM btc_trades (price DOUBLE PRECISION)")
@@ -256,11 +260,38 @@ def test_multi_from_correlation_asof():
         "SELECT b.price AS btc_price, e.price AS eth_price, "
         "b.price - e.price AS spread FROM btc_trades b, eth_trades e LIMIT 10"
     )
-    print("=== Multi-FROM correlation (ASOF) ===")
+    print("=== Multi-FROM non-matching timestamps ===")
     print(result)
     assert list(result.columns)[0] == "time", "Expected time column"
-    assert len(result) == 3, f"Expected 3 correlated rows, got {len(result)}"
-    assert result["spread"].tolist() == [5.0, 7.0, 5.0], "Unexpected spread sequence"
+    assert len(result) == 0, f"Expected 0 rows (non-matching timestamps), got {len(result)}"
+    print("PASS\n")
+
+
+def test_multi_from_matching_timestamps():
+    """Matching timestamps across streams produce correct combined output."""
+    sql = RtBotSql()
+
+    sql.execute("CREATE STREAM btc_trades (price DOUBLE PRECISION)")
+    sql.execute("CREATE STREAM eth_trades (price DOUBLE PRECISION)")
+
+    sql.insert_dataframe("btc_trades", [
+        {"time": 1000, "price": 100.0},
+        {"time": 2000, "price": 102.0},
+    ])
+    sql.insert_dataframe("eth_trades", [
+        {"time": 1000, "price": 95.0},
+        {"time": 2000, "price": 97.0},
+    ])
+
+    result = sql.execute(
+        "SELECT b.price AS btc_price, e.price AS eth_price, "
+        "b.price - e.price AS spread FROM btc_trades b, eth_trades e LIMIT 10"
+    )
+    print("=== Multi-FROM matching timestamps ===")
+    print(result)
+    assert list(result.columns)[0] == "time", "Expected time column"
+    assert len(result) == 2, f"Expected 2 correlated rows, got {len(result)}"
+    assert result["spread"].tolist() == [5.0, 5.0], "Unexpected spread sequence"
     print("PASS\n")
 
 
@@ -273,7 +304,8 @@ if __name__ == "__main__":
         test_having_clause,
         test_insert_dataframe,
         test_multi_column_group_by_scenario,
-        test_multi_from_correlation_asof,
+        test_multi_from_non_matching_timestamps,
+        test_multi_from_matching_timestamps,
     ]
 
     passed = 0

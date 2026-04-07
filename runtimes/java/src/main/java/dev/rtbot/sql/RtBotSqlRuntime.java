@@ -348,129 +348,51 @@ public class RtBotSqlRuntime {
         }
         viewPortMaps.put(name, sourcePortMap);
 
-        // Backfill the new view from already-known source data
-        if (usesSnapshotSync(name)) {
-            backfillWithSnapshotSync(name, viewMeta, sourcePortMap, pipelineId);
-        } else {
-            backfillSimple(name, viewMeta, sourcePortMap, pipelineId);
-        }
+        // Backfill the new view from already-known source data.
+        // Uses interleaved replay (all sources sorted by global timestamp)
+        // to preserve temporal ordering that RTBot operators expect.
+        backfillInterleaved(name, viewMeta, sourcePortMap, pipelineId);
     }
 
     /**
-     * Backfill a view using ASOF snapshot synchronization for multi-source views.
+     * Backfill a view by replaying all source messages in global timestamp order.
      *
-     * <p>Replays all source events in timestamp order. At each event, builds a
-     * snapshot from all sources (using the latest value at or before the event
-     * timestamp for non-trigger sources). Only feeds when all sources have data.
+     * <p>Interleaved replay preserves the temporal ordering that RTBot operators
+     * expect. Each message is fed to the program on its assigned input port —
+     * the program's own time synchronization determines when output is produced.
      */
-    private void backfillWithSnapshotSync(String name, ViewMeta viewMeta,
-                                          Map<String, String> sourcePortMap, String pipelineId) {
-        // Assign rank to each source for deterministic ordering at same timestamp
-        Map<String, Integer> sourceRank = new HashMap<>();
-        for (int i = 0; i < viewMeta.sourceStreams.size(); i++) {
-            sourceRank.put(viewMeta.sourceStreams.get(i), i);
-        }
-
-        // Collect all events from all sources
-        List<long[]> eventTimestamps = new ArrayList<>(); // [timestamp, rank]
-        List<String> eventSources = new ArrayList<>();
+    private void backfillInterleaved(String name, ViewMeta viewMeta,
+                                     Map<String, String> sourcePortMap, String pipelineId) {
+        // Collect all events from all sources with their port assignments
+        List<long[]> eventKeys = new ArrayList<>(); // [timestamp, sourceIndex]
+        List<String> eventPorts = new ArrayList<>();
         List<List<Double>> eventValues = new ArrayList<>();
 
-        for (String source : viewMeta.sourceStreams) {
-            int rank = sourceRank.get(source);
+        for (int i = 0; i < viewMeta.sourceStreams.size(); i++) {
+            String source = viewMeta.sourceStreams.get(i);
+            String port = sourcePortMap.getOrDefault(source, "i" + (i + 1));
             for (Message msg : store.read(source)) {
-                eventTimestamps.add(new long[]{msg.timestamp, rank});
-                eventSources.add(source);
+                eventKeys.add(new long[]{msg.timestamp, i});
+                eventPorts.add(port);
                 eventValues.add(new ArrayList<>(msg.values));
             }
         }
 
-        // Sort by (timestamp, rank)
-        Integer[] indices = new Integer[eventTimestamps.size()];
+        // Sort by (timestamp, sourceIndex) for deterministic ordering
+        Integer[] indices = new Integer[eventKeys.size()];
         for (int i = 0; i < indices.length; i++) indices[i] = i;
         java.util.Arrays.sort(indices, (a, b) -> {
-            long[] ea = eventTimestamps.get(a);
-            long[] eb = eventTimestamps.get(b);
+            long[] ea = eventKeys.get(a);
+            long[] eb = eventKeys.get(b);
             if (ea[0] != eb[0]) return Long.compare(ea[0], eb[0]);
             return Long.compare(ea[1], eb[1]);
         });
 
-        // Replay in order, building history and snapshots
-        // history: source -> list of (timestamp, values)
-        Map<String, List<long[]>> historyTimestamps = new HashMap<>();
-        Map<String, List<List<Double>>> historyValues = new HashMap<>();
-        for (String source : viewMeta.sourceStreams) {
-            historyTimestamps.put(source, new ArrayList<>());
-            historyValues.put(source, new ArrayList<>());
-        }
-
         for (int idx : indices) {
-            long timestamp = eventTimestamps.get(idx)[0];
-            String triggerSource = eventSources.get(idx);
-            List<Double> triggerValues = eventValues.get(idx);
-
-            // Append to history
-            historyTimestamps.get(triggerSource).add(new long[]{timestamp});
-            historyValues.get(triggerSource).add(new ArrayList<>(triggerValues));
-
-            // Build snapshot: for each source, find the latest values at or before timestamp
-            Map<String, List<Double>> snapshot = new LinkedHashMap<>();
-            boolean ready = true;
-
-            for (String source : viewMeta.sourceStreams) {
-                if (source.equals(triggerSource)) {
-                    snapshot.put(source, new ArrayList<>(triggerValues));
-                    continue;
-                }
-
-                // Find latest prior value from history
-                List<long[]> srcTimestamps = historyTimestamps.get(source);
-                List<List<Double>> srcValues = historyValues.get(source);
-                List<Double> prior = null;
-
-                for (int j = srcTimestamps.size() - 1; j >= 0; j--) {
-                    if (srcTimestamps.get(j)[0] <= timestamp) {
-                        prior = srcValues.get(j);
-                        break;
-                    }
-                }
-
-                if (prior == null) {
-                    ready = false;
-                    break;
-                }
-
-                snapshot.put(source, new ArrayList<>(prior));
-            }
-
-            if (!ready) continue;
-
-            // Feed all sources in order to the pipeline
-            List<OutputMessage> outputs = new ArrayList<>();
-            for (String source : viewMeta.sourceStreams) {
-                String port = sourcePortMap.getOrDefault(source, "i1");
-                outputs.addAll(runner.feed(pipelineId, timestamp, snapshot.get(source), port));
-            }
-
+            List<OutputMessage> outputs = runner.feed(
+                    pipelineId, eventKeys.get(idx)[0], eventValues.get(idx), eventPorts.get(idx));
             for (OutputMessage out : outputs) {
                 appendAndPropagate(name, out.timestamp, out.values);
-            }
-        }
-    }
-
-    /**
-     * Simple backfill: replay each source's messages sequentially.
-     */
-    private void backfillSimple(String name, ViewMeta viewMeta,
-                                Map<String, String> sourcePortMap, String pipelineId) {
-        for (int i = 0; i < viewMeta.sourceStreams.size(); i++) {
-            String source = viewMeta.sourceStreams.get(i);
-            String port = "i" + (i + 1);
-            for (Message msg : store.read(source)) {
-                List<OutputMessage> outputs = runner.feed(pipelineId, msg.timestamp, msg.values, port);
-                for (OutputMessage out : outputs) {
-                    appendAndPropagate(name, out.timestamp, out.values);
-                }
             }
         }
     }
@@ -573,8 +495,10 @@ public class RtBotSqlRuntime {
     }
 
     /**
-     * Feed a message to a dependent pipeline, using ASOF snapshot sync for
-     * multi-source views.
+     * Feed a message to a dependent pipeline on its assigned input port.
+     *
+     * <p>The compiled RTBot program handles all time synchronization internally.
+     * The runtime simply routes each source's messages to the correct port.
      */
     private List<OutputMessage> feedDependentPipeline(String dependent, String streamName,
                                                       long timestamp, List<Double> values) {
@@ -582,55 +506,8 @@ public class RtBotSqlRuntime {
         if (pipelineId == null) return Collections.emptyList();
 
         Map<String, String> portMap = viewPortMaps.getOrDefault(dependent, Collections.emptyMap());
-
-        // Simple case: single source or non-stream sources
-        if (!usesSnapshotSync(dependent)) {
-            String port = portMap.getOrDefault(streamName, "i1");
-            return runner.feed(pipelineId, timestamp, values, port);
-        }
-
-        // ASOF snapshot sync for multi-source views
-        ViewMeta view = catalog.lookupView(dependent);
-        if (view == null) return Collections.emptyList();
-
-        Map<String, List<Double>> snapshot = new LinkedHashMap<>();
-        for (String source : view.sourceStreams) {
-            if (source.equals(streamName)) {
-                snapshot.put(source, new ArrayList<>(values));
-                continue;
-            }
-
-            Message prior = store.readLatestBefore(source, timestamp);
-            if (prior == null) {
-                // Not all sources have data yet — skip
-                return Collections.emptyList();
-            }
-            snapshot.put(source, new ArrayList<>(prior.values));
-        }
-
-        // Feed all sources in order
-        List<OutputMessage> outputs = new ArrayList<>();
-        for (String source : view.sourceStreams) {
-            String port = portMap.getOrDefault(source, "i1");
-            outputs.addAll(runner.feed(pipelineId, timestamp, snapshot.get(source), port));
-        }
-        return outputs;
-    }
-
-    /**
-     * Check if a dependent view uses ASOF snapshot synchronization.
-     *
-     * <p>True when the view has more than one source stream and all sources
-     * are registered streams (not views or tables).
-     */
-    private boolean usesSnapshotSync(String dependent) {
-        ViewMeta view = catalog.lookupView(dependent);
-        if (view == null || view.sourceStreams.size() <= 1) return false;
-
-        for (String source : view.sourceStreams) {
-            if (catalog.lookupStream(source) == null) return false;
-        }
-        return true;
+        String port = portMap.getOrDefault(streamName, "i1");
+        return runner.feed(pipelineId, timestamp, values, port);
     }
 
     // =================================================================
@@ -724,24 +601,16 @@ public class RtBotSqlRuntime {
             return new SelectResult(columns, new ArrayList<>(), new ArrayList<>());
         }
 
-        // Build input messages
+        // Build input messages — interleaved by timestamp for correct ordering
         List<InputMessage> inputs = new ArrayList<>();
-        boolean useSnapshotSync = runtimeResult.sourceStreams.size() > 1
-                && runtimeResult.sourceStreams.stream()
-                        .allMatch(s -> catalog.lookupStream(s) != null);
-
-        if (useSnapshotSync) {
-            buildSnapshotSyncInputs(runtimeResult, inputs);
-        } else {
-            // Simple: feed each source's messages sequentially
-            for (int i = 0; i < runtimeResult.sourceStreams.size(); i++) {
-                String source = runtimeResult.sourceStreams.get(i);
-                String port = "i" + (i + 1);
-                for (Message msg : store.read(source)) {
-                    inputs.add(new InputMessage(msg.timestamp, new ArrayList<>(msg.values), port));
-                }
+        for (int i = 0; i < runtimeResult.sourceStreams.size(); i++) {
+            String source = runtimeResult.sourceStreams.get(i);
+            String port = "i" + (i + 1);
+            for (Message msg : store.read(source)) {
+                inputs.add(new InputMessage(msg.timestamp, new ArrayList<>(msg.values), port));
             }
         }
+        inputs.sort((a, b) -> Long.compare(a.timestamp, b.timestamp));
 
         // Run through ephemeral pipeline
         List<OutputMessage> outputs = runner.runOnce(runtimeResult.programJson, inputs);
@@ -763,67 +632,6 @@ public class RtBotSqlRuntime {
         columns.sort((a, b) -> Integer.compare(fieldMap.get(a), fieldMap.get(b)));
 
         return new SelectResult(columns, rows, timestamps);
-    }
-
-    /**
-     * Build ASOF snapshot-synchronized inputs for a multi-source ephemeral query.
-     */
-    private void buildSnapshotSyncInputs(CompilationResult runtimeResult, List<InputMessage> inputs) {
-        // Assign rank to each source for deterministic ordering at same timestamp
-        Map<String, Integer> sourceRank = new HashMap<>();
-        for (int i = 0; i < runtimeResult.sourceStreams.size(); i++) {
-            sourceRank.put(runtimeResult.sourceStreams.get(i), i);
-        }
-
-        // Collect all events
-        List<long[]> eventKeys = new ArrayList<>(); // [timestamp, rank]
-        List<String> eventSources = new ArrayList<>();
-        List<List<Double>> eventValues = new ArrayList<>();
-
-        for (String source : runtimeResult.sourceStreams) {
-            int rank = sourceRank.get(source);
-            for (Message msg : store.read(source)) {
-                eventKeys.add(new long[]{msg.timestamp, rank});
-                eventSources.add(source);
-                eventValues.add(new ArrayList<>(msg.values));
-            }
-        }
-
-        // Sort by (timestamp, rank)
-        Integer[] sortedIndices = new Integer[eventKeys.size()];
-        for (int i = 0; i < sortedIndices.length; i++) sortedIndices[i] = i;
-        java.util.Arrays.sort(sortedIndices, (a, b) -> {
-            long[] ea = eventKeys.get(a);
-            long[] eb = eventKeys.get(b);
-            if (ea[0] != eb[0]) return Long.compare(ea[0], eb[0]);
-            return Long.compare(ea[1], eb[1]);
-        });
-
-        // Build snapshots: latest value per source
-        Map<String, List<Double>> latestBySource = new HashMap<>();
-
-        for (int idx : sortedIndices) {
-            long timestamp = eventKeys.get(idx)[0];
-            String triggerSource = eventSources.get(idx);
-            List<Double> triggerValues = eventValues.get(idx);
-
-            latestBySource.put(triggerSource, new ArrayList<>(triggerValues));
-
-            // Only produce inputs when all sources have data
-            if (latestBySource.size() < runtimeResult.sourceStreams.size()) {
-                continue;
-            }
-
-            // Emit one input per source (in source order)
-            for (int i = 0; i < runtimeResult.sourceStreams.size(); i++) {
-                String source = runtimeResult.sourceStreams.get(i);
-                inputs.add(new InputMessage(
-                        timestamp,
-                        new ArrayList<>(latestBySource.get(source)),
-                        "i" + (i + 1)
-                ));
-            }
-        }
     }
 
     /**

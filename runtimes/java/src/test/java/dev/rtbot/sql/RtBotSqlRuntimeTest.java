@@ -194,7 +194,7 @@ public class RtBotSqlRuntimeTest {
     }
 
     // -----------------------------------------------------------------
-    // Multi-source MATERIALIZED VIEW (ASOF snapshot sync)
+    // Multi-source MATERIALIZED VIEW (timestamp synchronization)
     // -----------------------------------------------------------------
 
     @Test
@@ -207,13 +207,13 @@ public class RtBotSqlRuntimeTest {
             + "FROM btc b, eth e"
         );
 
-        // Insert with explicit timestamps via INSERT VALUES
-        // btc: t=1000, price=100; t=3000, price=101
-        // eth: t=2000, price=95; t=4000, price=95
-        runtime.execute("INSERT INTO btc VALUES (100.0)");
-        runtime.execute("INSERT INTO btc VALUES (101.0)");
-        runtime.execute("INSERT INTO eth VALUES (95.0)");
-        runtime.execute("INSERT INTO eth VALUES (95.0)");
+        // Insert with matching timestamps — RTBot operators synchronize on
+        // timestamps, so output is only produced when both streams have data
+        // at the same timestamp.
+        runtime.insert("btc", 1000L, Arrays.asList(100.0));
+        runtime.insert("eth", 1000L, Arrays.asList(95.0));
+        runtime.insert("btc", 2000L, Arrays.asList(101.0));
+        runtime.insert("eth", 2000L, Arrays.asList(95.0));
 
         Object resultObj = runtime.execute("SELECT * FROM cross_stats LIMIT 10");
         SelectResult result = (SelectResult) resultObj;
@@ -221,9 +221,8 @@ public class RtBotSqlRuntimeTest {
         List<String> columns = columnsWithTime(result);
         assertEquals(Arrays.asList("time", "btc_price", "eth_price", "spread"), columns);
 
-        // With auto-incrementing timestamps, snapshot sync should produce outputs
-        // when both sources have data
-        assertTrue("Should have at least 1 output row", result.rows.size() >= 1);
+        // Matching timestamps produce output
+        assertEquals("Should have 2 output rows", 2, result.rows.size());
 
         // Verify column structure of each row
         for (List<Double> row : result.rows) {
@@ -405,22 +404,45 @@ public class RtBotSqlRuntimeTest {
     }
 
     // =================================================================
-    // Port: multi-source ephemeral SELECT with ASOF correlation
-    // (Python: test_multi_from_ephemeral_select_asof_correlation)
+    // Multi-source ephemeral SELECT — non-matching timestamps
     // =================================================================
 
     @Test
-    public void multiSourceEphemeralSelectAsofCorrelation() {
+    public void multiSourceEphemeralSelectNonMatchingTimestamps() {
         runtime.execute("CREATE STREAM btc (price DOUBLE PRECISION)");
         runtime.execute("CREATE STREAM eth (price DOUBLE PRECISION)");
 
-        // Insert with explicit timestamps — interleaved across streams
+        // Insert with non-matching timestamps
         runtime.insert("btc", 1000L, Arrays.asList(100.0));
         runtime.insert("eth", 1200L, Arrays.asList(95.0));
         runtime.insert("btc", 1300L, Arrays.asList(102.0));
         runtime.insert("eth", 1700L, Arrays.asList(97.0));
 
-        // Ephemeral multi-source SELECT (tier-2/3 pipeline, not reading from a view)
+        // Ephemeral multi-source SELECT
+        Object resultObj = runtime.execute(
+            "SELECT b.price AS btc_price, e.price AS eth_price, "
+            + "b.price - e.price AS spread FROM btc b, eth e LIMIT 10"
+        );
+        SelectResult result = (SelectResult) resultObj;
+
+        List<String> columns = columnsWithTime(result);
+        assertEquals(Arrays.asList("time", "btc_price", "eth_price", "spread"), columns);
+
+        // No timestamps match → RTBot operators produce no output
+        assertTrue("Non-matching timestamps must produce empty result", result.rows.isEmpty());
+    }
+
+    @Test
+    public void multiSourceEphemeralSelectMatchingTimestamps() {
+        runtime.execute("CREATE STREAM btc (price DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM eth (price DOUBLE PRECISION)");
+
+        // Insert with matching timestamps
+        runtime.insert("btc", 1000L, Arrays.asList(100.0));
+        runtime.insert("eth", 1000L, Arrays.asList(95.0));
+        runtime.insert("btc", 2000L, Arrays.asList(102.0));
+        runtime.insert("eth", 2000L, Arrays.asList(97.0));
+
         Object resultObj = runtime.execute(
             "SELECT b.price AS btc_price, e.price AS eth_price, "
             + "b.price - e.price AS spread FROM btc b, eth e LIMIT 10"
@@ -431,12 +453,7 @@ public class RtBotSqlRuntimeTest {
         List<List<Double>> rows = rowsWithTime(result);
 
         assertEquals(Arrays.asList("time", "btc_price", "eth_price", "spread"), columns);
-
-        // Expected ASOF correlation:
-        //   t=1200: btc=100 (latest at t<=1200), eth=95 → spread=5
-        //   t=1300: btc=102, eth=95 (latest at t<=1300) → spread=7
-        //   t=1700: btc=102 (latest at t<=1700), eth=97 → spread=5
-        assertEquals("Should have exactly 3 rows from ASOF correlation", 3, rows.size());
+        assertEquals("Should have 2 rows from matching timestamps", 2, rows.size());
 
         List<List<Double>> dataOnly = new java.util.ArrayList<>();
         for (List<Double> row : rows) {
@@ -445,7 +462,6 @@ public class RtBotSqlRuntimeTest {
         assertEquals(
             Arrays.asList(
                 Arrays.asList(100.0, 95.0, 5.0),
-                Arrays.asList(102.0, 95.0, 7.0),
                 Arrays.asList(102.0, 97.0, 5.0)
             ),
             dataOnly
@@ -453,8 +469,8 @@ public class RtBotSqlRuntimeTest {
     }
 
     // =================================================================
-    // Port: multi-source MATERIALIZED VIEW with exact timestamps
-    // (Python: test_multi_from_materialized_view — strengthened)
+    // Multi-source MATERIALIZED VIEW with exact timestamps
+    // (Python: test_multi_from_materialized_view)
     // =================================================================
 
     @Test
@@ -467,11 +483,11 @@ public class RtBotSqlRuntimeTest {
             + "FROM btc b, eth e"
         );
 
-        // Insert with explicit interleaved timestamps (matching Python test)
+        // Insert with matching timestamps (mirrors Python test)
         runtime.insert("btc", 1700000001000L, Arrays.asList(100.0));
         runtime.insert("btc", 1700000003000L, Arrays.asList(101.0));
-        runtime.insert("eth", 1700000002000L, Arrays.asList(95.0));
-        runtime.insert("eth", 1700000004000L, Arrays.asList(95.0));
+        runtime.insert("eth", 1700000001000L, Arrays.asList(95.0));
+        runtime.insert("eth", 1700000003000L, Arrays.asList(95.0));
 
         Object resultObj = runtime.execute("SELECT * FROM cross_stats LIMIT 10");
         SelectResult result = (SelectResult) resultObj;
@@ -479,33 +495,24 @@ public class RtBotSqlRuntimeTest {
         List<String> columns = columnsWithTime(result);
         assertEquals(Arrays.asList("time", "btc_price", "eth_price", "spread"), columns);
 
-        // Expected: ASOF snapshot sync produces 2 outputs
-        //   When eth arrives at t=2000: btc=100 (latest at t<=2000), eth=95 → spread=5
-        //   When eth arrives at t=4000: btc=101 (latest at t<=4000), eth=95 → spread=6
-        // Note: btc at t=3000 also triggers, but only if eth has data at t<=3000 (yes, eth=95 at t=2000)
-        // So we might get: (100,95,5), (101,95,6), (101,95,6)
-        // Actually the backfill processes all events sorted by time:
-        //   t=1000 btc=100: no eth yet → skip
-        //   t=2000 eth=95: btc=100 (latest at t<=2000) → output (100,95,5)
-        //   t=3000 btc=101: eth=95 (latest at t<=3000) → output (101,95,6)
-        //   t=4000 eth=95: btc=101 (latest at t<=4000) → output (101,95,6)
-        // But the Python test expects only 2 rows: (100,95,5) and (101,95,6)
-        // This might be because the backfill deduplicates or the view stores latest-per-key.
-        // Let me just verify the exact Python expected output.
-        // Python test expects: [[100.0, 95.0, 5.0], [101.0, 95.0, 6.0]]
-
-        // Verify we get at least the expected data values
-        assertTrue("Should have at least 2 output rows", result.rows.size() >= 2);
+        // Matching timestamps produce output:
+        //   t=1700000001000: btc=100, eth=95 → spread=5
+        //   t=1700000003000: btc=101, eth=95 → spread=6
+        assertEquals("Should have 2 output rows", 2, result.rows.size());
 
         // Verify every row satisfies spread = btc_price - eth_price
         for (List<Double> row : result.rows) {
             assertEquals("spread = btc_price - eth_price", row.get(0) - row.get(1), row.get(2), 1e-9);
         }
 
-        // Verify the first row is (100, 95, 5) — the ASOF match when eth first arrives
+        // Verify exact values
         assertEquals(100.0, result.rows.get(0).get(0), 1e-9);
         assertEquals(95.0, result.rows.get(0).get(1), 1e-9);
         assertEquals(5.0, result.rows.get(0).get(2), 1e-9);
+
+        assertEquals(101.0, result.rows.get(1).get(0), 1e-9);
+        assertEquals(95.0, result.rows.get(1).get(1), 1e-9);
+        assertEquals(6.0, result.rows.get(1).get(2), 1e-9);
     }
 
     // =================================================================
@@ -1197,5 +1204,120 @@ public class RtBotSqlRuntimeTest {
     @Test(expected = IllegalArgumentException.class)
     public void subscribeWithNullListenerThrows() {
         runtime.subscribe("ticks", null);
+    }
+
+    // -----------------------------------------------------------------
+    // Multi-stream timestamp synchronization
+    // -----------------------------------------------------------------
+
+    @Test
+    public void multiStreamNonMatchingTimestampsProduceNoOutput() {
+        runtime.execute("CREATE STREAM stream_a (value DOUBLE)");
+        runtime.execute("CREATE STREAM stream_b (value DOUBLE)");
+        runtime.execute(
+                "CREATE MATERIALIZED VIEW combined AS "
+                + "SELECT a.value AS val_a, b.value AS val_b "
+                + "FROM stream_a a, stream_b b"
+        );
+
+        // Insert with non-matching timestamps
+        runtime.insert("stream_a", 300, Arrays.asList(10.0));
+        runtime.insert("stream_b", 400, Arrays.asList(20.0));
+        runtime.insert("stream_a", 500, Arrays.asList(30.0));
+        runtime.insert("stream_b", 600, Arrays.asList(40.0));
+
+        SelectResult result = (SelectResult) runtime.execute("SELECT * FROM combined LIMIT 10");
+        assertTrue(
+                "Non-matching timestamps must produce no output — "
+                + "RTBot operators synchronize on timestamps",
+                result.rows.isEmpty()
+        );
+    }
+
+    @Test
+    public void multiStreamMatchingTimestampsProduceOutput() {
+        runtime.execute("CREATE STREAM stream_a (value DOUBLE)");
+        runtime.execute("CREATE STREAM stream_b (value DOUBLE)");
+        runtime.execute(
+                "CREATE MATERIALIZED VIEW combined AS "
+                + "SELECT a.value AS val_a, b.value AS val_b, "
+                + "a.value + b.value AS total "
+                + "FROM stream_a a, stream_b b"
+        );
+
+        // Insert with matching timestamps
+        runtime.insert("stream_a", 1000, Arrays.asList(10.0));
+        runtime.insert("stream_b", 1000, Arrays.asList(20.0));
+        runtime.insert("stream_a", 2000, Arrays.asList(30.0));
+        runtime.insert("stream_b", 2000, Arrays.asList(40.0));
+
+        SelectResult result = (SelectResult) runtime.execute("SELECT * FROM combined LIMIT 10");
+        int aIdx = result.columns.indexOf("val_a");
+        int bIdx = result.columns.indexOf("val_b");
+        int totalIdx = result.columns.indexOf("total");
+
+        assertFalse("Matching timestamps must produce output", result.rows.isEmpty());
+
+        assertEquals(10.0, result.rows.get(0).get(aIdx), 1e-9);
+        assertEquals(20.0, result.rows.get(0).get(bIdx), 1e-9);
+        assertEquals(30.0, result.rows.get(0).get(totalIdx), 1e-9);
+    }
+
+    @Test
+    public void multiStreamMixedTimestamps() {
+        runtime.execute("CREATE STREAM stream_a (value DOUBLE)");
+        runtime.execute("CREATE STREAM stream_b (value DOUBLE)");
+        runtime.execute(
+                "CREATE MATERIALIZED VIEW combined AS "
+                + "SELECT a.value AS val_a, b.value AS val_b "
+                + "FROM stream_a a, stream_b b"
+        );
+
+        // Only t=1000 matches between both streams
+        runtime.insert("stream_a", 500, Arrays.asList(1.0));   // no match
+        runtime.insert("stream_a", 1000, Arrays.asList(10.0)); // match
+        runtime.insert("stream_b", 700, Arrays.asList(2.0));   // no match
+        runtime.insert("stream_b", 1000, Arrays.asList(20.0)); // match
+        runtime.insert("stream_a", 1500, Arrays.asList(30.0)); // no match
+
+        SelectResult result = (SelectResult) runtime.execute("SELECT * FROM combined LIMIT 10");
+        int aIdx = result.columns.indexOf("val_a");
+        int bIdx = result.columns.indexOf("val_b");
+
+        assertEquals("Only the matching timestamp should produce output",
+                1, result.rows.size());
+        assertEquals(10.0, result.rows.get(0).get(aIdx), 1e-9);
+        assertEquals(20.0, result.rows.get(0).get(bIdx), 1e-9);
+    }
+
+    @Test
+    public void multiStreamSubscriberReceivesOnlyMatchingTimestamps() {
+        RtBotSqlRuntime rt = new RtBotSqlRuntime();
+        try {
+            rt.execute("CREATE STREAM stream_a (value DOUBLE)");
+            rt.execute("CREATE STREAM stream_b (value DOUBLE)");
+            rt.execute(
+                    "CREATE MATERIALIZED VIEW combined AS "
+                    + "SELECT a.value AS val_a, b.value AS val_b "
+                    + "FROM stream_a a, stream_b b"
+            );
+
+            List<List<Double>> received = new CopyOnWriteArrayList<>();
+            rt.subscribe("combined", (name, ts, vals) -> received.add(new ArrayList<>(vals)));
+
+            // Non-matching: no output
+            rt.insert("stream_a", 300, Arrays.asList(10.0));
+            rt.insert("stream_b", 400, Arrays.asList(20.0));
+            assertEquals("Non-matching timestamps: subscriber should receive nothing",
+                    0, received.size());
+
+            // Matching: output
+            rt.insert("stream_a", 1000, Arrays.asList(50.0));
+            rt.insert("stream_b", 1000, Arrays.asList(60.0));
+            assertEquals("Matching timestamp: subscriber should receive one message",
+                    1, received.size());
+        } finally {
+            rt.destroyAll();
+        }
     }
 }
