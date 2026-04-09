@@ -6,3 +6,12 @@ cc_binary(
         "@rtbot//libs/api:rtbot-api",
     ],
 )
+
+cc_binary(
+    name = "ims_debug_test",
+    srcs = ["ims_debug_test.cpp"],
+    deps = [
+        "//libs/api:api_compiler",
+        "@rtbot//libs/api:rtbot-api",
+    ],
+)

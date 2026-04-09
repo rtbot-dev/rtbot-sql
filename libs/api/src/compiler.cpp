@@ -51,11 +51,29 @@ StreamSchema lookup_schema(const std::string& source,
 
   auto it_view = catalog.views.find(source);
   if (it_view != catalog.views.end()) {
-    // Build a StreamSchema from the view's field_map
+    // Build a StreamSchema from the view's field_map.
+    //
+    // The field_map stores the *physical* position of each column in the
+    // operator output vector.  For composite GROUP BY views, KeyedPipeline
+    // prepends an internal hash key at index 0, so the published columns
+    // start at index 1 (e.g. device_id→1, channel_id→2, …).
+    //
+    // Downstream views, however, receive a *logical* vector that contains
+    // only the published columns (the hash key is stripped during the
+    // decode→re-encode cycle in the JavaScript and Java runtimes).
+    // Therefore we must re-map the field_map indices to contiguous 0-based
+    // positions ordered by their original physical index.
     StreamSchema schema;
     schema.name = it_view->second.name;
-    for (const auto& [name, idx] : it_view->second.field_map) {
-      schema.columns.push_back({name, idx});
+
+    // Sort entries by physical index to preserve column order.
+    std::vector<std::pair<std::string, int>> sorted_entries(
+        it_view->second.field_map.begin(), it_view->second.field_map.end());
+    std::sort(sorted_entries.begin(), sorted_entries.end(),
+              [](const auto& a, const auto& b) { return a.second < b.second; });
+
+    for (int i = 0; i < static_cast<int>(sorted_entries.size()); ++i) {
+      schema.columns.push_back({sorted_entries[i].first, i});
     }
     return schema;
   }

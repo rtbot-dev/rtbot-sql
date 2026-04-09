@@ -530,13 +530,25 @@ SelectResult compile_group_by(
 
     // --- Build field map ---
     if (composite) {
-      // KeyedPipeline prepends hash key at index 0, shifting prototype outputs by 1.
-      // field_map: key0→1, key1→2, agg0→3, agg1→4, ...
+      // KeyedPipeline prepends an internal hash key at index 0, shifting
+      // prototype outputs by 1.  Add a VectorProject to strip the hash key
+      // so that downstream consumers (and the view's public field_map)
+      // see a clean, 0-based vector: [key0, key1, agg0, agg1, ...].
+      std::vector<int> proj_indices;
+      proj_indices.reserve(field_names.size());
+      for (size_t i = 0; i < field_names.size(); ++i) {
+        proj_indices.push_back(static_cast<int>(i + 1));  // skip hash at 0
+      }
+      auto proj_id = builder.next_id("proj");
+      builder.add_operator(proj_id, "VectorProject", {}, {}, {},
+                           {{"indices", proj_indices}});
+      builder.connect({keyed_id, "o1"}, {proj_id, "i1"});
+
       FieldMap field_map;
       for (size_t i = 0; i < field_names.size(); ++i) {
-        field_map[field_names[i]] = static_cast<int>(i + 1);
+        field_map[field_names[i]] = static_cast<int>(i);
       }
-      return {{keyed_id, "o1"}, field_map, /*is_segment_only=*/false};
+      return {{proj_id, "o1"}, field_map, /*is_segment_only=*/false};
     } else {
       // Single key: key at index 0 (prepended by KeyedPipeline), aggregates at 1, 2, ...
       FieldMap field_map;
@@ -776,17 +788,26 @@ SelectResult compile_group_by(
                          {{"prototype", proto_id}});
     builder.connect({compose_id, "o1"}, {keyed_id, "i1"});
 
-    // Field map: key columns first (KeyedPipeline prepends its key, but since
-    // we include keys explicitly in the prototype, keys appear at their natural
-    // positions in the prototype output. KeyedPipeline prepends its hash key at
-    // index 0, shifting all prototype outputs by 1.
-    // field_map: hash_key=0, key0=1, key1=2, agg0=3, ...
+    // KeyedPipeline prepends an internal hash key at index 0, shifting all
+    // prototype outputs by 1.  Add a VectorProject to strip the hash key
+    // so that downstream consumers (and the view's public field_map)
+    // see a clean, 0-based vector: [key0, key1, agg0, ...].
+    std::vector<int> proj_indices;
+    proj_indices.reserve(field_names.size());
+    for (size_t i = 0; i < field_names.size(); ++i) {
+      proj_indices.push_back(static_cast<int>(i + 1));  // skip hash at 0
+    }
+    auto proj_id = builder.next_id("proj");
+    builder.add_operator(proj_id, "VectorProject", {}, {}, {},
+                         {{"indices", proj_indices}});
+    builder.connect({keyed_id, "o1"}, {proj_id, "i1"});
+
     FieldMap field_map;
     for (size_t i = 0; i < field_names.size(); ++i) {
-      field_map[field_names[i]] = static_cast<int>(i + 1);  // +1 for hash key prepended
+      field_map[field_names[i]] = static_cast<int>(i);
     }
 
-    return {{keyed_id, "o1"}, field_map};
+    return {{proj_id, "o1"}, field_map};
   }
 
   // --- Single-key GROUP BY ---
