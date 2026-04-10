@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "rtbot_sql/api/types.h"
+#include "rtbot_sql/catalog/string_dictionary.h"
 
 namespace rtbot_sql::catalog {
 
@@ -30,6 +31,12 @@ class Catalog {
   void drop_view(const std::string& name);
   void drop_table(const std::string& name);
 
+  void register_dictionary(const std::string& key,
+                           const StringDictionary& dict);
+  StringDictionary* lookup_dictionary(const std::string& key);
+  StringDictionary& get_or_create_dictionary(const std::string& key);
+  void drop_dictionary(const std::string& key);
+
   std::vector<std::string> list_streams() const;
   std::vector<std::string> list_views() const;
   std::vector<std::string> list_tables() const;
@@ -38,6 +45,7 @@ class Catalog {
   std::map<std::string, StreamSchema> streams_;
   std::map<std::string, ViewMeta> views_;
   std::map<std::string, TableSchema> tables_;
+  std::map<std::string, StringDictionary> dictionaries_;
 };
 
 }  // namespace rtbot_sql::catalog

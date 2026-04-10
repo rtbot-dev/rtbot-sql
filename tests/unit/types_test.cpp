@@ -44,5 +44,17 @@ TEST(CompilationResult, HasErrorsWhenErrorsPresent) {
   EXPECT_TRUE(r.has_errors());
 }
 
+TEST(ColumnDefTest, DefaultColumnTypeIsDouble) {
+  ColumnDef col{"price", 0};
+  EXPECT_EQ(col.type, ColumnType::DOUBLE);
+}
+
+TEST(ColumnDefTest, TextColumnTypeCanBeSet) {
+  ColumnDef col{"location", 1, ColumnType::TEXT};
+  EXPECT_EQ(col.type, ColumnType::TEXT);
+  EXPECT_EQ(col.name, "location");
+  EXPECT_EQ(col.index, 1);
+}
+
 }  // namespace
 }  // namespace rtbot_sql

@@ -10,6 +10,8 @@
 #include <variant>
 
 #include "rtbot_sql/analyzer/scope.h"
+#include "rtbot_sql/catalog/catalog.h"
+#include "rtbot_sql/catalog/string_dictionary.h"
 #include "rtbot_sql/compiler/alias_expander.h"
 #include "rtbot_sql/compiler/graph_builder.h"
 #include "rtbot_sql/compiler/group_by_compiler.h"
@@ -110,6 +112,11 @@ catalog::Catalog snapshot_to_catalog(const CatalogSnapshot& snap) {
   }
   for (const auto& [name, schema] : snap.tables) {
     cat.register_table(name, schema);
+  }
+  for (const auto& [key, entries] : snap.dictionaries) {
+    catalog::StringDictionary dict;
+    dict.restore(entries);
+    cat.register_dictionary(key, dict);
   }
   return cat;
 }
@@ -397,7 +404,13 @@ CompilationResult handle_create_stream(
   StreamSchema schema;
   schema.name = stmt.name;
   for (size_t i = 0; i < stmt.columns.size(); ++i) {
-    schema.columns.push_back({stmt.columns[i].name, static_cast<int>(i)});
+    ColumnType col_type = ColumnType::DOUBLE;
+    const auto& tn = stmt.columns[i].type_name;
+    if (tn == "text" || tn == "varchar" || tn == "bpchar") {
+      col_type = ColumnType::TEXT;
+    }
+    schema.columns.push_back(
+        {stmt.columns[i].name, static_cast<int>(i), col_type});
   }
   result.stream_schema = schema;
   return result;
@@ -425,7 +438,13 @@ CompilationResult handle_create_table(const parser::ast::CreateStreamStmt& stmt)
   TableSchema schema;
   schema.name = stmt.name;
   for (size_t i = 0; i < stmt.columns.size(); ++i) {
-    schema.columns.push_back({stmt.columns[i].name, static_cast<int>(i)});
+    ColumnType col_type = ColumnType::DOUBLE;
+    const auto& tn = stmt.columns[i].type_name;
+    if (tn == "text" || tn == "varchar" || tn == "bpchar") {
+      col_type = ColumnType::TEXT;
+    }
+    schema.columns.push_back(
+        {stmt.columns[i].name, static_cast<int>(i), col_type});
   }
   schema.key_columns = key_cols;
   schema.changelog_stream = "rtbot:sql:table:" + stmt.name + ":changelog";
@@ -435,14 +454,59 @@ CompilationResult handle_create_table(const parser::ast::CreateStreamStmt& stmt)
 }
 
 // Handle INSERT.
-CompilationResult handle_insert(const parser::ast::InsertStmt& stmt) {
+CompilationResult handle_insert(const parser::ast::InsertStmt& stmt,
+                                catalog::Catalog& cat,
+                                const CatalogSnapshot& catalog) {
   CompilationResult result{};
   result.statement_type = StatementType::INSERT;
   result.entity_name = stmt.table_name;
 
-  for (const auto& val_expr : stmt.values) {
-    if (auto* c = std::get_if<parser::ast::Constant>(&val_expr)) {
+  // Look up columns from streams or tables.
+  std::vector<ColumnDef> columns;
+  auto it_stream = catalog.streams.find(stmt.table_name);
+  if (it_stream != catalog.streams.end()) {
+    columns = it_stream->second.columns;
+  } else {
+    auto it_table = catalog.tables.find(stmt.table_name);
+    if (it_table != catalog.tables.end()) {
+      columns = it_table->second.columns;
+    } else {
+      return make_error("INSERT: unknown stream or table: " +
+                        stmt.table_name);
+    }
+  }
+
+  // Check value count matches column count.
+  if (stmt.values.size() != columns.size()) {
+    return make_error(
+        "INSERT: value count mismatch (" + std::to_string(stmt.values.size()) +
+        " values for " +
+        std::to_string(columns.size()) + " columns)");
+  }
+
+  for (size_t i = 0; i < stmt.values.size(); ++i) {
+    const auto& col = columns[i];
+
+    if (auto* c = std::get_if<parser::ast::Constant>(&stmt.values[i])) {
+      if (col.type == ColumnType::TEXT) {
+        return make_error("INSERT: column '" + col.name +
+                          "' is TEXT but got a numeric value");
+      }
       result.insert_payload.push_back(c->value);
+    } else if (auto* sc =
+                   std::get_if<parser::ast::StringConstant>(&stmt.values[i])) {
+      if (col.type != ColumnType::TEXT) {
+        return make_error("INSERT: column '" + col.name +
+                          "' is DOUBLE but got a string value");
+      }
+      // Encode string via dictionary.
+      const std::string dict_key =
+          stmt.table_name + "." + col.name;
+      auto& dict = cat.get_or_create_dictionary(dict_key);
+      double id = dict.encode(sc->value);
+      result.insert_payload.push_back(id);
+      // Record the dictionary update.
+      result.dictionary_updates[dict_key] = dict.all_entries();
     } else {
       return make_error("INSERT values must be constants");
     }
@@ -916,7 +980,8 @@ CompilationResult compile_sql(const std::string& sql,
       return handle_create_mat_view(*s, catalog);
     }
     if (auto* s = std::get_if<parser::ast::InsertStmt>(&stmt)) {
-      return handle_insert(*s);
+      auto cat = snapshot_to_catalog(catalog);
+      return handle_insert(*s, cat, catalog);
     }
     if (auto* s = std::get_if<parser::ast::DropStmt>(&stmt)) {
       return handle_drop(*s, catalog);

@@ -25,10 +25,12 @@ enum class StatementType {
 
 enum class SelectTier { TIER1_READ, TIER2_SCAN, TIER3_EPHEMERAL };
 
+enum class ColumnType { DOUBLE, TEXT };
+
 struct ColumnDef {
   std::string name;
   int index;  // position in the vector_number
-  // All columns are DOUBLE (RTBot is numeric-only)
+  ColumnType type = ColumnType::DOUBLE;
 };
 
 struct StreamSchema {
@@ -69,6 +71,7 @@ struct CatalogSnapshot {
   std::map<std::string, StreamSchema> streams;
   std::map<std::string, ViewMeta> views;
   std::map<std::string, TableSchema> tables;
+  std::map<std::string, std::map<double, std::string>> dictionaries;
 };
 
 struct CompilationError {
@@ -93,6 +96,7 @@ struct CompilationResult {
   std::string entity_name;
   std::string drop_entity_name;
   EntityType drop_entity_type;
+  std::map<std::string, std::map<double, std::string>> dictionary_updates;
   std::vector<CompilationError> errors;
 
   bool has_errors() const { return !errors.empty(); }

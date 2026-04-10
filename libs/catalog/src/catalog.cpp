@@ -47,7 +47,11 @@ std::optional<EntityType> Catalog::resolve_entity(
 }
 
 CatalogSnapshot Catalog::snapshot() const {
-  return {streams_, views_, tables_};
+  CatalogSnapshot snap{streams_, views_, tables_, {}};
+  for (const auto& [key, dict] : dictionaries_) {
+    snap.dictionaries[key] = dict.all_entries();
+  }
+  return snap;
 }
 
 void Catalog::add_key(const std::string& view_name, double key) {
@@ -69,6 +73,25 @@ void Catalog::drop_stream(const std::string& name) { streams_.erase(name); }
 void Catalog::drop_view(const std::string& name) { views_.erase(name); }
 
 void Catalog::drop_table(const std::string& name) { tables_.erase(name); }
+
+void Catalog::register_dictionary(const std::string& key,
+                                  const StringDictionary& dict) {
+  dictionaries_[key] = dict;
+}
+
+StringDictionary* Catalog::lookup_dictionary(const std::string& key) {
+  auto it = dictionaries_.find(key);
+  if (it != dictionaries_.end()) return &it->second;
+  return nullptr;
+}
+
+StringDictionary& Catalog::get_or_create_dictionary(const std::string& key) {
+  return dictionaries_[key];
+}
+
+void Catalog::drop_dictionary(const std::string& key) {
+  dictionaries_.erase(key);
+}
 
 std::vector<std::string> Catalog::list_streams() const {
   std::vector<std::string> result;

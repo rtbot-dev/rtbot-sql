@@ -37,6 +37,10 @@ struct Constant {
   double value;
 };
 
+struct StringConstant {
+  std::string value;
+};
+
 struct ArrayLiteral {
   std::vector<double> values;
 };
@@ -44,6 +48,7 @@ struct ArrayLiteral {
 using Expr = std::variant<
     ColumnRef,
     Constant,
+    StringConstant,
     ArrayLiteral,
     std::unique_ptr<BinaryExpr>,
     std::unique_ptr<ComparisonExpr>,

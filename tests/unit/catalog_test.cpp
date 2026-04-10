@@ -2,6 +2,8 @@
 
 #include <gtest/gtest.h>
 
+#include "rtbot_sql/catalog/string_dictionary.h"
+
 namespace rtbot_sql::catalog {
 namespace {
 
@@ -189,6 +191,52 @@ TEST_F(CatalogTest, ListMethodsReturnEmptyWhenNoneRegistered) {
   EXPECT_TRUE(catalog.list_streams().empty());
   EXPECT_TRUE(catalog.list_views().empty());
   EXPECT_TRUE(catalog.list_tables().empty());
+}
+
+// --- Dictionary Management ---
+
+TEST_F(CatalogTest, RegisterAndLookupDictionary) {
+  StringDictionary dict;
+  dict.encode("Bay A");
+  dict.encode("Bay B");
+  catalog.register_dictionary("sensors.location", dict);
+  auto result = catalog.lookup_dictionary("sensors.location");
+  ASSERT_TRUE(result != nullptr);
+  EXPECT_EQ(result->size(), 2u);
+  auto decoded = result->decode(1.0);
+  ASSERT_TRUE(decoded.has_value());
+  EXPECT_EQ(*decoded, "Bay A");
+}
+
+TEST_F(CatalogTest, LookupMissingDictionaryReturnsNull) {
+  EXPECT_EQ(catalog.lookup_dictionary("nope"), nullptr);
+}
+
+TEST_F(CatalogTest, GetOrCreateDictionaryCreatesIfMissing) {
+  auto& dict = catalog.get_or_create_dictionary("sensors.location");
+  double id = dict.encode("Bay A");
+  EXPECT_DOUBLE_EQ(id, 1.0);
+  // Second call returns same dictionary
+  auto& dict2 = catalog.get_or_create_dictionary("sensors.location");
+  EXPECT_EQ(dict2.size(), 1u);
+}
+
+TEST_F(CatalogTest, SnapshotIncludesDictionaries) {
+  auto& dict = catalog.get_or_create_dictionary("sensors.location");
+  dict.encode("Bay A");
+  auto snap = catalog.snapshot();
+  EXPECT_EQ(snap.dictionaries.size(), 1u);
+  EXPECT_EQ(snap.dictionaries.count("sensors.location"), 1u);
+  auto entries = snap.dictionaries.at("sensors.location");
+  EXPECT_EQ(entries.size(), 1u);
+  EXPECT_EQ(entries.at(1.0), "Bay A");
+}
+
+TEST_F(CatalogTest, DropDictionary) {
+  auto& dict = catalog.get_or_create_dictionary("sensors.location");
+  dict.encode("Bay A");
+  catalog.drop_dictionary("sensors.location");
+  EXPECT_EQ(catalog.lookup_dictionary("sensors.location"), nullptr);
 }
 
 }  // namespace

@@ -104,12 +104,11 @@ ast::Expr convert_a_const(const json& node) {
     return ast::Constant{*numeric};
   }
   if (node.contains("sval")) {
-    // String constants not supported — all values are numeric in RTBot
-    throw std::runtime_error("string constants not supported");
+    return ast::StringConstant{node["sval"]["sval"].get<std::string>()};
   }
   if (node.contains("val") && node["val"].is_object() &&
       node["val"].contains("String")) {
-    throw std::runtime_error("string constants not supported");
+    return ast::StringConstant{node["val"]["String"]["sval"].get<std::string>()};
   }
   throw std::runtime_error("unknown A_Const type: " + node.dump());
 }

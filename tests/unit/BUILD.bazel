@@ -143,3 +143,30 @@ cc_test(
         "@com_google_googletest//:gtest_main",
     ],
 )
+
+cc_test(
+    name = "schema_test",
+    srcs = ["schema_test.cpp"],
+    deps = [
+        "//libs/api:api_compiler",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "string_dictionary_test",
+    srcs = ["string_dictionary_test.cpp"],
+    deps = [
+        "//libs/catalog",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "insert_test",
+    srcs = ["insert_test.cpp"],
+    deps = [
+        "//libs/api:api_compiler",
+        "@com_google_googletest//:gtest_main",
+    ],
+)

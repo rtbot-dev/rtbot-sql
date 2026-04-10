@@ -1425,5 +1425,154 @@ TEST_F(E2eRuntimeTest, MultiStreamMixedTimestamps) {
   EXPECT_DOUBLE_EQ(out5[b_idx], 50.0);
 }
 
+// ---------------------------------------------------------------------------
+// T-text-1: TEXT column round-trip via CREATE STREAM + INSERT
+//
+// Verifies that:
+//   1. CREATE STREAM with TEXT column produces correct ColumnType in schema
+//   2. INSERT with string literal resolves to dictionary ID
+//   3. dictionary_updates contains the new encoding
+// ---------------------------------------------------------------------------
+
+TEST(E2ERuntimeTextTest, TextColumnRoundTrip) {
+  CatalogSnapshot snap;
+  auto create_result = compile_sql(
+      "CREATE STREAM sensors (device_id DOUBLE PRECISION, location TEXT, "
+      "value DOUBLE PRECISION)",
+      snap);
+  ASSERT_FALSE(create_result.has_errors());
+
+  // Verify schema has correct column types
+  ASSERT_EQ(create_result.stream_schema.columns.size(), 3u);
+  EXPECT_EQ(create_result.stream_schema.columns[0].type, ColumnType::DOUBLE);
+  EXPECT_EQ(create_result.stream_schema.columns[1].type, ColumnType::TEXT);
+  EXPECT_EQ(create_result.stream_schema.columns[2].type, ColumnType::DOUBLE);
+
+  // Register in catalog
+  snap.streams["sensors"] = create_result.stream_schema;
+
+  auto insert_result =
+      compile_sql("INSERT INTO sensors VALUES (1, 'Bay A', 42.0)", snap);
+  ASSERT_FALSE(insert_result.has_errors());
+  ASSERT_EQ(insert_result.insert_payload.size(), 3u);
+  EXPECT_DOUBLE_EQ(insert_result.insert_payload[0], 1.0);
+  EXPECT_DOUBLE_EQ(insert_result.insert_payload[1], 1.0);  // dictionary ID
+  EXPECT_DOUBLE_EQ(insert_result.insert_payload[2], 42.0);
+
+  // dictionary_updates should contain the new encoding
+  ASSERT_EQ(insert_result.dictionary_updates.count("sensors.location"), 1u);
+  EXPECT_EQ(insert_result.dictionary_updates.at("sensors.location").at(1.0),
+            "Bay A");
+}
+
+// ---------------------------------------------------------------------------
+// T-text-2: JSON serialization round-trip for catalog with TEXT + dictionaries
+//
+// Simulates the JSON serialization that happens in JNI/browser bindings:
+//   1. Serialize a CatalogSnapshot with TEXT columns and dictionaries to JSON
+//   2. Deserialize it back
+//   3. Verify type info and dictionaries survive the round-trip
+//   4. Use the deserialized catalog for INSERT
+// ---------------------------------------------------------------------------
+
+TEST(E2ERuntimeTextTest, JsonCatalogRoundTrip) {
+  // Build a catalog with TEXT columns and pre-populated dictionaries
+  CatalogSnapshot original;
+  StreamSchema schema;
+  schema.name = "sensors";
+  schema.columns = {
+      {"device_id", 0, ColumnType::DOUBLE},
+      {"location", 1, ColumnType::TEXT},
+      {"value", 2, ColumnType::DOUBLE},
+  };
+  original.streams["sensors"] = schema;
+  original.dictionaries["sensors.location"] = {{1.0, "Bay A"}, {2.0, "Bay B"}};
+
+  // Serialize to JSON (mimicking what result_to_json/catalog serialization does)
+  json catalog_json;
+  json streams_json = json::object();
+  for (const auto& [name, s] : original.streams) {
+    json sj;
+    sj["name"] = s.name;
+    json cols = json::array();
+    for (const auto& c : s.columns) {
+      json cj;
+      cj["name"] = c.name;
+      cj["index"] = c.index;
+      cj["type"] = (c.type == ColumnType::TEXT) ? "TEXT" : "DOUBLE";
+      cols.push_back(cj);
+    }
+    sj["columns"] = cols;
+    streams_json[name] = sj;
+  }
+  catalog_json["streams"] = streams_json;
+
+  // Serialize dictionaries
+  json dict_json = json::object();
+  for (const auto& [key, entries] : original.dictionaries) {
+    json entry_json = json::object();
+    for (const auto& [id, str] : entries) {
+      entry_json[std::to_string(static_cast<int>(id))] = str;
+    }
+    dict_json[key] = entry_json;
+  }
+  catalog_json["dictionaries"] = dict_json;
+
+  // Deserialize (mimicking catalog_from_json)
+  CatalogSnapshot restored;
+  auto j = catalog_json;
+  if (j.contains("streams")) {
+    for (const auto& [name, val] : j["streams"].items()) {
+      StreamSchema s;
+      s.name = val.at("name").get<std::string>();
+      for (const auto& col : val.at("columns")) {
+        ColumnType col_type = ColumnType::DOUBLE;
+        if (col.contains("type") && col["type"].is_string()) {
+          if (col["type"] == "TEXT") col_type = ColumnType::TEXT;
+        }
+        s.columns.push_back(
+            {col.at("name").get<std::string>(), col.at("index").get<int>(),
+             col_type});
+      }
+      restored.streams[name] = s;
+    }
+  }
+  if (j.contains("dictionaries") && j["dictionaries"].is_object()) {
+    for (auto& [key, entries] : j["dictionaries"].items()) {
+      std::map<double, std::string> dict_entries;
+      for (auto& [id_str, str_val] : entries.items()) {
+        dict_entries[std::stod(id_str)] = str_val.get<std::string>();
+      }
+      restored.dictionaries[key] = dict_entries;
+    }
+  }
+
+  // Verify the round-trip preserved types
+  ASSERT_EQ(restored.streams.count("sensors"), 1u);
+  const auto& restored_schema = restored.streams.at("sensors");
+  ASSERT_EQ(restored_schema.columns.size(), 3u);
+  EXPECT_EQ(restored_schema.columns[0].type, ColumnType::DOUBLE);
+  EXPECT_EQ(restored_schema.columns[1].type, ColumnType::TEXT);
+  EXPECT_EQ(restored_schema.columns[2].type, ColumnType::DOUBLE);
+
+  // Verify dictionaries survived
+  ASSERT_EQ(restored.dictionaries.count("sensors.location"), 1u);
+  EXPECT_EQ(restored.dictionaries.at("sensors.location").at(1.0), "Bay A");
+  EXPECT_EQ(restored.dictionaries.at("sensors.location").at(2.0), "Bay B");
+
+  // Use restored catalog for INSERT — should reuse existing dictionary IDs
+  auto insert_result = compile_sql(
+      "INSERT INTO sensors VALUES (1, 'Bay A', 42.0)", restored);
+  ASSERT_FALSE(insert_result.has_errors());
+  ASSERT_EQ(insert_result.insert_payload.size(), 3u);
+  EXPECT_DOUBLE_EQ(insert_result.insert_payload[1], 1.0);  // reused ID
+
+  // New string should get next available ID
+  auto insert_result2 = compile_sql(
+      "INSERT INTO sensors VALUES (2, 'Bay C', 99.0)", restored);
+  ASSERT_FALSE(insert_result2.has_errors());
+  EXPECT_DOUBLE_EQ(insert_result2.insert_payload[1], 3.0);  // next ID after 2.0
+}
+
 }  // namespace
 }  // namespace rtbot_sql::api
