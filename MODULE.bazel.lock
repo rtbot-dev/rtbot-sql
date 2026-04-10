@@ -513,7 +513,7 @@
     "@@emsdk+//:emscripten_cache.bzl%emscripten_cache": {
       "general": {
         "bzlTransitiveDigest": "uqDvXmpTNqW4+ie/Fk+xC3TrFrKvL+9hNtoP51Kt2oo=",
-        "usagesDigest": "GlOTVAeh1Lz2Ph5EB4BFE6lfL2gvXNqWDzRmXqQuK+E=",
+        "usagesDigest": "xuKi1cNn4XXF4x5kEmSlJd7eznDGhUgiTjGjeNtJG9k=",
         "recordedFileInputs": {},
         "recordedDirentsInputs": {},
         "envVariables": {},
@@ -532,7 +532,7 @@
     "@@emsdk+//:emscripten_deps.bzl%emscripten_deps": {
       "general": {
         "bzlTransitiveDigest": "SddTA+cllLPuY9S2zQ7GIkgUk6NIyXv/U9DES+93YIs=",
-        "usagesDigest": "UnbmyiDvtcFmBsXPatpenn+qVHHOsIUKz9iWrpbLukw=",
+        "usagesDigest": "a5m1BreGnpOX3QXUQbasqFyQ0J1/CoIHcnSACeIWBYU=",
         "recordedFileInputs": {},
         "recordedDirentsInputs": {},
         "envVariables": {},
