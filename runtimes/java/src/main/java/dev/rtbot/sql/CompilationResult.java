@@ -65,6 +65,9 @@ public class CompilationResult {
     @SerializedName("delete_payload")
     public List<Double> deletePayload;
 
+    @SerializedName("dictionary_updates")
+    public Map<String, Map<String, String>> dictionaryUpdates;
+
     /**
      * Returns {@code true} if the compilation produced errors.
      */

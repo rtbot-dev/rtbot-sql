@@ -26,16 +26,21 @@ public class CatalogSnapshot {
     @SerializedName("tables")
     public Map<String, TableSchema> tables;
 
+    @SerializedName("dictionaries")
+    public Map<String, Map<Double, String>> dictionaries;
+
     public CatalogSnapshot() {
         this.streams = new HashMap<>();
         this.views = new HashMap<>();
         this.tables = new HashMap<>();
+        this.dictionaries = new HashMap<>();
     }
 
     @Override
     public String toString() {
         return "CatalogSnapshot{streams=" + streams.size()
                 + ", views=" + views.size()
-                + ", tables=" + tables.size() + '}';
+                + ", tables=" + tables.size()
+                + ", dictionaries=" + dictionaries.size() + '}';
     }
 }

@@ -45,7 +45,11 @@ jstring std_to_jstring(JNIEnv* env, const std::string& s) {
 // ---------------------------------------------------------------------------
 
 ColumnDef column_def_from_json(const json& j) {
-  return {j.at("name").get<std::string>(), j.at("index").get<int>()};
+  ColumnType col_type = ColumnType::DOUBLE;
+  if (j.contains("type") && j["type"].is_string()) {
+    if (j["type"] == "TEXT") col_type = ColumnType::TEXT;
+  }
+  return {j.at("name").get<std::string>(), j.at("index").get<int>(), col_type};
 }
 
 StreamSchema stream_schema_from_json(const json& j) {
@@ -120,6 +124,15 @@ CatalogSnapshot catalog_from_json(const std::string& catalog_json) {
   if (j.contains("tables")) {
     for (const auto& [name, val] : j["tables"].items()) {
       snap.tables[name] = table_schema_from_json(val);
+    }
+  }
+  if (j.contains("dictionaries") && j["dictionaries"].is_object()) {
+    for (auto& [key, entries] : j["dictionaries"].items()) {
+      std::map<double, std::string> dict_entries;
+      for (auto& [id_str, str_val] : entries.items()) {
+        dict_entries[std::stod(id_str)] = str_val.get<std::string>();
+      }
+      snap.dictionaries[key] = dict_entries;
     }
   }
   return snap;
@@ -223,7 +236,8 @@ json result_to_json(const CompilationResult& r) {
   schema["name"] = r.stream_schema.name;
   json cols = json::array();
   for (const auto& c : r.stream_schema.columns) {
-    cols.push_back({{"name", c.name}, {"index", c.index}});
+    cols.push_back({{"name", c.name}, {"index", c.index},
+                    {"type", (c.type == ColumnType::TEXT) ? "TEXT" : "DOUBLE"}});
   }
   schema["columns"] = cols;
   j["stream_schema"] = schema;
@@ -233,7 +247,8 @@ json result_to_json(const CompilationResult& r) {
   tschema["name"] = r.table_schema.name;
   json tcols = json::array();
   for (const auto& c : r.table_schema.columns) {
-    tcols.push_back({{"name", c.name}, {"index", c.index}});
+    tcols.push_back({{"name", c.name}, {"index", c.index},
+                     {"type", (c.type == ColumnType::TEXT) ? "TEXT" : "DOUBLE"}});
   }
   tschema["columns"] = tcols;
   tschema["changelog_stream"] = r.table_schema.changelog_stream;
@@ -243,6 +258,19 @@ json result_to_json(const CompilationResult& r) {
   // drop info
   j["drop_entity_name"] = r.drop_entity_name;
   j["drop_entity_type"] = entity_type_str(r.drop_entity_type);
+
+  // dictionary_updates
+  if (!r.dictionary_updates.empty()) {
+    json dict_json = json::object();
+    for (const auto& [key, entries] : r.dictionary_updates) {
+      json entry_json = json::object();
+      for (const auto& [id, str] : entries) {
+        entry_json[std::to_string(static_cast<int>(id))] = str;
+      }
+      dict_json[key] = entry_json;
+    }
+    j["dictionary_updates"] = dict_json;
+  }
 
   return j;
 }

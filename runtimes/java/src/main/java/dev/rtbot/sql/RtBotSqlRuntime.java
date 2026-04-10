@@ -122,6 +122,60 @@ public class RtBotSqlRuntime {
     }
 
     /**
+     * Insert a row with mixed types (doubles and strings for TEXT columns).
+     *
+     * <p>Strings are dictionary-encoded to doubles before passing to the
+     * existing {@link #insert(String, long, List)} pipeline. Each TEXT column
+     * gets its own {@link StringDictionary} keyed by
+     * {@code streamName + "." + columnName}.
+     *
+     * @param streamName the target stream
+     * @param timestamp  the explicit timestamp (must be monotonically increasing per stream)
+     * @param values     mixed list — {@link String} for TEXT columns, {@link Number} for DOUBLE columns
+     * @throws IllegalArgumentException if streamName is null, stream doesn't exist,
+     *         column count mismatches, or value types don't match column types
+     */
+    public void insertMixed(String streamName, long timestamp, List<Object> values) {
+        if (streamName == null) {
+            throw new IllegalArgumentException("streamName must not be null");
+        }
+        StreamSchema schema = catalog.lookupStream(streamName);
+        if (schema == null) {
+            throw new IllegalArgumentException("unknown stream: " + streamName);
+        }
+        if (values.size() != schema.columns.size()) {
+            throw new IllegalArgumentException(
+                "expected " + schema.columns.size() + " values, got " + values.size());
+        }
+
+        List<Double> encoded = new ArrayList<>(values.size());
+        for (int i = 0; i < values.size(); i++) {
+            ColumnDef col = schema.columns.get(i);
+            Object val = values.get(i);
+
+            if (col.isText()) {
+                if (!(val instanceof String)) {
+                    throw new IllegalArgumentException(
+                        "expected String for TEXT column '" + col.name
+                        + "', got " + val.getClass().getSimpleName());
+                }
+                String dictKey = streamName + "." + col.name;
+                StringDictionary dict = catalog.getOrCreateDictionary(dictKey);
+                encoded.add(dict.encode((String) val));
+            } else {
+                if (!(val instanceof Number)) {
+                    throw new IllegalArgumentException(
+                        "expected Number for DOUBLE column '" + col.name
+                        + "', got " + val.getClass().getSimpleName());
+                }
+                encoded.add(((Number) val).doubleValue());
+            }
+        }
+
+        insert(streamName, timestamp, encoded);
+    }
+
+    /**
      * Insert a message with an explicit timestamp into a stream and propagate
      * to dependent views.
      *
@@ -236,6 +290,50 @@ public class RtBotSqlRuntime {
     }
 
     // =================================================================
+    // Output decoding
+    // =================================================================
+
+    /**
+     * Decode a raw output row, converting TEXT column dictionary IDs back to strings.
+     *
+     * <p>For each column in the stream schema, if the column is TEXT, the
+     * corresponding double value is looked up in the stream's
+     * {@link StringDictionary} (keyed by {@code "streamName.columnName"}).
+     * If the lookup succeeds, the string replaces the numeric ID in the
+     * returned list; otherwise the raw double is preserved.
+     *
+     * <p>If the stream is unknown or values is null, the raw doubles are
+     * returned as-is.
+     *
+     * @param streamName the stream/view name for schema lookup
+     * @param values     raw double values from the pipeline
+     * @return decoded values — String for TEXT columns, Double for DOUBLE columns
+     */
+    public List<Object> decodeRow(String streamName, List<Double> values) {
+        StreamSchema schema = catalog.lookupStream(streamName);
+        if (schema == null || values == null) {
+            return new ArrayList<>(values != null ? values : List.of());
+        }
+
+        List<Object> decoded = new ArrayList<>(values.size());
+        for (int i = 0; i < values.size(); i++) {
+            if (i < schema.columns.size() && schema.columns.get(i).isText()) {
+                String dictKey = streamName + "." + schema.columns.get(i).name;
+                StringDictionary dict = catalog.lookupDictionary(dictKey);
+                if (dict != null) {
+                    String str = dict.decode(values.get(i));
+                    decoded.add(str != null ? str : values.get(i));
+                } else {
+                    decoded.add(values.get(i));
+                }
+            } else {
+                decoded.add(values.get(i));
+            }
+        }
+        return decoded;
+    }
+
+    // =================================================================
     // Testing accessors
     // =================================================================
 
@@ -300,6 +398,19 @@ public class RtBotSqlRuntime {
                 && payload.size() != schema.columns.size()) {
             throw new SqlError("INSERT payload length mismatch for " + streamName
                     + ": expected " + schema.columns.size() + ", got " + payload.size());
+        }
+
+        // Sync dictionary updates from C++ compiler back to Java catalog.
+        if (result.dictionaryUpdates != null) {
+            for (Map.Entry<String, Map<String, String>> entry : result.dictionaryUpdates.entrySet()) {
+                String dictKey = entry.getKey();
+                StringDictionary dict = catalog.getOrCreateDictionary(dictKey);
+                for (Map.Entry<String, String> mapping : entry.getValue().entrySet()) {
+                    double id = Double.parseDouble(mapping.getKey());
+                    String str = mapping.getValue();
+                    dict.putMapping(id, str);
+                }
+            }
         }
 
         appendAndPropagate(streamName, nextTimestamp(), payload);
@@ -741,9 +852,13 @@ public class RtBotSqlRuntime {
     }
 
     /**
-     * Serialize the full runtime state (pipelines) for persistence.
+     * Serialize the full runtime state (pipelines and dictionaries) for persistence.
      *
-     * @return a map of pipeline ID to serialized JSON state
+     * <p>Pipeline states are keyed by view name. Dictionary states are keyed by
+     * {@code "dict:" + dictKey} (e.g. {@code "dict:sensors.location"}) with JSON
+     * values from {@link StringDictionary#toJson()}.
+     *
+     * @return a map of state keys to serialized JSON values
      */
     public Map<String, String> serializeState() {
         Map<String, String> state = new HashMap<>();
@@ -755,20 +870,40 @@ public class RtBotSqlRuntime {
                 // Skip pipelines that fail to serialize
             }
         }
+
+        // Serialize dictionaries alongside pipeline state
+        for (Map.Entry<String, StringDictionary> entry : catalog.getDictionaries().entrySet()) {
+            if (!entry.getValue().isEmpty()) {
+                state.put("dict:" + entry.getKey(), entry.getValue().toJson());
+            }
+        }
+
         return state;
     }
 
     /**
-     * Restore pipeline state from a previously serialized state map.
+     * Restore pipeline and dictionary state from a previously serialized state map.
      *
-     * @param state map of view name to serialized JSON state
+     * <p>Entries with keys prefixed by {@code "dict:"} are restored as
+     * {@link StringDictionary} instances in the catalog. All other entries
+     * are treated as pipeline state keyed by view name.
+     *
+     * @param state map of state keys to serialized JSON values
      */
     public void restoreState(Map<String, String> state) {
         for (Map.Entry<String, String> entry : state.entrySet()) {
-            String viewName = entry.getKey();
-            String pipelineId = viewPipelines.get(viewName);
-            if (pipelineId != null) {
-                runner.restore(pipelineId, entry.getValue());
+            if (entry.getKey().startsWith("dict:")) {
+                // Restore dictionary
+                String dictKey = entry.getKey().substring(5);
+                StringDictionary dict = StringDictionary.fromJson(entry.getValue());
+                catalog.registerDictionary(dictKey, dict);
+            } else {
+                // Restore pipeline state
+                String viewName = entry.getKey();
+                String pipelineId = viewPipelines.get(viewName);
+                if (pipelineId != null) {
+                    runner.restore(pipelineId, entry.getValue());
+                }
             }
         }
     }

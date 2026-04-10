@@ -1210,6 +1210,25 @@ public class RtBotSqlRuntimeTest {
     // Multi-stream timestamp synchronization
     // -----------------------------------------------------------------
 
+    // -----------------------------------------------------------------
+    // Column type preservation (TEXT vs DOUBLE)
+    // -----------------------------------------------------------------
+
+    @Test
+    public void createStreamWithTextColumnPreservesType() {
+        runtime.execute("CREATE STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)");
+        StreamSchema schema = runtime.getCatalog().lookupStream("sensors");
+        assertNotNull(schema);
+        assertEquals(3, schema.columns.size());
+        assertEquals("DOUBLE", schema.columns.get(0).type);
+        assertEquals("TEXT", schema.columns.get(1).type);
+        assertEquals("DOUBLE", schema.columns.get(2).type);
+    }
+
+    // -----------------------------------------------------------------
+    // Multi-stream timestamp synchronization
+    // -----------------------------------------------------------------
+
     @Test
     public void multiStreamNonMatchingTimestampsProduceNoOutput() {
         runtime.execute("CREATE STREAM stream_a (value DOUBLE)");
@@ -1290,6 +1309,434 @@ public class RtBotSqlRuntimeTest {
         assertEquals(20.0, result.rows.get(0).get(bIdx), 1e-9);
     }
 
+    // -----------------------------------------------------------------
+    // Dictionary storage in catalog
+    // -----------------------------------------------------------------
+
+    @Test
+    public void catalogDictionaryStorageRoundTrip() {
+        runtime.execute("CREATE STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)");
+        InMemoryCatalog catalog = runtime.getCatalog();
+
+        StringDictionary dict = catalog.getOrCreateDictionary("sensors.location");
+        double id1 = dict.encode("Bay A");
+        double id2 = dict.encode("Bay B");
+        assertEquals(1.0, id1, 1e-9);
+        assertEquals(2.0, id2, 1e-9);
+
+        // Verify it's in the snapshot
+        CatalogSnapshot snap = catalog.snapshot();
+        assertNotNull(snap.dictionaries);
+        assertTrue(snap.dictionaries.containsKey("sensors.location"));
+    }
+
+    // -----------------------------------------------------------------
+    // insertMixed() — string-aware insert with dictionary encoding
+    // -----------------------------------------------------------------
+
+    @Test
+    public void insertWithStringValueEncodesViaDictionary() {
+        runtime.execute("CREATE STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)");
+        runtime.insertMixed("sensors", 1000L, Arrays.asList(1.0, "Bay A", 42.0));
+
+        // Verify dictionary was populated
+        StringDictionary dict = runtime.getCatalog().lookupDictionary("sensors.location");
+        assertNotNull(dict);
+        assertEquals(1, dict.size());
+        assertEquals("Bay A", dict.decode(1.0));
+    }
+
+    @Test
+    public void insertMixedReusesExistingDictionaryIds() {
+        runtime.execute("CREATE STREAM sensors (location TEXT, value DOUBLE PRECISION)");
+        runtime.insertMixed("sensors", 1000L, Arrays.asList("Bay A", 10.0));
+        runtime.insertMixed("sensors", 2000L, Arrays.asList("Bay A", 20.0));
+        runtime.insertMixed("sensors", 3000L, Arrays.asList("Bay B", 30.0));
+
+        StringDictionary dict = runtime.getCatalog().lookupDictionary("sensors.location");
+        assertNotNull(dict);
+        assertEquals(2, dict.size());
+        assertEquals("Bay A", dict.decode(1.0));
+        assertEquals("Bay B", dict.decode(2.0));
+    }
+
+    @Test(expected = IllegalArgumentException.class)
+    public void insertMixedStringIntoDoubleColumnThrows() {
+        runtime.execute("CREATE STREAM ticks (value DOUBLE PRECISION)");
+        runtime.insertMixed("ticks", 1000L, Arrays.asList((Object) "hello"));
+    }
+
+    @Test(expected = IllegalArgumentException.class)
+    public void insertMixedDoubleIntoTextColumnThrows() {
+        runtime.execute("CREATE STREAM sensors (location TEXT)");
+        runtime.insertMixed("sensors", 1000L, Arrays.asList((Object) 42.0));
+    }
+
+    @Test
+    public void insertMixedWithEmptyStringWorks() {
+        runtime.execute("CREATE STREAM sensors (location TEXT, value DOUBLE PRECISION)");
+        runtime.insertMixed("sensors", 1000L, Arrays.asList("", 42.0));
+        StringDictionary dict = runtime.getCatalog().lookupDictionary("sensors.location");
+        assertEquals(1, dict.size());
+        assertEquals("", dict.decode(1.0));
+    }
+
+    // -----------------------------------------------------------------
+    // decodeRow() — dictionary ID → string decoding on output
+    // -----------------------------------------------------------------
+
+    @Test
+    public void decodeOutputValuesConvertsTextColumnsToStrings() {
+        runtime.execute("CREATE STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)");
+        runtime.insertMixed("sensors", 1000L, List.of(1.0, "Bay A", 42.0));
+        runtime.insertMixed("sensors", 2000L, List.of(2.0, "Bay B", 99.0));
+
+        Object resultObj = runtime.execute("SELECT * FROM sensors LIMIT 2");
+        SelectResult result = (SelectResult) resultObj;
+
+        // Raw values have dictionary IDs
+        assertEquals(1.0, result.rows.get(0).get(1), 1e-9);
+
+        // Decode should return mixed list with strings
+        List<Object> decoded0 = runtime.decodeRow("sensors", result.rows.get(0));
+        assertEquals(1.0, ((Number)decoded0.get(0)).doubleValue(), 1e-9);
+        assertEquals("Bay A", decoded0.get(1));
+        assertEquals(42.0, ((Number)decoded0.get(2)).doubleValue(), 1e-9);
+
+        List<Object> decoded1 = runtime.decodeRow("sensors", result.rows.get(1));
+        assertEquals("Bay B", decoded1.get(1));
+    }
+
+    @Test
+    public void decodeRowWithAllDoubleColumnsReturnsDoubles() {
+        runtime.execute("CREATE STREAM ticks (value DOUBLE PRECISION)");
+        runtime.execute("INSERT INTO ticks VALUES (42)");
+
+        Object resultObj = runtime.execute("SELECT * FROM ticks LIMIT 1");
+        SelectResult result = (SelectResult) resultObj;
+
+        List<Object> decoded = runtime.decodeRow("ticks", result.rows.get(0));
+        assertEquals(42.0, ((Number)decoded.get(0)).doubleValue(), 1e-9);
+    }
+
+    @Test
+    public void decodeRowWithUnknownStreamReturnsRawDoubles() {
+        List<Object> decoded = runtime.decodeRow("nonexistent", List.of(1.0, 2.0));
+        assertEquals(1.0, ((Number)decoded.get(0)).doubleValue(), 1e-9);
+        assertEquals(2.0, ((Number)decoded.get(1)).doubleValue(), 1e-9);
+    }
+
+    // -----------------------------------------------------------------
+    // Dictionary persistence across serialize/restore
+    // -----------------------------------------------------------------
+
+    @Test
+    public void dictionaryStateSurvivesSerializeRestore() {
+        runtime.execute("CREATE STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)");
+        runtime.insertMixed("sensors", 1000L, List.of(1.0, "Bay A", 42.0));
+        runtime.insertMixed("sensors", 2000L, List.of(2.0, "Bay B", 99.0));
+
+        // Serialize
+        Map<String, String> state = runtime.serializeState();
+        assertNotNull(state);
+
+        // Create fresh runtime, restore
+        RtBotSqlRuntime runtime2 = new RtBotSqlRuntime();
+        runtime2.setCollectMode(true);
+        runtime2.execute("CREATE STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)");
+        runtime2.restoreState(state);
+
+        // Dictionary should be restored
+        StringDictionary dict = runtime2.getCatalog().lookupDictionary("sensors.location");
+        assertNotNull("dictionary should survive restore", dict);
+        assertEquals(2, dict.size());
+        assertEquals("Bay A", dict.decode(1.0));
+        assertEquals("Bay B", dict.decode(2.0));
+
+        // New inserts should get next ID
+        runtime2.insertMixed("sensors", 3000L, List.of(3.0, "Bay C", 55.0));
+        assertEquals(3.0, dict.encode("Bay C"), 1e-9);  // already encoded, returns same ID
+
+        runtime2.destroyAll();
+    }
+
+    @Test
+    public void emptyDictionarySerializesCleanly() {
+        runtime.execute("CREATE STREAM ticks (value DOUBLE PRECISION)");
+        Map<String, String> state = runtime.serializeState();
+        assertNotNull(state);
+
+        RtBotSqlRuntime runtime2 = new RtBotSqlRuntime();
+        runtime2.setCollectMode(true);
+        runtime2.execute("CREATE STREAM ticks (value DOUBLE PRECISION)");
+        runtime2.restoreState(state);
+        // No crash, no dictionaries
+        assertNull(runtime2.getCatalog().lookupDictionary("ticks.value"));
+        runtime2.destroyAll();
+    }
+
+    // =================================================================
+    // End-to-End Integration: Full Pipeline with TEXT Columns (Task 14)
+    // =================================================================
+
+    /**
+     * E2E: TEXT column with GROUP BY on a numeric column.
+     *
+     * Verifies that dictionary-encoded TEXT values coexist with numeric
+     * GROUP BY aggregation. The TEXT column (location) is in the source
+     * stream but not in the GROUP BY key or aggregated output — it only
+     * participates as a passthrough in the source rows.
+     */
+    @Test
+    public void endToEndTextColumnWithGroupBy() {
+        runtime.execute("CREATE STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)");
+
+        runtime.insertMixed("sensors", 1000L, List.of(1.0, "Bay A", 10.0));
+        runtime.insertMixed("sensors", 2000L, List.of(1.0, "Bay A", 20.0));
+        runtime.insertMixed("sensors", 3000L, List.of(2.0, "Bay B", 30.0));
+        runtime.insertMixed("sensors", 4000L, List.of(2.0, "Bay B", 40.0));
+
+        // GROUP BY on numeric column device_id — TEXT column not selected
+        runtime.execute(
+            "CREATE MATERIALIZED VIEW avg_by_device AS "
+            + "SELECT device_id, AVG(value) AS avg_val "
+            + "FROM sensors GROUP BY device_id"
+        );
+
+        Object resultObj = runtime.execute("SELECT * FROM avg_by_device");
+        assertTrue(resultObj instanceof SelectResult);
+        SelectResult result = (SelectResult) resultObj;
+
+        assertEquals(2, result.rows.size());
+
+        // Build map by device_id for order-independent assertions
+        int deviceIdx = result.columns.indexOf("device_id");
+        int avgIdx = result.columns.indexOf("avg_val");
+        assertTrue("Should have device_id column", deviceIdx >= 0);
+        assertTrue("Should have avg_val column", avgIdx >= 0);
+
+        Map<Double, Double> avgByDevice = new HashMap<>();
+        for (List<Double> row : result.rows) {
+            avgByDevice.put(row.get(deviceIdx), row.get(avgIdx));
+        }
+
+        // device 1: avg(10, 20) = 15.0
+        assertEquals(15.0, avgByDevice.get(1.0), 1e-9);
+        // device 2: avg(30, 40) = 35.0
+        assertEquals(35.0, avgByDevice.get(2.0), 1e-9);
+    }
+
+    /**
+     * E2E: TEXT column with subscription API.
+     *
+     * Verifies that raw subscription output contains dictionary IDs
+     * (as doubles) for TEXT columns, and that {@code decodeRow()} correctly
+     * converts them back to human-readable strings.
+     */
+    @Test
+    public void endToEndTextColumnWithSubscription() {
+        RtBotSqlRuntime subRuntime = new RtBotSqlRuntime();
+        try {
+            subRuntime.execute("CREATE STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)");
+
+            CollectingListener listener = new CollectingListener();
+            subRuntime.subscribe("sensors", listener);
+
+            subRuntime.insertMixed("sensors", 1000L, List.of(1.0, "Bay A", 42.0));
+
+            assertEquals("Subscriber should receive 1 message", 1, listener.count());
+
+            // Raw subscription sees dictionary IDs — "Bay A" encoded as 1.0
+            List<Double> rawValues = listener.values.get(0);
+            assertEquals(1.0, rawValues.get(0), 1e-9);  // device_id
+            assertEquals(1.0, rawValues.get(1), 1e-9);  // "Bay A" -> dictionary ID 1.0
+            assertEquals(42.0, rawValues.get(2), 1e-9);  // value
+
+            // decodeRow converts dictionary IDs back to strings
+            List<Object> decoded = subRuntime.decodeRow("sensors", rawValues);
+            assertEquals(1.0, ((Number) decoded.get(0)).doubleValue(), 1e-9);
+            assertEquals("Bay A", decoded.get(1));
+            assertEquals(42.0, ((Number) decoded.get(2)).doubleValue(), 1e-9);
+
+            // Insert a second row with same string — should reuse dictionary ID
+            subRuntime.insertMixed("sensors", 2000L, List.of(2.0, "Bay A", 99.0));
+            List<Double> rawValues2 = listener.values.get(1);
+            assertEquals(1.0, rawValues2.get(1), 1e-9);  // same dictionary ID
+
+            // Insert with new string — gets next dictionary ID
+            subRuntime.insertMixed("sensors", 3000L, List.of(3.0, "Bay B", 55.0));
+            List<Double> rawValues3 = listener.values.get(2);
+            assertEquals(2.0, rawValues3.get(1), 1e-9);  // "Bay B" -> dictionary ID 2.0
+
+            List<Object> decoded3 = subRuntime.decodeRow("sensors", rawValues3);
+            assertEquals("Bay B", decoded3.get(1));
+        } finally {
+            subRuntime.destroyAll();
+        }
+    }
+
+    /**
+     * E2E: SQL INSERT with string literal for TEXT column.
+     *
+     * Verifies that the C++ compiler's dictionary encoding of string literals
+     * in INSERT statements flows through the JNI bridge. The compiler encodes
+     * 'Bay A' to a numeric dictionary ID in the insert_payload, and the
+     * {@code dictionary_updates} field syncs the mapping back to the Java
+     * catalog so that subsequent INSERTs and {@code decodeRow()} work correctly.
+     */
+    @Test
+    public void endToEndSqlInsertWithStringLiteral() {
+        runtime.execute("CREATE STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)");
+
+        // SQL INSERT with string literal — C++ compiler encodes 'Bay A' to dictionary ID
+        runtime.execute("INSERT INTO sensors VALUES (1, 'Bay A', 42.0)");
+
+        Object resultObj = runtime.execute("SELECT * FROM sensors LIMIT 1");
+        assertTrue(resultObj instanceof SelectResult);
+        SelectResult result = (SelectResult) resultObj;
+        assertEquals(1, result.rows.size());
+
+        // The C++ compiler encodes 'Bay A' as dictionary ID 1.0
+        int locIdx = result.columns.indexOf("location");
+        assertTrue("Should have location column", locIdx >= 0);
+        assertEquals(1.0, result.rows.get(0).get(locIdx), 1e-9);
+
+        // Verify other columns are correct
+        int deviceIdx = result.columns.indexOf("device_id");
+        int valueIdx = result.columns.indexOf("value");
+        assertEquals(1.0, result.rows.get(0).get(deviceIdx), 1e-9);
+        assertEquals(42.0, result.rows.get(0).get(valueIdx), 1e-9);
+
+        // With dictionary sync, decodeRow should now return string values
+        List<Object> decoded = runtime.decodeRow("sensors", result.rows.get(0));
+        assertEquals("Bay A", decoded.get(locIdx));
+        assertEquals(1.0, decoded.get(deviceIdx));
+        assertEquals(42.0, decoded.get(valueIdx));
+
+        // Second INSERT with same string literal — both get 1.0
+        runtime.execute("INSERT INTO sensors VALUES (2, 'Bay A', 99.0)");
+
+        Object resultObj2 = runtime.execute("SELECT * FROM sensors LIMIT 10");
+        SelectResult result2 = (SelectResult) resultObj2;
+        assertEquals(2, result2.rows.size());
+        assertEquals(1.0, result2.rows.get(0).get(locIdx), 1e-9);
+        assertEquals(1.0, result2.rows.get(1).get(locIdx), 1e-9);
+
+        // Both rows should decode to "Bay A"
+        List<Object> decoded0 = runtime.decodeRow("sensors", result2.rows.get(0));
+        List<Object> decoded1 = runtime.decodeRow("sensors", result2.rows.get(1));
+        assertEquals("Bay A", decoded0.get(locIdx));
+        assertEquals("Bay A", decoded1.get(locIdx));
+    }
+
+    /**
+     * E2E: Mixed insertMixed + SQL INSERT shows that insertMixed populates
+     * the Java dictionary, enabling decodeRow() for all rows.
+     *
+     * <p>This is the recommended pattern: use insertMixed() for data with
+     * TEXT columns when decode support is needed.
+     */
+    @Test
+    public void endToEndInsertMixedThenSelectAndDecode() {
+        runtime.execute("CREATE STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)");
+
+        // insertMixed handles dictionary encoding on the Java side
+        runtime.insertMixed("sensors", 1000L, List.of(1.0, "Bay A", 42.0));
+        runtime.insertMixed("sensors", 2000L, List.of(2.0, "Bay B", 99.0));
+        runtime.insertMixed("sensors", 3000L, List.of(3.0, "Bay A", 55.0));
+
+        Object resultObj = runtime.execute("SELECT * FROM sensors LIMIT 10");
+        SelectResult result = (SelectResult) resultObj;
+        assertEquals(3, result.rows.size());
+
+        int locIdx = result.columns.indexOf("location");
+        // 'Bay A' always gets dictionary ID 1.0, 'Bay B' gets 2.0
+        assertEquals(1.0, result.rows.get(0).get(locIdx), 1e-9);
+        assertEquals(2.0, result.rows.get(1).get(locIdx), 1e-9);
+        assertEquals(1.0, result.rows.get(2).get(locIdx), 1e-9);  // reused
+
+        // decodeRow converts all three rows correctly
+        List<Object> decoded0 = runtime.decodeRow("sensors", result.rows.get(0));
+        assertEquals("Bay A", decoded0.get(locIdx));
+
+        List<Object> decoded1 = runtime.decodeRow("sensors", result.rows.get(1));
+        assertEquals("Bay B", decoded1.get(locIdx));
+
+        List<Object> decoded2 = runtime.decodeRow("sensors", result.rows.get(2));
+        assertEquals("Bay A", decoded2.get(locIdx));
+    }
+
+    /**
+     * E2E: TEXT column serialize/restore and continue inserting.
+     *
+     * Verifies that string dictionaries are persisted in the serialized state
+     * and correctly restored in a fresh runtime. After restore, new string
+     * values get the next sequential dictionary IDs.
+     */
+    @Test
+    public void endToEndTextColumnSerializeRestoreAndContinue() {
+        runtime.execute("CREATE STREAM sensors (location TEXT, value DOUBLE PRECISION)");
+        runtime.insertMixed("sensors", 1000L, List.of("Bay A", 10.0));
+        runtime.insertMixed("sensors", 2000L, List.of("Bay B", 20.0));
+
+        // Verify dictionary state before serialize
+        StringDictionary dictBefore = runtime.getCatalog().lookupDictionary("sensors.location");
+        assertNotNull(dictBefore);
+        assertEquals(2, dictBefore.size());
+
+        // Serialize
+        Map<String, String> state = runtime.serializeState();
+        assertNotNull(state);
+        assertTrue("State should contain dictionary entry",
+                   state.containsKey("dict:sensors.location"));
+
+        // Fresh runtime with same schema
+        RtBotSqlRuntime runtime2 = new RtBotSqlRuntime();
+        runtime2.setCollectMode(true);
+        try {
+            runtime2.execute("CREATE STREAM sensors (location TEXT, value DOUBLE PRECISION)");
+            runtime2.restoreState(state);
+
+            // Dictionary should be restored with both entries
+            StringDictionary restoredDict = runtime2.getCatalog().lookupDictionary("sensors.location");
+            assertNotNull("Dictionary should survive serialize/restore", restoredDict);
+            assertEquals(2, restoredDict.size());
+            assertEquals("Bay A", restoredDict.decode(1.0));
+            assertEquals("Bay B", restoredDict.decode(2.0));
+
+            // Insert new data — should get next sequential ID (3.0)
+            runtime2.insertMixed("sensors", 3000L, List.of("Bay C", 30.0));
+
+            assertEquals(3, restoredDict.size());
+            assertEquals("Bay C", restoredDict.decode(3.0));
+
+            // Existing strings should still decode correctly
+            assertEquals("Bay A", restoredDict.decode(1.0));
+            assertEquals("Bay B", restoredDict.decode(2.0));
+
+            // Re-inserting an existing string should reuse the same ID
+            runtime2.insertMixed("sensors", 4000L, List.of("Bay A", 40.0));
+            assertEquals("Dictionary should still have 3 entries (Bay A reused)",
+                         3, restoredDict.size());
+
+            // Verify the full data via SELECT + decode
+            Object resultObj = runtime2.execute("SELECT * FROM sensors LIMIT 10");
+            SelectResult result = (SelectResult) resultObj;
+            // Only rows inserted in runtime2 (after restore), not the original ones
+            assertEquals(2, result.rows.size());
+
+            List<Object> decoded0 = runtime2.decodeRow("sensors", result.rows.get(0));
+            assertEquals("Bay C", decoded0.get(0));
+            assertEquals(30.0, ((Number) decoded0.get(1)).doubleValue(), 1e-9);
+
+            List<Object> decoded1 = runtime2.decodeRow("sensors", result.rows.get(1));
+            assertEquals("Bay A", decoded1.get(0));
+            assertEquals(40.0, ((Number) decoded1.get(1)).doubleValue(), 1e-9);
+        } finally {
+            runtime2.destroyAll();
+        }
+    }
+
     @Test
     public void multiStreamSubscriberReceivesOnlyMatchingTimestamps() {
         RtBotSqlRuntime rt = new RtBotSqlRuntime();
@@ -1319,5 +1766,85 @@ public class RtBotSqlRuntimeTest {
         } finally {
             rt.destroyAll();
         }
+    }
+
+    /**
+     * SQL INSERT with string literal syncs dictionary back to catalog.
+     */
+    @Test
+    public void sqlInsertStringLiteralSyncsDictionaryToCatalog() {
+        runtime.execute("CREATE STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)");
+        runtime.execute("INSERT INTO sensors VALUES (1, 'Bay A', 42.0)");
+
+        InMemoryCatalog cat = runtime.getCatalog();
+        StringDictionary dict = cat.lookupDictionary("sensors.location");
+        assertNotNull("Dictionary should exist after SQL INSERT with string literal", dict);
+        assertEquals("Bay A", dict.decode(1.0));
+    }
+
+    /**
+     * Consecutive SQL INSERTs with different string literals produce
+     * distinct dictionary IDs and decodeRow works for all.
+     */
+    @Test
+    public void consecutiveSqlInsertsWithDifferentStringsProduceDistinctIds() {
+        runtime.execute("CREATE STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)");
+        runtime.execute("INSERT INTO sensors VALUES (1, 'Bay A', 42.0)");
+        runtime.execute("INSERT INTO sensors VALUES (2, 'Bay B', 99.0)");
+        runtime.execute("INSERT INTO sensors VALUES (3, 'Bay A', 55.0)");
+
+        Object resultObj = runtime.execute("SELECT * FROM sensors LIMIT 10");
+        assertTrue(resultObj instanceof SelectResult);
+        SelectResult result = (SelectResult) resultObj;
+        assertEquals(3, result.rows.size());
+
+        int locIdx = result.columns.indexOf("location");
+        assertTrue(locIdx >= 0);
+
+        // 'Bay A' should consistently get ID 1.0, 'Bay B' should get 2.0
+        assertEquals(1.0, result.rows.get(0).get(locIdx), 1e-9);
+        assertEquals(2.0, result.rows.get(1).get(locIdx), 1e-9);
+        assertEquals(1.0, result.rows.get(2).get(locIdx), 1e-9);
+
+        // decodeRow should work for all rows
+        List<Object> decoded0 = runtime.decodeRow("sensors", result.rows.get(0));
+        List<Object> decoded1 = runtime.decodeRow("sensors", result.rows.get(1));
+        List<Object> decoded2 = runtime.decodeRow("sensors", result.rows.get(2));
+        assertEquals("Bay A", decoded0.get(locIdx));
+        assertEquals("Bay B", decoded1.get(locIdx));
+        assertEquals("Bay A", decoded2.get(locIdx));
+    }
+
+    /**
+     * Mixed path: insertMixed + SQL INSERT on the same stream.
+     * Dictionary IDs must stay consistent across both insert paths.
+     */
+    @Test
+    public void mixedInsertPathsMaintainDictionaryCoherence() {
+        runtime.execute("CREATE STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)");
+
+        // insertMixed first — Java dictionary gets Bay A=1.0
+        runtime.insertMixed("sensors", 1000L, List.of(1.0, "Bay A", 42.0));
+
+        // SQL INSERT second — C++ compiler should get the existing dictionary
+        // via catalog snapshot and assign Bay B=2.0
+        runtime.execute("INSERT INTO sensors VALUES (2, 'Bay B', 99.0)");
+
+        // insertMixed again — Java dictionary should know both
+        runtime.insertMixed("sensors", 3000L, List.of(3.0, "Bay A", 55.0));
+
+        Object resultObj = runtime.execute("SELECT * FROM sensors LIMIT 10");
+        SelectResult result = (SelectResult) resultObj;
+        assertEquals(3, result.rows.size());
+
+        int locIdx = result.columns.indexOf("location");
+        assertEquals(1.0, result.rows.get(0).get(locIdx), 1e-9);  // Bay A
+        assertEquals(2.0, result.rows.get(1).get(locIdx), 1e-9);  // Bay B
+        assertEquals(1.0, result.rows.get(2).get(locIdx), 1e-9);  // Bay A
+
+        // All rows should decode correctly
+        assertEquals("Bay A", runtime.decodeRow("sensors", result.rows.get(0)).get(locIdx));
+        assertEquals("Bay B", runtime.decodeRow("sensors", result.rows.get(1)).get(locIdx));
+        assertEquals("Bay A", runtime.decodeRow("sensors", result.rows.get(2)).get(locIdx));
     }
 }

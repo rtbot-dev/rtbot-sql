@@ -245,6 +245,21 @@ java_test(
 )
 
 # ---------------------------------------------------------------------------
+# StringDictionary — pure-Java bidirectional string↔double mapping
+#
+# Run:  bazel test //runtimes/java:string-dictionary-test --test_output=all
+# ---------------------------------------------------------------------------
+java_test(
+    name = "string-dictionary-test",
+    srcs = ["src/test/java/dev/rtbot/sql/StringDictionaryTest.java"],
+    test_class = "dev.rtbot.sql.StringDictionaryTest",
+    deps = [
+        ":rtbot-sql-java",
+        "@maven//:junit_junit",
+    ],
+)
+
+# ---------------------------------------------------------------------------
 # Load test — bearing preset throughput benchmark
 #
 # Measures msgs/sec, memory, and CPU utilization by feeding synthetic

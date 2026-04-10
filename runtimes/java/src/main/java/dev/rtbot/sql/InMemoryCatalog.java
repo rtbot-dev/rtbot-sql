@@ -23,6 +23,7 @@ public class InMemoryCatalog {
     private final Map<String, StreamSchema> streams = new LinkedHashMap<>();
     private final Map<String, ViewMeta> views = new LinkedHashMap<>();
     private final Map<String, TableSchema> tables = new LinkedHashMap<>();
+    private final Map<String, StringDictionary> dictionaries = new LinkedHashMap<>();
 
     private final Gson gson = new Gson();
 
@@ -134,6 +135,49 @@ public class InMemoryCatalog {
     }
 
     // -----------------------------------------------------------------
+    // Dictionary storage (TEXT column encoding)
+    // -----------------------------------------------------------------
+
+    /**
+     * Get or create a {@link StringDictionary} for the given key.
+     *
+     * <p>The key is typically {@code "stream.column"} for TEXT columns.
+     */
+    public StringDictionary getOrCreateDictionary(String key) {
+        return dictionaries.computeIfAbsent(key, k -> new StringDictionary());
+    }
+
+    /**
+     * Look up a dictionary by key.
+     *
+     * @return the dictionary, or {@code null} if not found
+     */
+    public StringDictionary lookupDictionary(String key) {
+        return dictionaries.get(key);
+    }
+
+    /**
+     * Register an existing dictionary under the given key.
+     */
+    public void registerDictionary(String key, StringDictionary dict) {
+        dictionaries.put(key, dict);
+    }
+
+    /**
+     * Remove a dictionary by key.
+     */
+    public void dropDictionary(String key) {
+        dictionaries.remove(key);
+    }
+
+    /**
+     * Returns a copy of all registered dictionaries.
+     */
+    public Map<String, StringDictionary> getDictionaries() {
+        return new LinkedHashMap<>(dictionaries);
+    }
+
+    // -----------------------------------------------------------------
     // Snapshot
     // -----------------------------------------------------------------
 
@@ -174,6 +218,11 @@ public class InMemoryCatalog {
                     original.keyColumns != null ? new ArrayList<>(original.keyColumns) : new ArrayList<>()
             );
             snap.tables.put(entry.getKey(), copy);
+        }
+
+        snap.dictionaries = new HashMap<>();
+        for (Map.Entry<String, StringDictionary> entry : dictionaries.entrySet()) {
+            snap.dictionaries.put(entry.getKey(), entry.getValue().allEntries());
         }
 
         return snap;
