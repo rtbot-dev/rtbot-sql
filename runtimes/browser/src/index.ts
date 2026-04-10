@@ -2,6 +2,7 @@ import { InMemoryCatalog } from "./catalog";
 import { InMemoryStreamStore, WatchCallback } from "./stream_store";
 import { StubPipelineRunner, PipelineRunner } from "./pipeline_runner";
 import { formatRow, FormattedRow } from "./formatter";
+import { StringDictionary } from "./string_dictionary";
 import {
   CatalogSnapshot,
   CompilationResult,
@@ -15,6 +16,7 @@ export {
   InMemoryStreamStore,
   StubPipelineRunner,
   formatRow,
+  StringDictionary,
 };
 export type {
   PipelineRunner,
@@ -78,6 +80,16 @@ export class RtBotSql {
         break;
 
       case "INSERT": {
+        // Sync dictionary updates from C++ compiler
+        if (result.dictionary_updates) {
+          for (const [dictKey, entries] of Object.entries(result.dictionary_updates)) {
+            const dict = this.catalog.getOrCreateDictionary(dictKey);
+            for (const [idStr, str] of Object.entries(entries)) {
+              dict.putMapping(Number(idStr), str);
+            }
+          }
+        }
+
         const msg: Message = {
           timestamp: Date.now(),
           values: result.insert_payload,
@@ -111,6 +123,59 @@ export class RtBotSql {
 
   getStore(): InMemoryStreamStore {
     return this.store;
+  }
+
+  insertMixed(streamName: string, timestamp: number, values: (number | string)[]): void {
+    const schema = this.catalog.lookupStream(streamName);
+    if (!schema) throw new Error(`unknown stream: ${streamName}`);
+    if (values.length !== schema.columns.length) {
+      throw new Error(
+        `expected ${schema.columns.length} values, got ${values.length}`,
+      );
+    }
+
+    const encoded: number[] = [];
+    for (let i = 0; i < values.length; i++) {
+      const col = schema.columns[i];
+      const val = values[i];
+
+      if (col.type === "TEXT") {
+        if (typeof val !== "string") {
+          throw new Error(
+            `expected string for TEXT column '${col.name}', got ${typeof val}`,
+          );
+        }
+        const dictKey = `${streamName}.${col.name}`;
+        const dict = this.catalog.getOrCreateDictionary(dictKey);
+        encoded.push(dict.encode(val));
+      } else {
+        if (typeof val === "string") {
+          throw new Error(
+            `expected number for DOUBLE column '${col.name}', got string`,
+          );
+        }
+        encoded.push(val);
+      }
+    }
+
+    this.store.append(streamName, { timestamp, values: encoded });
+  }
+
+  decodeRow(streamName: string, values: number[]): (number | string)[] {
+    const schema = this.catalog.lookupStream(streamName);
+    if (!schema) return [...values];
+
+    return values.map((val, i) => {
+      if (i < schema.columns.length && schema.columns[i].type === "TEXT") {
+        const dictKey = `${streamName}.${schema.columns[i].name}`;
+        const dict = this.catalog.lookupDictionary(dictKey);
+        if (dict) {
+          const s = dict.decode(val);
+          return s !== undefined ? s : val;
+        }
+      }
+      return val;
+    });
   }
 
   static compile(

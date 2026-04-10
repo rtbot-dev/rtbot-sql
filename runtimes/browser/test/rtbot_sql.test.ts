@@ -4,12 +4,14 @@ import {
   RtBotSql,
   formatRow,
   StubPipelineRunner,
+  StringDictionary,
 } from "../index";
 import type {
   RtBotSqlWasmModule,
   CompilationResult,
   ValidationResult,
   CatalogSnapshot,
+  ColumnDef,
   Message,
 } from "../index";
 
@@ -351,5 +353,319 @@ describe("RtBotSql lifecycle", () => {
     expect(received[1].values).toEqual([43]);
 
     unsub();
+  });
+});
+
+// --- Task 1: TypeScript type updates for dictionaries ---
+
+describe("TypeScript type updates for dictionaries", () => {
+  it("ColumnDef has optional type field", () => {
+    const col: ColumnDef = { name: "loc", index: 0, type: "TEXT" };
+    expect(col.type).toBe("TEXT");
+  });
+
+  it("ColumnDef type defaults to undefined (backward compat)", () => {
+    const col: ColumnDef = { name: "price", index: 0 };
+    expect(col.type).toBeUndefined();
+  });
+
+  it("CatalogSnapshot has optional dictionaries field", () => {
+    const snap: CatalogSnapshot = {
+      streams: {},
+      views: {},
+      tables: {},
+      dictionaries: { "s.col": { "1": "Bay A" } },
+    };
+    expect(snap.dictionaries!["s.col"]["1"]).toBe("Bay A");
+  });
+
+  it("CompilationResult has optional dictionary_updates field", () => {
+    const result: CompilationResult = {
+      statement_type: "INSERT",
+      entity_name: "s",
+      program_json: "",
+      field_map: {},
+      source_streams: [],
+      view_type: "SCALAR",
+      key_index: -1,
+      select_tier: "TIER1_READ",
+      insert_payload: [1.0],
+      stream_schema: { name: "", columns: [] },
+      table_schema: { name: "", columns: [], changelog_stream: "", key_columns: [] },
+      drop_entity_name: "",
+      drop_entity_type: "STREAM",
+      errors: [],
+      dictionary_updates: { "s.loc": { "1": "Bay A" } },
+    };
+    expect(result.dictionary_updates!["s.loc"]["1"]).toBe("Bay A");
+  });
+});
+
+// --- Task 2: StringDictionary ---
+
+describe("StringDictionary", () => {
+  it("encode assigns sequential IDs starting at 1", () => {
+    const d = new StringDictionary();
+    expect(d.encode("alpha")).toBe(1);
+    expect(d.encode("beta")).toBe(2);
+    expect(d.encode("alpha")).toBe(1);
+  });
+
+  it("decode roundtrip", () => {
+    const d = new StringDictionary();
+    d.encode("hello");
+    expect(d.decode(1)).toBe("hello");
+    expect(d.decode(99)).toBeUndefined();
+  });
+
+  it("lookup", () => {
+    const d = new StringDictionary();
+    d.encode("hello");
+    expect(d.lookup("hello")).toBe(1);
+    expect(d.lookup("unknown")).toBeUndefined();
+  });
+
+  it("putMapping adds new entry", () => {
+    const d = new StringDictionary();
+    d.putMapping(5, "hello");
+    expect(d.decode(5)).toBe("hello");
+    expect(d.lookup("hello")).toBe(5);
+    expect(d.encode("world")).toBe(6);
+  });
+
+  it("putMapping is idempotent for existing string", () => {
+    const d = new StringDictionary();
+    d.encode("hello");
+    d.putMapping(99, "hello");
+    expect(d.lookup("hello")).toBe(1);
+    expect(d.decode(99)).toBeUndefined();
+  });
+
+  it("putMapping is idempotent for existing ID", () => {
+    const d = new StringDictionary();
+    d.putMapping(1, "hello");
+    d.putMapping(1, "world");
+    expect(d.decode(1)).toBe("hello");
+    expect(d.lookup("world")).toBeUndefined();
+  });
+
+  it("size and isEmpty", () => {
+    const d = new StringDictionary();
+    expect(d.isEmpty).toBe(true);
+    expect(d.size).toBe(0);
+    d.encode("a");
+    expect(d.isEmpty).toBe(false);
+    expect(d.size).toBe(1);
+  });
+
+  it("allEntries returns all mappings", () => {
+    const d = new StringDictionary();
+    d.encode("alpha");
+    d.encode("beta");
+    expect(d.allEntries()).toEqual(new Map([[1, "alpha"], [2, "beta"]]));
+  });
+
+  it("restore from serialized state", () => {
+    const d = new StringDictionary();
+    d.restore({ "1": "alpha", "2": "beta" });
+    expect(d.decode(1)).toBe("alpha");
+    expect(d.decode(2)).toBe("beta");
+    expect(d.encode("gamma")).toBe(3);
+  });
+});
+
+// --- Task 3: InMemoryCatalog dictionary support ---
+
+describe("InMemoryCatalog dictionary support", () => {
+  it("getOrCreateDictionary returns same instance", () => {
+    const catalog = new InMemoryCatalog();
+    const d1 = catalog.getOrCreateDictionary("s.col");
+    const d2 = catalog.getOrCreateDictionary("s.col");
+    expect(d1).toBe(d2);
+  });
+
+  it("lookupDictionary returns undefined for unknown", () => {
+    const catalog = new InMemoryCatalog();
+    expect(catalog.lookupDictionary("unknown")).toBeUndefined();
+  });
+
+  it("snapshot includes dictionaries", () => {
+    const catalog = new InMemoryCatalog();
+    const d = catalog.getOrCreateDictionary("s.col");
+    d.encode("Bay A");
+    const snap = catalog.snapshot();
+    expect(snap.dictionaries).toBeDefined();
+    expect(snap.dictionaries!["s.col"]["1"]).toBe("Bay A");
+  });
+
+  it("drop clears related dictionaries", () => {
+    const catalog = new InMemoryCatalog();
+    catalog.registerStream("s", { name: "s", columns: [] });
+    catalog.getOrCreateDictionary("s.col").encode("Bay A");
+    catalog.drop("s");
+    expect(catalog.lookupDictionary("s.col")).toBeUndefined();
+  });
+});
+
+// --- Task 4: RtBotSql insertMixed and decodeRow ---
+
+describe("RtBotSql insertMixed and decodeRow", () => {
+  it("insertMixed encodes strings to dictionary IDs", () => {
+    const wasm = createMockWasm();
+    const rtbotSql = new RtBotSql({ wasmModule: wasm });
+    rtbotSql.getCatalog().registerStream("sensors", {
+      name: "sensors",
+      columns: [
+        { name: "device_id", index: 0, type: "DOUBLE" },
+        { name: "location", index: 1, type: "TEXT" },
+        { name: "value", index: 2, type: "DOUBLE" },
+      ],
+    });
+
+    rtbotSql.insertMixed("sensors", 1000, [1.0, "Bay A", 42.0]);
+    const msgs = rtbotSql.getStore().read("sensors");
+    expect(msgs).toHaveLength(1);
+    expect(msgs[0].values).toEqual([1.0, 1, 42.0]);
+  });
+
+  it("insertMixed reuses existing dictionary IDs", () => {
+    const wasm = createMockWasm();
+    const rtbotSql = new RtBotSql({ wasmModule: wasm });
+    rtbotSql.getCatalog().registerStream("sensors", {
+      name: "sensors",
+      columns: [
+        { name: "device_id", index: 0, type: "DOUBLE" },
+        { name: "location", index: 1, type: "TEXT" },
+        { name: "value", index: 2, type: "DOUBLE" },
+      ],
+    });
+
+    rtbotSql.insertMixed("sensors", 1000, [1.0, "Bay A", 42.0]);
+    rtbotSql.insertMixed("sensors", 2000, [2.0, "Bay B", 99.0]);
+    rtbotSql.insertMixed("sensors", 3000, [3.0, "Bay A", 55.0]);
+
+    const msgs = rtbotSql.getStore().read("sensors");
+    expect(msgs[0].values[1]).toBe(1);
+    expect(msgs[1].values[1]).toBe(2);
+    expect(msgs[2].values[1]).toBe(1);
+  });
+
+  it("decodeRow converts TEXT column IDs back to strings", () => {
+    const wasm = createMockWasm();
+    const rtbotSql = new RtBotSql({ wasmModule: wasm });
+    rtbotSql.getCatalog().registerStream("sensors", {
+      name: "sensors",
+      columns: [
+        { name: "device_id", index: 0, type: "DOUBLE" },
+        { name: "location", index: 1, type: "TEXT" },
+        { name: "value", index: 2, type: "DOUBLE" },
+      ],
+    });
+
+    rtbotSql.insertMixed("sensors", 1000, [1.0, "Bay A", 42.0]);
+    rtbotSql.insertMixed("sensors", 2000, [2.0, "Bay B", 99.0]);
+
+    const msgs = rtbotSql.getStore().read("sensors");
+    expect(rtbotSql.decodeRow("sensors", msgs[0].values)).toEqual([1.0, "Bay A", 42.0]);
+    expect(rtbotSql.decodeRow("sensors", msgs[1].values)).toEqual([2.0, "Bay B", 99.0]);
+  });
+
+  it("decodeRow for unknown stream returns raw values", () => {
+    const wasm = createMockWasm();
+    const rtbotSql = new RtBotSql({ wasmModule: wasm });
+    expect(rtbotSql.decodeRow("unknown", [1.0, 2.0])).toEqual([1.0, 2.0]);
+  });
+
+  it("insertMixed throws for string in DOUBLE column", () => {
+    const wasm = createMockWasm();
+    const rtbotSql = new RtBotSql({ wasmModule: wasm });
+    rtbotSql.getCatalog().registerStream("sensors", {
+      name: "sensors",
+      columns: [
+        { name: "device_id", index: 0, type: "DOUBLE" },
+        { name: "location", index: 1, type: "TEXT" },
+        { name: "value", index: 2, type: "DOUBLE" },
+      ],
+    });
+    expect(() =>
+      rtbotSql.insertMixed("sensors", 1000, [1.0, "Bay A", "not a number"]),
+    ).toThrow();
+  });
+
+  it("insertMixed throws for number in TEXT column", () => {
+    const wasm = createMockWasm();
+    const rtbotSql = new RtBotSql({ wasmModule: wasm });
+    rtbotSql.getCatalog().registerStream("sensors", {
+      name: "sensors",
+      columns: [
+        { name: "device_id", index: 0, type: "DOUBLE" },
+        { name: "location", index: 1, type: "TEXT" },
+        { name: "value", index: 2, type: "DOUBLE" },
+      ],
+    });
+    expect(() =>
+      rtbotSql.insertMixed("sensors", 1000, [1.0, 42.0, 42.0]),
+    ).toThrow();
+  });
+});
+
+// --- Task 5: SQL INSERT dictionary sync ---
+
+describe("RtBotSql SQL INSERT dictionary sync", () => {
+  it("syncs dictionary_updates from compilation result", () => {
+    const mockWasm: RtBotSqlWasmModule = {
+      compileSqlJson(sql: string, _catalogJson: string): string {
+        const createMatch = sql.match(/CREATE\s+STREAM\s+(\w+)\s*\(([^)]+)\)/i);
+        if (createMatch) {
+          const name = createMatch[1];
+          const colDefs = createMatch[2].split(",").map((c, i) => {
+            const parts = c.trim().split(/\s+/);
+            const colType = parts.slice(1).join(" ").toUpperCase().includes("TEXT") ? "TEXT" : "DOUBLE";
+            return { name: parts[0], index: i, type: colType };
+          });
+          return JSON.stringify({
+            statement_type: "CREATE_STREAM",
+            entity_name: name,
+            stream_schema: { name, columns: colDefs },
+            errors: [],
+            program_json: "", field_map: {}, source_streams: [],
+            view_type: "SCALAR", key_index: -1, select_tier: "TIER1_READ",
+            insert_payload: [],
+            table_schema: { name: "", columns: [], changelog_stream: "", key_columns: [] },
+            drop_entity_name: "", drop_entity_type: "STREAM",
+          });
+        }
+
+        const insertMatch = sql.match(/INSERT/i);
+        if (insertMatch) {
+          return JSON.stringify({
+            statement_type: "INSERT",
+            entity_name: "sensors",
+            insert_payload: [1.0, 1.0, 42.0],
+            dictionary_updates: { "sensors.location": { "1": "Bay A" } },
+            errors: [],
+            program_json: "", field_map: {}, source_streams: [],
+            view_type: "SCALAR", key_index: -1, select_tier: "TIER1_READ",
+            stream_schema: { name: "", columns: [] },
+            table_schema: { name: "", columns: [], changelog_stream: "", key_columns: [] },
+            drop_entity_name: "", drop_entity_type: "STREAM",
+          });
+        }
+
+        return JSON.stringify({ errors: [{ message: "unsupported", line: -1, column: -1 }] });
+      },
+      validateSql: () => JSON.stringify({ valid: true, errors: [] }),
+    };
+
+    const rtbotSql = new RtBotSql({ wasmModule: mockWasm });
+    rtbotSql.execute("CREATE STREAM sensors (device_id DOUBLE, location TEXT, value DOUBLE)");
+    rtbotSql.execute("INSERT INTO sensors VALUES (1, 'Bay A', 42.0)");
+
+    const dict = rtbotSql.getCatalog().lookupDictionary("sensors.location");
+    expect(dict).toBeDefined();
+    expect(dict!.decode(1)).toBe("Bay A");
+
+    const msgs = rtbotSql.getStore().read("sensors");
+    expect(rtbotSql.decodeRow("sensors", msgs[0].values)).toEqual([1.0, "Bay A", 42.0]);
   });
 });

@@ -19,6 +19,7 @@ export type SelectTier = "TIER1_READ" | "TIER2_SCAN" | "TIER3_EPHEMERAL";
 export interface ColumnDef {
   name: string;
   index: number;
+  type?: "DOUBLE" | "TEXT";
 }
 
 export interface StreamSchema {
@@ -50,6 +51,7 @@ export interface CatalogSnapshot {
   streams: Record<string, StreamSchema>;
   views: Record<string, ViewMeta>;
   tables: Record<string, TableSchema>;
+  dictionaries?: Record<string, Record<string, string>>;
 }
 
 export interface CompilationError {
@@ -73,6 +75,7 @@ export interface CompilationResult {
   drop_entity_name: string;
   drop_entity_type: EntityType;
   errors: CompilationError[];
+  dictionary_updates?: Record<string, Record<string, string>>;
 }
 
 export interface ValidationResult {
