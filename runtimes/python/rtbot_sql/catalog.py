@@ -6,12 +6,18 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
 from .compiler import native
+from .string_dictionary import StringDictionary
 
 
 @dataclass
 class ColumnDef:
   name: str
   index: int
+  col_type: str = "DOUBLE"  # "DOUBLE" or "TEXT"
+
+  @property
+  def is_text(self) -> bool:
+    return self.col_type == "TEXT"
 
 
 @dataclass
@@ -43,11 +49,15 @@ class TableSchema:
 
 def _to_column_def(obj: Any) -> ColumnDef:
   if isinstance(obj, ColumnDef):
-    return ColumnDef(obj.name, obj.index)
+    return ColumnDef(obj.name, obj.index, obj.col_type)
   if isinstance(obj, native.ColumnDef):
-    return ColumnDef(obj.name, int(obj.index))
+    col_type = "TEXT" if obj.type == native.ColumnType.TEXT else "DOUBLE"
+    return ColumnDef(obj.name, int(obj.index), col_type)
   if isinstance(obj, dict):
-    return ColumnDef(str(obj["name"]), int(obj["index"]))
+    col_type = str(obj.get("type", "DOUBLE")).upper()
+    if col_type not in ("DOUBLE", "TEXT"):
+      col_type = "DOUBLE"
+    return ColumnDef(str(obj["name"]), int(obj["index"]), col_type)
   raise TypeError(f"Unsupported column definition: {type(obj)!r}")
 
 
@@ -128,7 +138,8 @@ def _to_table_schema(name: str, obj: Any) -> TableSchema:
 
 
 def _column_to_native(col: ColumnDef) -> native.ColumnDef:
-  return native.ColumnDef(col.name, int(col.index))
+  col_type = native.ColumnType.TEXT if col.is_text else native.ColumnType.DOUBLE
+  return native.ColumnDef(col.name, int(col.index), col_type)
 
 
 def _stream_to_native(schema: StreamSchema) -> native.StreamSchema:
@@ -166,6 +177,7 @@ class InMemoryCatalog:
     self._streams: Dict[str, StreamSchema] = {}
     self._views: Dict[str, ViewMeta] = {}
     self._tables: Dict[str, TableSchema] = {}
+    self._dictionaries: Dict[str, StringDictionary] = {}
 
   def register_stream(self, name: str, schema: Any) -> None:
     self._streams[name] = _to_stream_schema(name, schema)
@@ -199,6 +211,11 @@ class InMemoryCatalog:
     snap.streams = {name: _stream_to_native(schema) for name, schema in self._streams.items()}
     snap.views = {name: _view_to_native(meta) for name, meta in self._views.items()}
     snap.tables = {name: _table_to_native(schema) for name, schema in self._tables.items()}
+    snap.dictionaries = {
+        key: d.all_entries()
+        for key, d in self._dictionaries.items()
+        if not d.is_empty
+    }
     return snap
 
   def add_key(self, view_name: str, key: float) -> None:
@@ -235,6 +252,10 @@ class InMemoryCatalog:
     if name in self._tables:
       self._tables.pop(name, None)
       removed = True
+    # Remove dictionaries keyed by "name.columnName"
+    to_remove = [k for k in self._dictionaries if k.startswith(name + ".")]
+    for k in to_remove:
+      self._dictionaries.pop(k, None)
     return removed
 
   def streams(self) -> Dict[str, StreamSchema]:
@@ -245,3 +266,20 @@ class InMemoryCatalog:
 
   def tables(self) -> Dict[str, TableSchema]:
     return dict(self._tables)
+
+  def get_or_create_dictionary(self, key: str) -> StringDictionary:
+    if key not in self._dictionaries:
+      self._dictionaries[key] = StringDictionary()
+    return self._dictionaries[key]
+
+  def lookup_dictionary(self, key: str) -> Optional[StringDictionary]:
+    return self._dictionaries.get(key)
+
+  def register_dictionary(self, key: str, d: StringDictionary) -> None:
+    self._dictionaries[key] = d
+
+  def drop_dictionary(self, key: str) -> None:
+    self._dictionaries.pop(key, None)
+
+  def get_dictionaries(self) -> Dict[str, StringDictionary]:
+    return dict(self._dictionaries)

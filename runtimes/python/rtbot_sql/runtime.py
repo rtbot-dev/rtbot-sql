@@ -133,7 +133,73 @@ class RtBotSql:
           f"INSERT payload length mismatch for {stream_name}: expected {len(schema.columns)}, got {len(payload)}"
       ])
 
+    # Sync dictionary updates from C++ compiler back to Python catalog.
+    if hasattr(result, 'dictionary_updates') and result.dictionary_updates:
+      for dict_key, entries in result.dictionary_updates.items():
+        d = self._catalog.get_or_create_dictionary(dict_key)
+        for fid, s in entries.items():
+          d.put_mapping(float(fid), s)
+
     self._append_and_propagate(stream_name, self._next_timestamp(), payload)
+
+  def insert_mixed(self, stream_name: str, timestamp: int, values: list) -> None:
+    """Insert a row with mixed types (doubles and strings for TEXT columns).
+
+    Strings are dictionary-encoded to doubles before passing to the
+    append pipeline. Each TEXT column gets its own StringDictionary
+    keyed by "streamName.columnName".
+    """
+    if stream_name is None:
+      raise ValueError("stream_name must not be None")
+    schema = self._catalog.lookup_stream(stream_name)
+    if schema is None:
+      raise ValueError(f"unknown stream: {stream_name}")
+    if len(values) != len(schema.columns):
+      raise ValueError(
+          f"expected {len(schema.columns)} values, got {len(values)}")
+
+    encoded = []
+    for i, col in enumerate(schema.columns):
+      val = values[i]
+      if col.is_text:
+        if not isinstance(val, str):
+          raise ValueError(
+              f"expected str for TEXT column '{col.name}', got {type(val).__name__}")
+        dict_key = f"{stream_name}.{col.name}"
+        d = self._catalog.get_or_create_dictionary(dict_key)
+        encoded.append(d.encode(val))
+      else:
+        if isinstance(val, str):
+          raise ValueError(
+              f"expected number for DOUBLE column '{col.name}', got str")
+        encoded.append(float(val))
+
+    self._append_and_propagate(stream_name, timestamp, encoded)
+
+  def decode_row(self, stream_name: str, values: list) -> list:
+    """Decode a row of double values, converting TEXT column IDs back to strings.
+
+    For each TEXT column, looks up the double value in the corresponding
+    StringDictionary. Returns the original double if the stream is unknown
+    or no dictionary mapping exists.
+    """
+    schema = self._catalog.lookup_stream(stream_name)
+    if schema is None or values is None:
+      return list(values) if values else []
+
+    decoded = []
+    for i, val in enumerate(values):
+      if i < len(schema.columns) and schema.columns[i].is_text:
+        dict_key = f"{stream_name}.{schema.columns[i].name}"
+        d = self._catalog.lookup_dictionary(dict_key)
+        if d is not None:
+          s = d.decode(float(val))
+          decoded.append(s if s is not None else val)
+        else:
+          decoded.append(val)
+      else:
+        decoded.append(val)
+    return decoded
 
   def _handle_create_view(
       self,

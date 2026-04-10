@@ -3,6 +3,9 @@ import unittest
 
 import rtbot_sql
 from rtbot_sql import compiler
+from rtbot_sql.string_dictionary import StringDictionary
+
+native = compiler.native
 
 
 def _columns_and_rows(result):
@@ -388,6 +391,271 @@ class ViewStorageTest(unittest.TestCase):
     self.assertEqual(actual[1.0], [1.0, 1450.0, 2.0])
     # instrument 2: (200*5) = 1000, count=1
     self.assertEqual(actual[2.0], [2.0, 1000.0, 1.0])
+
+
+class ColumnTypeBindingTest(unittest.TestCase):
+  def test_column_type_enum_exists(self):
+    """ColumnType enum is exposed via native bindings."""
+    self.assertTrue(hasattr(native, 'ColumnType'))
+    self.assertTrue(hasattr(native.ColumnType, 'DOUBLE'))
+    self.assertTrue(hasattr(native.ColumnType, 'TEXT'))
+
+  def test_column_def_has_type_field(self):
+    """ColumnDef exposes the type field from C++."""
+    col = native.ColumnDef("price", 0)
+    # Default should be DOUBLE
+    self.assertEqual(col.type, native.ColumnType.DOUBLE)
+
+
+class DictionaryBindingTest(unittest.TestCase):
+  def test_catalog_snapshot_has_dictionaries(self):
+    """CatalogSnapshot exposes dictionaries field."""
+    snap = native.CatalogSnapshot()
+    self.assertTrue(hasattr(snap, 'dictionaries'))
+    self.assertIsInstance(snap.dictionaries, dict)
+
+  def test_compilation_result_has_dictionary_updates(self):
+    """CompilationResult exposes dictionary_updates field."""
+    result = native.CompilationResult()
+    self.assertTrue(hasattr(result, 'dictionary_updates'))
+
+
+class CatalogDictionaryTest(unittest.TestCase):
+  def test_column_def_preserves_type(self):
+    """Python ColumnDef stores TEXT type from C++ compilation."""
+    rt = rtbot_sql.RtBotSql()
+    rt.execute("CREATE STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)")
+    schema = rt._catalog.lookup_stream("sensors")
+    self.assertEqual(schema.columns[0].col_type, "DOUBLE")
+    self.assertEqual(schema.columns[1].col_type, "TEXT")
+    self.assertEqual(schema.columns[2].col_type, "DOUBLE")
+
+  def test_column_def_is_text(self):
+    """ColumnDef.is_text helper method."""
+    rt = rtbot_sql.RtBotSql()
+    rt.execute("CREATE STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)")
+    schema = rt._catalog.lookup_stream("sensors")
+    self.assertFalse(schema.columns[0].is_text)
+    self.assertTrue(schema.columns[1].is_text)
+    self.assertFalse(schema.columns[2].is_text)
+
+
+class StringDictionaryTest(unittest.TestCase):
+  def test_encode_assigns_sequential_ids(self):
+    d = StringDictionary()
+    self.assertEqual(d.encode("alpha"), 1.0)
+    self.assertEqual(d.encode("beta"), 2.0)
+    self.assertEqual(d.encode("alpha"), 1.0)  # idempotent
+
+  def test_decode_roundtrip(self):
+    d = StringDictionary()
+    d.encode("hello")
+    self.assertEqual(d.decode(1.0), "hello")
+    self.assertIsNone(d.decode(99.0))
+
+  def test_lookup(self):
+    d = StringDictionary()
+    d.encode("hello")
+    self.assertEqual(d.lookup("hello"), 1.0)
+    self.assertIsNone(d.lookup("unknown"))
+
+  def test_put_mapping(self):
+    d = StringDictionary()
+    d.put_mapping(5.0, "hello")
+    self.assertEqual(d.decode(5.0), "hello")
+    self.assertEqual(d.lookup("hello"), 5.0)
+    # Next encode should get 6.0
+    self.assertEqual(d.encode("world"), 6.0)
+
+  def test_put_mapping_idempotent_string(self):
+    d = StringDictionary()
+    d.encode("hello")  # ID 1.0
+    d.put_mapping(99.0, "hello")  # no-op: string exists
+    self.assertEqual(d.lookup("hello"), 1.0)
+    self.assertIsNone(d.decode(99.0))
+
+  def test_put_mapping_idempotent_id(self):
+    d = StringDictionary()
+    d.put_mapping(1.0, "hello")
+    d.put_mapping(1.0, "world")  # no-op: ID exists
+    self.assertEqual(d.decode(1.0), "hello")
+    self.assertIsNone(d.lookup("world"))
+
+  def test_size_and_empty(self):
+    d = StringDictionary()
+    self.assertTrue(d.is_empty)
+    self.assertEqual(d.size, 0)
+    d.encode("a")
+    self.assertFalse(d.is_empty)
+    self.assertEqual(d.size, 1)
+
+  def test_all_entries(self):
+    d = StringDictionary()
+    d.encode("alpha")
+    d.encode("beta")
+    entries = d.all_entries()
+    self.assertEqual(entries, {1.0: "alpha", 2.0: "beta"})
+
+  def test_restore(self):
+    d = StringDictionary()
+    d.restore({"1": "alpha", "2": "beta"})
+    self.assertEqual(d.decode(1.0), "alpha")
+    self.assertEqual(d.decode(2.0), "beta")
+    self.assertEqual(d.encode("gamma"), 3.0)
+
+
+class CatalogDictionaryStorageTest(unittest.TestCase):
+  def test_get_or_create_dictionary(self):
+    from rtbot_sql.catalog import InMemoryCatalog
+    cat = InMemoryCatalog()
+    d1 = cat.get_or_create_dictionary("sensors.location")
+    d2 = cat.get_or_create_dictionary("sensors.location")
+    self.assertIs(d1, d2)
+
+  def test_lookup_dictionary_returns_none_for_unknown(self):
+    from rtbot_sql.catalog import InMemoryCatalog
+    cat = InMemoryCatalog()
+    self.assertIsNone(cat.lookup_dictionary("unknown"))
+
+  def test_snapshot_includes_dictionaries(self):
+    from rtbot_sql.catalog import InMemoryCatalog
+    cat = InMemoryCatalog()
+    d = cat.get_or_create_dictionary("sensors.location")
+    d.encode("Bay A")
+    snap = cat.snapshot()
+    self.assertIn("sensors.location", snap.dictionaries)
+    self.assertEqual(snap.dictionaries["sensors.location"][1.0], "Bay A")
+
+  def test_drop_clears_related_dictionaries(self):
+    from rtbot_sql.catalog import InMemoryCatalog
+    cat = InMemoryCatalog()
+    cat.register_stream("sensors", {"name": "sensors", "columns": [{"name": "loc", "index": 0}]})
+    cat.get_or_create_dictionary("sensors.loc").encode("Bay A")
+    cat.drop("sensors")
+    self.assertIsNone(cat.lookup_dictionary("sensors.loc"))
+
+
+class InsertMixedTest(unittest.TestCase):
+  def test_insert_mixed_encodes_strings(self):
+    rt = rtbot_sql.RtBotSql()
+    rt.execute("CREATE STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)")
+    rt.insert_mixed("sensors", 1000, [1.0, "Bay A", 42.0])
+
+    messages = rt._store.read("sensors")
+    self.assertEqual(len(messages), 1)
+    self.assertEqual(messages[0].values, [1.0, 1.0, 42.0])
+
+  def test_insert_mixed_reuses_existing_ids(self):
+    rt = rtbot_sql.RtBotSql()
+    rt.execute("CREATE STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)")
+    rt.insert_mixed("sensors", 1000, [1.0, "Bay A", 42.0])
+    rt.insert_mixed("sensors", 2000, [2.0, "Bay B", 99.0])
+    rt.insert_mixed("sensors", 3000, [3.0, "Bay A", 55.0])
+
+    messages = rt._store.read("sensors")
+    self.assertEqual(len(messages), 3)
+    self.assertEqual(messages[0].values[1], 1.0)  # Bay A = 1.0
+    self.assertEqual(messages[1].values[1], 2.0)  # Bay B = 2.0
+    self.assertEqual(messages[2].values[1], 1.0)  # Bay A = 1.0 (reused)
+
+  def test_insert_mixed_string_into_double_column_raises(self):
+    rt = rtbot_sql.RtBotSql()
+    rt.execute("CREATE STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)")
+    with self.assertRaises(ValueError):
+      rt.insert_mixed("sensors", 1000, [1.0, "Bay A", "not a number"])
+
+  def test_insert_mixed_double_into_text_column_raises(self):
+    rt = rtbot_sql.RtBotSql()
+    rt.execute("CREATE STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)")
+    with self.assertRaises(ValueError):
+      rt.insert_mixed("sensors", 1000, [1.0, 42.0, 42.0])
+
+  def test_insert_mixed_unknown_stream_raises(self):
+    rt = rtbot_sql.RtBotSql()
+    with self.assertRaises(ValueError):
+      rt.insert_mixed("nonexistent", 1000, [1.0])
+
+  def test_insert_mixed_column_count_mismatch_raises(self):
+    rt = rtbot_sql.RtBotSql()
+    rt.execute("CREATE STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)")
+    with self.assertRaises(ValueError):
+      rt.insert_mixed("sensors", 1000, [1.0, "Bay A"])
+
+
+class DecodeRowTest(unittest.TestCase):
+  def test_decode_row_converts_text_columns(self):
+    rt = rtbot_sql.RtBotSql()
+    rt.execute("CREATE STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)")
+    rt.insert_mixed("sensors", 1000, [1.0, "Bay A", 42.0])
+    rt.insert_mixed("sensors", 2000, [2.0, "Bay B", 99.0])
+
+    messages = rt._store.read("sensors")
+    decoded = rt.decode_row("sensors", messages[0].values)
+    self.assertEqual(decoded, [1.0, "Bay A", 42.0])
+
+    decoded2 = rt.decode_row("sensors", messages[1].values)
+    self.assertEqual(decoded2, [2.0, "Bay B", 99.0])
+
+  def test_decode_row_unknown_stream_returns_raw(self):
+    rt = rtbot_sql.RtBotSql()
+    raw = [1.0, 2.0, 3.0]
+    decoded = rt.decode_row("unknown", raw)
+    self.assertEqual(decoded, [1.0, 2.0, 3.0])
+
+  def test_decode_row_all_double_returns_doubles(self):
+    rt = rtbot_sql.RtBotSql()
+    rt.execute("CREATE STREAM prices (price DOUBLE PRECISION, volume DOUBLE PRECISION)")
+    rt.execute("INSERT INTO prices VALUES (100.0, 200.0)")
+    messages = rt._store.read("prices")
+    decoded = rt.decode_row("prices", messages[0].values)
+    self.assertEqual(decoded, [100.0, 200.0])
+
+
+class SqlInsertDictionarySyncTest(unittest.TestCase):
+  def test_sql_insert_syncs_dictionary(self):
+    """SQL INSERT with string literal syncs dictionary back to catalog."""
+    rt = rtbot_sql.RtBotSql()
+    rt.execute("CREATE STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)")
+    rt.execute("INSERT INTO sensors VALUES (1, 'Bay A', 42.0)")
+
+    d = rt._catalog.lookup_dictionary("sensors.location")
+    self.assertIsNotNone(d, "Dictionary should exist after SQL INSERT with string literal")
+    self.assertEqual(d.decode(1.0), "Bay A")
+
+  def test_consecutive_sql_inserts_maintain_dictionary(self):
+    rt = rtbot_sql.RtBotSql()
+    rt.execute("CREATE STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)")
+    rt.execute("INSERT INTO sensors VALUES (1, 'Bay A', 42.0)")
+    rt.execute("INSERT INTO sensors VALUES (2, 'Bay B', 99.0)")
+    rt.execute("INSERT INTO sensors VALUES (3, 'Bay A', 55.0)")
+
+    messages = rt._store.read("sensors")
+    self.assertEqual(len(messages), 3)
+    # Bay A = 1.0, Bay B = 2.0, Bay A = 1.0 (reused)
+    self.assertEqual(messages[0].values[1], 1.0)
+    self.assertEqual(messages[1].values[1], 2.0)
+    self.assertEqual(messages[2].values[1], 1.0)
+
+    # decodeRow should work
+    decoded = rt.decode_row("sensors", messages[1].values)
+    self.assertEqual(decoded[1], "Bay B")
+
+  def test_mixed_insert_paths_maintain_coherence(self):
+    """insertMixed + SQL INSERT maintain dictionary coherence."""
+    rt = rtbot_sql.RtBotSql()
+    rt.execute("CREATE STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)")
+    rt.insert_mixed("sensors", 1000, [1.0, "Bay A", 42.0])
+    rt.execute("INSERT INTO sensors VALUES (2, 'Bay B', 99.0)")
+    rt.insert_mixed("sensors", 3000, [3.0, "Bay A", 55.0])
+
+    messages = rt._store.read("sensors")
+    self.assertEqual(len(messages), 3)
+    self.assertEqual(messages[0].values[1], 1.0)  # Bay A
+    self.assertEqual(messages[1].values[1], 2.0)  # Bay B
+    self.assertEqual(messages[2].values[1], 1.0)  # Bay A
+
+    self.assertEqual(rt.decode_row("sensors", messages[0].values)[1], "Bay A")
+    self.assertEqual(rt.decode_row("sensors", messages[1].values)[1], "Bay B")
 
 
 if __name__ == "__main__":

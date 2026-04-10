@@ -28,6 +28,7 @@ using rtbot_sql::StreamSchema;
 using rtbot_sql::TableSchema;
 using rtbot_sql::ViewMeta;
 using rtbot_sql::ViewType;
+using rtbot_sql::ColumnType;
 
 struct InputVectorMessage {
   std::uint64_t timestamp = 0;
@@ -177,11 +178,18 @@ PYBIND11_MODULE(_rtbot_sql_native, m) {
       .value("TIER2_SCAN", SelectTier::TIER2_SCAN)
       .value("TIER3_EPHEMERAL", SelectTier::TIER3_EPHEMERAL);
 
+  py::enum_<ColumnType>(m, "ColumnType")
+      .value("DOUBLE", ColumnType::DOUBLE)
+      .value("TEXT", ColumnType::TEXT);
+
   py::class_<ColumnDef>(m, "ColumnDef")
       .def(py::init<>())
       .def(py::init<std::string, int>(), py::arg("name"), py::arg("index"))
+      .def(py::init<std::string, int, ColumnType>(),
+           py::arg("name"), py::arg("index"), py::arg("type"))
       .def_readwrite("name", &ColumnDef::name)
-      .def_readwrite("index", &ColumnDef::index);
+      .def_readwrite("index", &ColumnDef::index)
+      .def_readwrite("type", &ColumnDef::type);
 
   py::class_<StreamSchema>(m, "StreamSchema")
       .def(py::init<>())
@@ -211,7 +219,8 @@ PYBIND11_MODULE(_rtbot_sql_native, m) {
       .def(py::init<>())
       .def_readwrite("streams", &CatalogSnapshot::streams)
       .def_readwrite("views", &CatalogSnapshot::views)
-      .def_readwrite("tables", &CatalogSnapshot::tables);
+      .def_readwrite("tables", &CatalogSnapshot::tables)
+      .def_readwrite("dictionaries", &CatalogSnapshot::dictionaries);
 
   py::class_<CompilationError>(m, "CompilationError")
       .def(py::init<>())
@@ -234,6 +243,7 @@ PYBIND11_MODULE(_rtbot_sql_native, m) {
       .def_readwrite("drop_entity_name", &CompilationResult::drop_entity_name)
       .def_readwrite("drop_entity_type", &CompilationResult::drop_entity_type)
       .def_readwrite("errors", &CompilationResult::errors)
+      .def_readwrite("dictionary_updates", &CompilationResult::dictionary_updates)
       .def("has_errors", &CompilationResult::has_errors);
 
   py::class_<InputVectorMessage>(m, "InputVectorMessage")
