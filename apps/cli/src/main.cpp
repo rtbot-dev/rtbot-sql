@@ -36,11 +36,26 @@ CatalogSnapshot load_catalog(const std::string& path) {
       } else if (stream_j.contains("columns")) {
         // Detailed format: {"trades": {"columns": [{"name": "price", "index": 0}]}}
         for (const auto& col_j : stream_j["columns"]) {
+          ColumnType col_type = ColumnType::DOUBLE;
+          if (col_j.contains("type") && col_j["type"].is_string()) {
+            if (col_j["type"] == "TEXT") col_type = ColumnType::TEXT;
+          }
           schema.columns.push_back(
-              {col_j["name"].get<std::string>(), col_j["index"].get<int>()});
+              {col_j["name"].get<std::string>(), col_j["index"].get<int>(),
+               col_type});
         }
       }
       catalog.streams[name] = schema;
+    }
+  }
+
+  if (j.contains("dictionaries") && j["dictionaries"].is_object()) {
+    for (auto& [key, entries] : j["dictionaries"].items()) {
+      std::map<double, std::string> dict_entries;
+      for (auto& [id_str, str_val] : entries.items()) {
+        dict_entries[std::stod(id_str)] = str_val.get<std::string>();
+      }
+      catalog.dictionaries[key] = dict_entries;
     }
   }
 
@@ -80,7 +95,8 @@ json result_to_json(const CompilationResult& r) {
     case StatementType::CREATE_STREAM: {
       json cols = json::array();
       for (const auto& col : r.stream_schema.columns) {
-        cols.push_back({{"name", col.name}, {"index", col.index}});
+        cols.push_back({{"name", col.name}, {"index", col.index},
+                        {"type", (col.type == ColumnType::TEXT) ? "TEXT" : "DOUBLE"}});
       }
       j["schema"] = cols;
       break;
@@ -88,7 +104,8 @@ json result_to_json(const CompilationResult& r) {
     case StatementType::CREATE_TABLE: {
       json cols = json::array();
       for (const auto& col : r.table_schema.columns) {
-        cols.push_back({{"name", col.name}, {"index", col.index}});
+        cols.push_back({{"name", col.name}, {"index", col.index},
+                        {"type", (col.type == ColumnType::TEXT) ? "TEXT" : "DOUBLE"}});
       }
       j["schema"] = cols;
       j["key_columns"] = r.table_schema.key_columns;
@@ -101,6 +118,17 @@ json result_to_json(const CompilationResult& r) {
     }
     case StatementType::INSERT: {
       j["values"] = r.insert_payload;
+      if (!r.dictionary_updates.empty()) {
+        json dict_json = json::object();
+        for (const auto& [key, entries] : r.dictionary_updates) {
+          json entry_json = json::object();
+          for (const auto& [id, str] : entries) {
+            entry_json[std::to_string(static_cast<int>(id))] = str;
+          }
+          dict_json[key] = entry_json;
+        }
+        j["dictionary_updates"] = dict_json;
+      }
       break;
     }
     case StatementType::SELECT: {
