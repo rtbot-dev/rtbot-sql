@@ -4,7 +4,6 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
-
 #include "rtbot_sql/compiler/expression_compiler.h"
 
 namespace rtbot_sql::compiler {
@@ -163,7 +162,7 @@ SelectResult compile_select_projection(
     const auto& item = select_list[i];
     auto result =
         compile_expression(item.expr, input_endpoint, scope, builder, nullptr,
-                           source_endpoints);
+                            source_endpoints);
     auto ep = ensure_endpoint(std::move(result), input_endpoint, builder);
 
     if (sync_zero_ep.has_value()) {

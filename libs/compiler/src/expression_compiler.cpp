@@ -173,11 +173,11 @@ Endpoint compile_sync_op(const std::string& op, const Endpoint& left_ep,
 }  // namespace
 
 ExprResult compile_expression(const parser::ast::Expr& expr,
-                              const Endpoint& input_endpoint,
-                              const analyzer::Scope& scope,
-                              GraphBuilder& builder,
-                              ExprCache* cache,
-                              const std::map<std::string, Endpoint>* source_endpoints) {
+                               const Endpoint& input_endpoint,
+                               const analyzer::Scope& scope,
+                               GraphBuilder& builder,
+                               ExprCache* cache,
+                                const std::map<std::string, Endpoint>* source_endpoints) {
   using namespace parser::ast;
 
   // Cache lookup
@@ -267,10 +267,23 @@ ExprResult compile_expression(const parser::ast::Expr& expr,
   if (auto* func_ptr = std::get_if<std::unique_ptr<FuncCall>>(&expr)) {
     const auto& func = **func_ptr;
 
-    // POWER(expr, n) — special case with exponent parameter
+    // TS() — extract message timestamp as a scalar value
     std::string upper_name = func.name;
     std::transform(upper_name.begin(), upper_name.end(), upper_name.begin(),
                    ::toupper);
+    if (upper_name == "TS") {
+      if (!func.args.empty()) {
+        throw std::runtime_error("TS() takes no arguments");
+      }
+      auto id = builder.next_id("ts");
+      builder.add_operator(id, "TimestampExtract");
+      builder.connect(input_endpoint, {id, "i1"});
+      ExprResult r = Endpoint{id, "o1"};
+      maybe_cache(expr, r);
+      return r;
+    }
+
+    // POWER(expr, n) — special case with exponent parameter
     if (upper_name == "POWER") {
       if (func.args.size() != 2) {
         throw std::runtime_error("POWER requires exactly 2 arguments");
@@ -292,6 +305,64 @@ ExprResult compile_expression(const parser::ast::Expr& expr,
       auto id = builder.next_id("power");
       builder.add_operator(id, "Power", {{"value", exp_const->value}});
       builder.connect(std::get<Endpoint>(base), {id, "i1"});
+      ExprResult r = Endpoint{id, "o1"};
+      maybe_cache(expr, r);
+      return r;
+    }
+
+    // TIMESHIFT(expr, shift) — shift message timestamps by a constant
+    if (upper_name == "TIMESHIFT") {
+      if (func.args.size() != 2) {
+        throw std::runtime_error(
+            "TIMESHIFT requires exactly 2 arguments");
+      }
+      auto signal = compile_expression(func.args[0], input_endpoint, scope,
+                                       builder, cache, source_endpoints);
+      auto shift_result =
+          compile_expression(func.args[1], input_endpoint, scope, builder,
+                             cache, source_endpoints);
+      auto* shift_const = std::get_if<ConstantMarker>(&shift_result);
+      if (!shift_const) {
+        throw std::runtime_error(
+            "TIMESHIFT shift must be a constant");
+      }
+
+      auto signal_ep =
+          ensure_endpoint_local(std::move(signal), input_endpoint, builder);
+      auto id = builder.next_id("timeshift");
+      builder.add_operator(
+          id, "TimeShift",
+          {{"shift", shift_const->value}});
+      builder.connect(signal_ep, {id, "i1"});
+      ExprResult r = Endpoint{id, "o1"};
+      maybe_cache(expr, r);
+      return r;
+    }
+
+    // RESAMPLE_CONSTANT(expr, interval) — resampler with fixed grid (t0=0)
+    if (upper_name == "RESAMPLE_CONSTANT") {
+      if (func.args.size() != 2) {
+        throw std::runtime_error(
+            "RESAMPLE_CONSTANT requires exactly 2 arguments");
+      }
+      auto signal = compile_expression(func.args[0], input_endpoint, scope,
+                                       builder, cache, source_endpoints);
+      auto interval_result =
+          compile_expression(func.args[1], input_endpoint, scope, builder,
+                             cache, source_endpoints);
+      auto* interval_const = std::get_if<ConstantMarker>(&interval_result);
+      if (!interval_const) {
+        throw std::runtime_error(
+            "RESAMPLE_CONSTANT interval must be a constant");
+      }
+
+      auto signal_ep =
+          ensure_endpoint_local(std::move(signal), input_endpoint, builder);
+      auto id = builder.next_id("resample");
+      builder.add_operator(
+          id, "ResamplerConstant",
+          {{"interval", interval_const->value}, {"t0", 0.0}});
+      builder.connect(signal_ep, {id, "i1"});
       ExprResult r = Endpoint{id, "o1"};
       maybe_cache(expr, r);
       return r;

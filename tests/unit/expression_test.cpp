@@ -390,5 +390,263 @@ TEST_F(ExpressionTest, CaseWhenNoElseProducesMultiplexerOnePort) {
   EXPECT_TRUE(has_mux);
 }
 
+// TS() → TimestampExtract
+TEST_F(ExpressionTest, TSFunctionProducesTimestampExtract) {
+  auto f = std::make_unique<FuncCall>();
+  f->name = "TS";
+  Expr expr = std::move(f);
+
+  auto result = compile_expression(std::move(expr), input, scope, builder);
+  ASSERT_TRUE(std::holds_alternative<Endpoint>(result));
+  auto& ep = std::get<Endpoint>(result);
+
+  ASSERT_EQ(builder.operators().size(), 1u);
+  auto& op = builder.operators()[0];
+  EXPECT_EQ(op.type, "TimestampExtract");
+  EXPECT_EQ(ep.operator_id, op.id);
+  EXPECT_EQ(ep.port, "o1");
+
+  ASSERT_EQ(builder.connections().size(), 1u);
+  expect_conn(builder, "input_0", "o1", op.id, "i1");
+}
+
+// ts() lowercase → TimestampExtract
+TEST_F(ExpressionTest, TSFunctionCaseInsensitive) {
+  auto f = std::make_unique<FuncCall>();
+  f->name = "ts";
+  Expr expr = std::move(f);
+
+  auto result = compile_expression(std::move(expr), input, scope, builder);
+  ASSERT_TRUE(std::holds_alternative<Endpoint>(result));
+
+  ASSERT_EQ(builder.operators().size(), 1u);
+  EXPECT_EQ(builder.operators()[0].type, "TimestampExtract");
+}
+
+// TS(123) should fail — no arguments allowed
+TEST_F(ExpressionTest, TSFunctionWithArgsThrows) {
+  auto f = std::make_unique<FuncCall>();
+  f->name = "TS";
+  f->args.push_back(num(123.0));
+  Expr expr = std::move(f);
+
+  EXPECT_THROW(
+      compile_expression(std::move(expr), input, scope, builder),
+      std::runtime_error);
+}
+
+// RESAMPLE_CONSTANT(price, 1000000) → VectorExtract(1) → ResamplerConstant(interval=1000000, t0=0)
+TEST_F(ExpressionTest, ResampleConstantProducesResamplerConstant) {
+  auto result = compile_expression(
+      func2("RESAMPLE_CONSTANT", col("price"), num(1000000.0)),
+      input, scope, builder);
+  ASSERT_TRUE(std::holds_alternative<Endpoint>(result));
+  auto& ep = std::get<Endpoint>(result);
+
+  ASSERT_EQ(builder.operators().size(), 2u);
+  auto& ext = builder.operators()[0];
+  auto& rs = builder.operators()[1];
+  EXPECT_EQ(ext.type, "VectorExtract");
+  EXPECT_EQ(ext.params.at("index"), 1.0);
+  EXPECT_EQ(rs.type, "ResamplerConstant");
+  EXPECT_EQ(rs.params.at("interval"), 1000000.0);
+  EXPECT_EQ(rs.params.at("t0"), 0.0);
+  EXPECT_EQ(ep.operator_id, rs.id);
+  EXPECT_EQ(ep.port, "o1");
+
+  ASSERT_EQ(builder.connections().size(), 2u);
+  expect_conn(builder, "input_0", "o1", ext.id, "i1");
+  expect_conn(builder, ext.id, "o1", rs.id, "i1");
+}
+
+// resample_constant() lowercase → ResamplerConstant (case insensitive)
+TEST_F(ExpressionTest, ResampleConstantCaseInsensitive) {
+  auto result = compile_expression(
+      func2("resample_constant", col("price"), num(5000.0)),
+      input, scope, builder);
+  ASSERT_TRUE(std::holds_alternative<Endpoint>(result));
+
+  ASSERT_EQ(builder.operators().size(), 2u);
+  EXPECT_EQ(builder.operators()[1].type, "ResamplerConstant");
+  EXPECT_EQ(builder.operators()[1].params.at("interval"), 5000.0);
+  EXPECT_EQ(builder.operators()[1].params.at("t0"), 0.0);
+}
+
+// RESAMPLE_CONSTANT with wrong arg count throws
+TEST_F(ExpressionTest, ResampleConstantWrongArgCountThrows) {
+  // Zero args
+  {
+    auto f = std::make_unique<FuncCall>();
+    f->name = "RESAMPLE_CONSTANT";
+    Expr expr = std::move(f);
+    EXPECT_THROW(
+        compile_expression(std::move(expr), input, scope, builder),
+        std::runtime_error);
+  }
+  // One arg
+  {
+    GraphBuilder b2;
+    EXPECT_THROW(
+        compile_expression(func("RESAMPLE_CONSTANT", col("price")),
+                           input, scope, b2),
+        std::runtime_error);
+  }
+  // Three args
+  {
+    GraphBuilder b3;
+    auto f = std::make_unique<FuncCall>();
+    f->name = "RESAMPLE_CONSTANT";
+    f->args.push_back(col("price"));
+    f->args.push_back(num(1000.0));
+    f->args.push_back(num(0.0));
+    Expr expr = std::move(f);
+    EXPECT_THROW(
+        compile_expression(std::move(expr), input, scope, b3),
+        std::runtime_error);
+  }
+}
+
+// RESAMPLE_CONSTANT(price, quantity) — non-constant interval should throw
+TEST_F(ExpressionTest, ResampleConstantNonConstantIntervalThrows) {
+  EXPECT_THROW(
+      compile_expression(
+          func2("RESAMPLE_CONSTANT", col("price"), col("quantity")),
+          input, scope, builder),
+      std::runtime_error);
+}
+
+// RESAMPLE_CONSTANT(price * 2, 1000) — expression as first arg works
+TEST_F(ExpressionTest, ResampleConstantWithExpressionArg) {
+  auto result = compile_expression(
+      func2("RESAMPLE_CONSTANT", binary("*", col("price"), num(2.0)),
+            num(1000.0)),
+      input, scope, builder);
+  ASSERT_TRUE(std::holds_alternative<Endpoint>(result));
+
+  // Should have: VectorExtract → Scale(2) → ResamplerConstant(interval=1000, t0=0)
+  ASSERT_EQ(builder.operators().size(), 3u);
+  auto& ext = builder.operators()[0];
+  auto& scale = builder.operators()[1];
+  auto& rs = builder.operators()[2];
+  EXPECT_EQ(ext.type, "VectorExtract");
+  EXPECT_EQ(scale.type, "Scale");
+  EXPECT_EQ(scale.params.at("value"), 2.0);
+  EXPECT_EQ(rs.type, "ResamplerConstant");
+  EXPECT_EQ(rs.params.at("interval"), 1000.0);
+  EXPECT_EQ(rs.params.at("t0"), 0.0);
+
+  ASSERT_EQ(builder.connections().size(), 3u);
+  expect_conn(builder, "input_0", "o1", ext.id, "i1");
+  expect_conn(builder, ext.id, "o1", scale.id, "i1");
+  expect_conn(builder, scale.id, "o1", rs.id, "i1");
+}
+
+// TIMESHIFT(price, -1000) → VectorExtract(1) → TimeShift(shift=-1000)
+TEST_F(ExpressionTest, TimeShiftProducesTimeShift) {
+  auto result = compile_expression(
+      func2("TIMESHIFT", col("price"), num(-1000.0)),
+      input, scope, builder);
+  ASSERT_TRUE(std::holds_alternative<Endpoint>(result));
+  auto& ep = std::get<Endpoint>(result);
+
+  ASSERT_EQ(builder.operators().size(), 2u);
+  auto& ext = builder.operators()[0];
+  auto& ts = builder.operators()[1];
+  EXPECT_EQ(ext.type, "VectorExtract");
+  EXPECT_EQ(ext.params.at("index"), 1.0);
+  EXPECT_EQ(ts.type, "TimeShift");
+  EXPECT_EQ(ts.params.at("shift"), -1000.0);
+  EXPECT_EQ(ep.operator_id, ts.id);
+  EXPECT_EQ(ep.port, "o1");
+
+  ASSERT_EQ(builder.connections().size(), 2u);
+  expect_conn(builder, "input_0", "o1", ext.id, "i1");
+  expect_conn(builder, ext.id, "o1", ts.id, "i1");
+}
+
+// timeshift() lowercase → TimeShift (case insensitive)
+TEST_F(ExpressionTest, TimeShiftCaseInsensitive) {
+  auto result = compile_expression(
+      func2("timeshift", col("price"), num(-500.0)),
+      input, scope, builder);
+  ASSERT_TRUE(std::holds_alternative<Endpoint>(result));
+
+  ASSERT_EQ(builder.operators().size(), 2u);
+  EXPECT_EQ(builder.operators()[1].type, "TimeShift");
+  EXPECT_EQ(builder.operators()[1].params.at("shift"), -500.0);
+}
+
+// TIMESHIFT with wrong arg count throws
+TEST_F(ExpressionTest, TimeShiftWrongArgCountThrows) {
+  // Zero args
+  {
+    auto f = std::make_unique<FuncCall>();
+    f->name = "TIMESHIFT";
+    Expr expr = std::move(f);
+    EXPECT_THROW(
+        compile_expression(std::move(expr), input, scope, builder),
+        std::runtime_error);
+  }
+  // One arg
+  {
+    GraphBuilder b2;
+    EXPECT_THROW(
+        compile_expression(func("TIMESHIFT", col("price")),
+                           input, scope, b2),
+        std::runtime_error);
+  }
+  // Three args
+  {
+    GraphBuilder b3;
+    auto f = std::make_unique<FuncCall>();
+    f->name = "TIMESHIFT";
+    f->args.push_back(col("price"));
+    f->args.push_back(num(-1000.0));
+    f->args.push_back(num(0.0));
+    Expr expr = std::move(f);
+    EXPECT_THROW(
+        compile_expression(std::move(expr), input, scope, b3),
+        std::runtime_error);
+  }
+}
+
+// TIMESHIFT(price, quantity) — non-constant shift should throw
+TEST_F(ExpressionTest, TimeShiftNonConstantShiftThrows) {
+  EXPECT_THROW(
+      compile_expression(
+          func2("TIMESHIFT", col("price"), col("quantity")),
+          input, scope, builder),
+      std::runtime_error);
+}
+
+// TIMESHIFT(RESAMPLE_CONSTANT(price, 1000), -1000) — composition
+TEST_F(ExpressionTest, TimeShiftWrappingResampleConstant) {
+  auto inner = func2("RESAMPLE_CONSTANT", col("price"), num(1000.0));
+  auto result = compile_expression(
+      func2("TIMESHIFT", std::move(inner), num(-1000.0)),
+      input, scope, builder);
+  ASSERT_TRUE(std::holds_alternative<Endpoint>(result));
+  auto& ep = std::get<Endpoint>(result);
+
+  // Should have: VectorExtract → ResamplerConstant → TimeShift
+  ASSERT_EQ(builder.operators().size(), 3u);
+  auto& ext = builder.operators()[0];
+  auto& rs = builder.operators()[1];
+  auto& ts = builder.operators()[2];
+  EXPECT_EQ(ext.type, "VectorExtract");
+  EXPECT_EQ(rs.type, "ResamplerConstant");
+  EXPECT_EQ(rs.params.at("interval"), 1000.0);
+  EXPECT_EQ(rs.params.at("t0"), 0.0);
+  EXPECT_EQ(ts.type, "TimeShift");
+  EXPECT_EQ(ts.params.at("shift"), -1000.0);
+  EXPECT_EQ(ep.operator_id, ts.id);
+  EXPECT_EQ(ep.port, "o1");
+
+  ASSERT_EQ(builder.connections().size(), 3u);
+  expect_conn(builder, "input_0", "o1", ext.id, "i1");
+  expect_conn(builder, ext.id, "o1", rs.id, "i1");
+  expect_conn(builder, rs.id, "o1", ts.id, "i1");
+}
+
 }  // namespace
 }  // namespace rtbot_sql::compiler
