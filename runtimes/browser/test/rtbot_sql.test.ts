@@ -9,6 +9,7 @@ import {
 import type {
   RtBotSqlWasmModule,
   CompilationResult,
+  ExpandedCompilationResult,
   ValidationResult,
   CatalogSnapshot,
   ColumnDef,
@@ -17,9 +18,37 @@ import type {
 
 // --- Mock WASM module for unit tests ---
 
+function wrapExpanded(result: CompilationResult): string {
+  const expanded: ExpandedCompilationResult = {
+    results: [result],
+    new_ts_units_per_second: -1,
+  };
+  return JSON.stringify(expanded);
+}
+
+function wrapExpandedErrors(errors: { message: string; line: number; column: number }[]): string {
+  const result: CompilationResult = {
+    statement_type: "CREATE_STREAM",
+    entity_name: "",
+    program_json: "",
+    field_map: {},
+    source_streams: [],
+    view_type: "SCALAR",
+    key_index: -1,
+    select_tier: "TIER1_READ",
+    insert_payload: [],
+    stream_schema: { name: "", columns: [] },
+    table_schema: { name: "", columns: [], changelog_stream: "", key_columns: [] },
+    drop_entity_name: "",
+    drop_entity_type: "STREAM",
+    errors,
+  };
+  return wrapExpanded(result);
+}
+
 function createMockWasm(): RtBotSqlWasmModule {
   return {
-    compileSqlJson(sql: string, catalogJson: string): string {
+    compileSqlJson(sql: string, catalogJson: string, _tsUnitsPerSecond?: number): string {
       const catalog: CatalogSnapshot = JSON.parse(catalogJson);
 
       // Simple mock: parse CREATE STREAM
@@ -53,7 +82,7 @@ function createMockWasm(): RtBotSqlWasmModule {
           drop_entity_type: "STREAM",
           errors: [],
         };
-        return JSON.stringify(result);
+        return wrapExpanded(result);
       }
 
       // Simple mock: parse INSERT
@@ -84,7 +113,7 @@ function createMockWasm(): RtBotSqlWasmModule {
           drop_entity_type: "STREAM",
           errors: [],
         };
-        return JSON.stringify(result);
+        return wrapExpanded(result);
       }
 
       // Simple mock: parse SELECT
@@ -92,11 +121,9 @@ function createMockWasm(): RtBotSqlWasmModule {
       if (selectMatch) {
         const source = selectMatch[2];
         if (!catalog.streams[source] && !catalog.views[source]) {
-          return JSON.stringify({
-            errors: [
-              { message: `unknown source: ${source}`, line: -1, column: -1 },
-            ],
-          });
+          return wrapExpandedErrors([
+            { message: `unknown source: ${source}`, line: -1, column: -1 },
+          ]);
         }
         const result: CompilationResult = {
           statement_type: "SELECT",
@@ -119,14 +146,12 @@ function createMockWasm(): RtBotSqlWasmModule {
           drop_entity_type: "STREAM",
           errors: [],
         };
-        return JSON.stringify(result);
+        return wrapExpanded(result);
       }
 
-      return JSON.stringify({
-        errors: [
-          { message: "unsupported statement type", line: -1, column: -1 },
-        ],
-      });
+      return wrapExpandedErrors([
+        { message: "unsupported statement type", line: -1, column: -1 },
+      ]);
     },
 
     validateSql(sql: string): string {
@@ -277,7 +302,10 @@ describe("RtBotSql.compile", () => {
       tables: {},
     };
 
-    const result = RtBotSql.compile("SELECT price FROM prices", catalog, wasm);
+    const expanded = RtBotSql.compile("SELECT price FROM prices", catalog, wasm);
+    expect(expanded.results).toHaveLength(1);
+    expect(expanded.new_ts_units_per_second).toBe(-1);
+    const result = expanded.results[0];
     expect(result.errors).toHaveLength(0);
     expect(result.statement_type).toBe("SELECT");
     expect(result.source_streams).toContain("prices");
@@ -290,12 +318,12 @@ describe("RtBotSql.compile", () => {
       tables: {},
     };
 
-    const result = RtBotSql.compile(
+    const expanded = RtBotSql.compile(
       "SELECT x FROM nonexistent",
       catalog,
       wasm,
     );
-    expect(result.errors.length).toBeGreaterThan(0);
+    expect(expanded.results[0].errors.length).toBeGreaterThan(0);
   });
 });
 
@@ -614,7 +642,7 @@ describe("RtBotSql insertMixed and decodeRow", () => {
 describe("RtBotSql SQL INSERT dictionary sync", () => {
   it("syncs dictionary_updates from compilation result", () => {
     const mockWasm: RtBotSqlWasmModule = {
-      compileSqlJson(sql: string, _catalogJson: string): string {
+      compileSqlJson(sql: string, _catalogJson: string, _tsUnitsPerSecond?: number): string {
         const createMatch = sql.match(/CREATE\s+STREAM\s+(\w+)\s*\(([^)]+)\)/i);
         if (createMatch) {
           const name = createMatch[1];
@@ -623,7 +651,7 @@ describe("RtBotSql SQL INSERT dictionary sync", () => {
             const colType = parts.slice(1).join(" ").toUpperCase().includes("TEXT") ? "TEXT" : "DOUBLE";
             return { name: parts[0], index: i, type: colType };
           });
-          return JSON.stringify({
+          return wrapExpanded({
             statement_type: "CREATE_STREAM",
             entity_name: name,
             stream_schema: { name, columns: colDefs },
@@ -633,12 +661,12 @@ describe("RtBotSql SQL INSERT dictionary sync", () => {
             insert_payload: [],
             table_schema: { name: "", columns: [], changelog_stream: "", key_columns: [] },
             drop_entity_name: "", drop_entity_type: "STREAM",
-          });
+          } as CompilationResult);
         }
 
         const insertMatch = sql.match(/INSERT/i);
         if (insertMatch) {
-          return JSON.stringify({
+          return wrapExpanded({
             statement_type: "INSERT",
             entity_name: "sensors",
             insert_payload: [1.0, 1.0, 42.0],
@@ -649,10 +677,10 @@ describe("RtBotSql SQL INSERT dictionary sync", () => {
             stream_schema: { name: "", columns: [] },
             table_schema: { name: "", columns: [], changelog_stream: "", key_columns: [] },
             drop_entity_name: "", drop_entity_type: "STREAM",
-          });
+          } as CompilationResult);
         }
 
-        return JSON.stringify({ errors: [{ message: "unsupported", line: -1, column: -1 }] });
+        return wrapExpandedErrors([{ message: "unsupported", line: -1, column: -1 }]);
       },
       validateSql: () => JSON.stringify({ valid: true, errors: [] }),
     };
@@ -667,5 +695,216 @@ describe("RtBotSql SQL INSERT dictionary sync", () => {
 
     const msgs = rtbotSql.getStore().read("sensors");
     expect(rtbotSql.decodeRow("sensors", msgs[0].values)).toEqual([1.0, "Bay A", 42.0]);
+  });
+});
+
+// --- Task 3 (browser): CREATE ALIGNED STREAM ... BIN() sugar syntax catalog ---
+
+describe("CREATE ALIGNED STREAM BIN() sugar syntax catalog", () => {
+  // Pipeline: vibration → vibration_bin → vibration_rs → input
+  //
+  // In a real runtime, data would flow as:
+  //   vibration:     (t=50ms, [8.0]), (t=200ms, [12.0]), ... → AVG = 10.0
+  //   vibration_bin: (t=1050ms, [10.0])  ← bin 0 avg flushed
+  //   vibration_rs:  (t=1000ms, [10.0])  ← TIMESHIFT(-1000) corrected
+  //   input:         (t=1000ms, [10.0, 75.0])  ← cross-join
+  //
+  // This test verifies catalog population only (StubPipelineRunner — no data flow).
+
+  /** Build a default CompilationResult with all required fields. */
+  function baseResult(overrides: Partial<CompilationResult>): CompilationResult {
+    return {
+      statement_type: "CREATE_STREAM",
+      entity_name: "",
+      program_json: "",
+      field_map: {},
+      source_streams: [],
+      view_type: "SCALAR",
+      key_index: -1,
+      select_tier: "TIER1_READ",
+      insert_payload: [],
+      stream_schema: { name: "", columns: [] },
+      table_schema: { name: "", columns: [], changelog_stream: "", key_columns: [] },
+      drop_entity_name: "",
+      drop_entity_type: "STREAM",
+      errors: [],
+      ...overrides,
+    };
+  }
+
+  it("aligned stream sugar populates catalog with streams and views", () => {
+    const alignedSql = "CREATE ALIGNED STREAM input (vibration DOUBLE, bearing_temp DOUBLE) BIN(1s)";
+
+    const mockWasm: RtBotSqlWasmModule = {
+      compileSqlJson(sql: string, _catalogJson: string, _tsUnitsPerSecond?: number): string {
+        if (sql === alignedSql) {
+          const expanded: ExpandedCompilationResult = {
+            results: [
+              // Result 1: CREATE_STREAM for "vibration"
+              baseResult({
+                statement_type: "CREATE_STREAM",
+                entity_name: "vibration",
+                stream_schema: {
+                  name: "vibration",
+                  columns: [{ name: "value", index: 0 }],
+                },
+              }),
+              // Result 2: CREATE_STREAM for "bearing_temp"
+              baseResult({
+                statement_type: "CREATE_STREAM",
+                entity_name: "bearing_temp",
+                stream_schema: {
+                  name: "bearing_temp",
+                  columns: [{ name: "value", index: 0 }],
+                },
+              }),
+              // Result 3: CREATE_VIEW for "vibration_bin"
+              baseResult({
+                statement_type: "CREATE_VIEW",
+                entity_name: "vibration_bin",
+                source_streams: ["vibration"],
+                field_map: { vibration: 0 },
+                program_json: '{"operators":[{"type":"BIN_AVG"}],"connections":[]}',
+              }),
+              // Result 4: CREATE_VIEW for "bearing_temp_bin"
+              baseResult({
+                statement_type: "CREATE_VIEW",
+                entity_name: "bearing_temp_bin",
+                source_streams: ["bearing_temp"],
+                field_map: { bearing_temp: 0 },
+                program_json: '{"operators":[{"type":"BIN_AVG"}],"connections":[]}',
+              }),
+              // Result 5: CREATE_VIEW for "vibration_rs"
+              baseResult({
+                statement_type: "CREATE_VIEW",
+                entity_name: "vibration_rs",
+                source_streams: ["vibration_bin"],
+                field_map: { vibration: 0 },
+                program_json: '{"operators":[{"type":"TIMESHIFT"}],"connections":[]}',
+              }),
+              // Result 6: CREATE_VIEW for "bearing_temp_rs"
+              baseResult({
+                statement_type: "CREATE_VIEW",
+                entity_name: "bearing_temp_rs",
+                source_streams: ["bearing_temp_bin"],
+                field_map: { bearing_temp: 0 },
+                program_json: '{"operators":[{"type":"TIMESHIFT"}],"connections":[]}',
+              }),
+              // Result 7: CREATE_VIEW for "input" (cross-join)
+              baseResult({
+                statement_type: "CREATE_VIEW",
+                entity_name: "input",
+                source_streams: ["vibration_rs", "bearing_temp_rs"],
+                field_map: { vibration: 0, bearing_temp: 1 },
+                program_json: '{"operators":[{"type":"CROSS_JOIN"}],"connections":[]}',
+              }),
+            ],
+            new_ts_units_per_second: -1,
+          };
+          return JSON.stringify(expanded);
+        }
+        return wrapExpandedErrors([{ message: "unsupported", line: -1, column: -1 }]);
+      },
+      validateSql: () => JSON.stringify({ valid: true, errors: [] }),
+    };
+
+    const rtbotSql = new RtBotSql({ wasmModule: mockWasm });
+    rtbotSql.execute(alignedSql);
+
+    // --- Assert streams ---
+
+    const vibStream = rtbotSql.getCatalog().lookupStream("vibration");
+    expect(vibStream).toBeDefined();
+    expect(vibStream!.columns).toHaveLength(1);
+    expect(vibStream!.columns[0].name).toBe("value");
+
+    const btStream = rtbotSql.getCatalog().lookupStream("bearing_temp");
+    expect(btStream).toBeDefined();
+    expect(btStream!.columns).toHaveLength(1);
+    expect(btStream!.columns[0].name).toBe("value");
+
+    // --- Assert views ---
+
+    const vibBin = rtbotSql.getCatalog().lookupView("vibration_bin");
+    expect(vibBin).toBeDefined();
+    expect(vibBin!.entity_type).toBe("VIEW");
+    expect(vibBin!.source_streams).toEqual(["vibration"]);
+
+    const btBin = rtbotSql.getCatalog().lookupView("bearing_temp_bin");
+    expect(btBin).toBeDefined();
+    expect(btBin!.entity_type).toBe("VIEW");
+    expect(btBin!.source_streams).toEqual(["bearing_temp"]);
+
+    const vibRs = rtbotSql.getCatalog().lookupView("vibration_rs");
+    expect(vibRs).toBeDefined();
+    expect(vibRs!.source_streams).toEqual(["vibration_bin"]);
+
+    const btRs = rtbotSql.getCatalog().lookupView("bearing_temp_rs");
+    expect(btRs).toBeDefined();
+    expect(btRs!.source_streams).toEqual(["bearing_temp_bin"]);
+
+    const inputView = rtbotSql.getCatalog().lookupView("input");
+    expect(inputView).toBeDefined();
+    expect(inputView!.source_streams).toEqual(["vibration_rs", "bearing_temp_rs"]);
+  });
+
+  it("SET TIMESCALE updates internal timescale", () => {
+    let capturedTsUnitsPerSecond: number | undefined;
+
+    const mockWasm: RtBotSqlWasmModule = {
+      compileSqlJson(sql: string, _catalogJson: string, tsUnitsPerSecond?: number): string {
+        if (/SET\s+TIMESCALE/i.test(sql)) {
+          // SET TIMESCALE ms → update to 1000 units/sec
+          const expanded: ExpandedCompilationResult = {
+            results: [],
+            new_ts_units_per_second: 1000,
+          };
+          return JSON.stringify(expanded);
+        }
+
+        // Capture tsUnitsPerSecond on the second call (CREATE ALIGNED STREAM)
+        capturedTsUnitsPerSecond = tsUnitsPerSecond;
+
+        // Return a minimal aligned-stream expansion so catalog gets populated
+        const expanded: ExpandedCompilationResult = {
+          results: [
+            baseResult({
+              statement_type: "CREATE_STREAM",
+              entity_name: "vibration",
+              stream_schema: {
+                name: "vibration",
+                columns: [{ name: "value", index: 0 }],
+              },
+            }),
+            baseResult({
+              statement_type: "CREATE_STREAM",
+              entity_name: "bearing_temp",
+              stream_schema: {
+                name: "bearing_temp",
+                columns: [{ name: "value", index: 0 }],
+              },
+            }),
+          ],
+          new_ts_units_per_second: -1,
+        };
+        return JSON.stringify(expanded);
+      },
+      validateSql: () => JSON.stringify({ valid: true, errors: [] }),
+    };
+
+    const rtbotSql = new RtBotSql({ wasmModule: mockWasm });
+
+    // First call: SET TIMESCALE — should update internal timescale to 1000
+    rtbotSql.execute("SET TIMESCALE ms");
+
+    // Second call: CREATE ALIGNED STREAM — mock captures tsUnitsPerSecond
+    rtbotSql.execute("CREATE ALIGNED STREAM input (vibration DOUBLE, bearing_temp DOUBLE) BIN(1s)");
+
+    // Verify the mock received the updated timescale
+    expect(capturedTsUnitsPerSecond).toBe(1000);
+
+    // Verify catalog was populated correctly
+    expect(rtbotSql.getCatalog().lookupStream("vibration")).toBeDefined();
+    expect(rtbotSql.getCatalog().lookupStream("bearing_temp")).toBeDefined();
   });
 });

@@ -28,11 +28,14 @@ class CompilerBindingTest(unittest.TestCase):
   def test_compile_create_table(self):
     snapshot = compiler.native.CatalogSnapshot()
 
-    result = compiler.native.compile_sql(
+    compilation = compiler.native.compile_sql(
         "CREATE TABLE trades (instrument_id DOUBLE PRECISION, price DOUBLE PRECISION)",
         snapshot,
+        1_000_000,
     )
 
+    self.assertIn("results", compilation)
+    result = compilation["results"][0]
     self.assertEqual(result.statement_type, compiler.native.StatementType.CREATE_STREAM)
     self.assertEqual(len(result.errors), 0)
     self.assertEqual(result.entity_name, "trades")
@@ -656,6 +659,236 @@ class SqlInsertDictionarySyncTest(unittest.TestCase):
 
     self.assertEqual(rt.decode_row("sensors", messages[0].values)[1], "Bay A")
     self.assertEqual(rt.decode_row("sensors", messages[1].values)[1], "Bay B")
+
+
+class AlignedStreamSugarTest(unittest.TestCase):
+  def test_aligned_stream_sugar_syntax(self):
+    """Full e2e test for CREATE ALIGNED STREAM ... BIN() sugar syntax.
+
+    Pipeline: vibration → vibration_bin → vibration_rs → input
+              bearing_temp → bearing_temp_bin → bearing_temp_rs → input
+
+    The single sugar statement:
+      CREATE ALIGNED STREAM input (vibration DOUBLE, bearing_temp DOUBLE) BIN(1s)
+    expands to 7 internal statements:
+      CREATE STREAM vibration (value DOUBLE)
+      CREATE STREAM bearing_temp (value DOUBLE)
+      CREATE VIEW vibration_bin AS ... BIN_AVG(vibration, 1s)
+      CREATE VIEW bearing_temp_bin AS ... BIN_AVG(bearing_temp, 1s)
+      CREATE VIEW vibration_rs AS ... RESAMPLE_CONSTANT + TIMESHIFT
+      CREATE VIEW bearing_temp_rs AS ... RESAMPLE_CONSTANT + TIMESHIFT
+      CREATE VIEW input AS ... cross-join vibration_rs, bearing_temp_rs
+    """
+    rt = rtbot_sql.RtBotSql()
+
+    # -- Execute the sugar: single call expands to 7 statements ---------
+    rt.execute(
+        "CREATE ALIGNED STREAM input (vibration DOUBLE, bearing_temp DOUBLE) BIN(1s)"
+    )
+
+    # The sugar creates all views as plain VIEWs (not materialized).
+    # Promote the final combining view to MATERIALIZED_VIEW so its output
+    # is stored and we can assert via rt._store.read("input").
+    rt._catalog.lookup_view("input").entity_type = native.EntityType.MATERIALIZED_VIEW
+
+    # -- Verify catalog state -------------------------------------------
+    self.assertIsNotNone(rt._catalog.lookup_stream("vibration"))
+    self.assertIsNotNone(rt._catalog.lookup_stream("bearing_temp"))
+    self.assertIsNotNone(rt._catalog.lookup_view("vibration_bin"))
+    self.assertIsNotNone(rt._catalog.lookup_view("bearing_temp_bin"))
+    self.assertIsNotNone(rt._catalog.lookup_view("vibration_rs"))
+    self.assertIsNotNone(rt._catalog.lookup_view("bearing_temp_rs"))
+    self.assertIsNotNone(rt._catalog.lookup_view("input"))
+
+    # -- Insert data (default _ts_units_per_second = 1_000_000 → µs) ---
+    #
+    # vibration stream inputs (bin 0, t < 1_000_000µs):
+    #   (t=50000µs, [8.0]), (t=200000µs, [12.0]), (t=400000µs, [10.0]),
+    #   (t=600000µs, [14.0]), (t=900000µs, [6.0])
+    #   → AVG = (8+12+10+14+6)/5 = 10.0
+    for ts, val in [
+        (50000, 8.0), (200000, 12.0), (400000, 10.0),
+        (600000, 14.0), (900000, 6.0),
+    ]:
+      rt._append_and_propagate("vibration", ts, [val])
+
+    # bearing_temp stream inputs (bin 0, t < 1_000_000µs):
+    #   (t=100000µs, [68.0]), (t=300000µs, [72.0]), (t=500000µs, [74.0]),
+    #   (t=700000µs, [78.0]), (t=850000µs, [76.0]), (t=950000µs, [82.0])
+    #   → AVG = (68+72+74+78+76+82)/6 = 75.0
+    for ts, val in [
+        (100000, 68.0), (300000, 72.0), (500000, 74.0),
+        (700000, 78.0), (850000, 76.0), (950000, 82.0),
+    ]:
+      rt._append_and_propagate("bearing_temp", ts, [val])
+
+    # vibration stream inputs (bin 1, 1_000_000 ≤ t < 2_000_000µs):
+    #   (t=1050000µs, [20.0]), (t=1300000µs, [22.0]),
+    #   (t=1500000µs, [28.0]), (t=1800000µs, [30.0])
+    #   → AVG = (20+22+28+30)/4 = 25.0
+    #
+    # vibration_bin output (flushed when first bin-1 message arrives):
+    #   (t=1050000µs, [10.0])  ← bin 0 avg flushed
+    #
+    # vibration_rs output (after RESAMPLE_CONSTANT + TIMESHIFT):
+    #   (t=1000000µs, [10.0])  ← TIMESHIFT(-1000000) corrects resampler latency
+    for ts, val in [
+        (1050000, 20.0), (1300000, 22.0),
+        (1500000, 28.0), (1800000, 30.0),
+    ]:
+      rt._append_and_propagate("vibration", ts, [val])
+
+    # bearing_temp stream inputs (bin 1, 1_000_000 ≤ t < 2_000_000µs):
+    #   (t=1100000µs, [85.0]), (t=1400000µs, [90.0]), (t=1700000µs, [95.0])
+    #   → AVG = (85+90+95)/3 = 90.0
+    #
+    # bearing_temp_bin output (flushed when first bin-1 message arrives):
+    #   (t=1100000µs, [75.0])  ← bin 0 avg flushed
+    #
+    # bearing_temp_rs output (after RESAMPLE_CONSTANT + TIMESHIFT):
+    #   (t=1000000µs, [75.0])  ← TIMESHIFT(-1000000) corrects resampler latency
+    #
+    # Combined "input" output (cross-join of vibration_rs and bearing_temp_rs):
+    #   (t=1000000µs, [10.0, 75.0])  ← both streams aligned at bin-0 boundary
+    for ts, val in [
+        (1100000, 85.0), (1400000, 90.0), (1700000, 95.0),
+    ]:
+      rt._append_and_propagate("bearing_temp", ts, [val])
+
+    # vibration bin 2 (2_000_000 ≤ t < 3_000_000µs):
+    #   (t=2100000µs, [30.0]), (t=2400000µs, [40.0]), (t=2700000µs, [35.0])
+    #   → AVG = (30+40+35)/3 = 35.0
+    #
+    # vibration_bin output (flushed when first bin-2 message arrives):
+    #   (t=2100000µs, [25.0])  ← bin 1 avg flushed
+    #
+    # vibration_rs output:
+    #   (t=2000000µs, [25.0])  ← TIMESHIFT corrects to bin boundary
+    for ts, val in [
+        (2100000, 30.0), (2400000, 40.0), (2700000, 35.0),
+    ]:
+      rt._append_and_propagate("vibration", ts, [val])
+
+    # bearing_temp bin 2 (2_000_000 ≤ t < 3_000_000µs):
+    #   (t=2200000µs, [96.0]), (t=2500000µs, [100.0]), (t=2800000µs, [104.0])
+    #   → AVG = (96+100+104)/3 = 100.0
+    #
+    # bearing_temp_bin output (flushed when first bin-2 message arrives):
+    #   (t=2200000µs, [90.0])  ← bin 1 avg flushed
+    #
+    # bearing_temp_rs output:
+    #   (t=2000000µs, [90.0])  ← TIMESHIFT corrects to bin boundary
+    #
+    # Combined "input" output:
+    #   (t=2000000µs, [25.0, 90.0])  ← both streams aligned at bin-1 boundary
+    for ts, val in [
+        (2200000, 96.0), (2500000, 100.0), (2800000, 104.0),
+    ]:
+      rt._append_and_propagate("bearing_temp", ts, [val])
+
+    # Bin 3 triggers flush of bin 2 for both streams:
+    #   vibration: (t=3100000µs, [999.0]) → flushes bin-2 avg=35.0
+    #   bearing_temp: (t=3200000µs, [999.0]) → flushes bin-2 avg=100.0
+    rt._append_and_propagate("vibration", 3100000, [999.0])
+    rt._append_and_propagate("bearing_temp", 3200000, [999.0])
+
+    # -- Read from store and assert combined output ---------------------
+    messages = rt._store.read("input")
+    self.assertEqual(len(messages), 2, "Expected exactly 2 combined outputs (bin 0 + bin 1)")
+
+    # First message: bin 0 result at the 1-second boundary
+    #   (t=1000000µs, [10.0, 75.0])
+    self.assertEqual(messages[0].timestamp, 1000000)
+    self.assertAlmostEqual(messages[0].values[0], 10.0, places=5)
+    self.assertAlmostEqual(messages[0].values[1], 75.0, places=5)
+
+    # Second message: bin 1 result at the 2-second boundary
+    #   (t=2000000µs, [25.0, 90.0])
+    self.assertEqual(messages[1].timestamp, 2000000)
+    self.assertAlmostEqual(messages[1].values[0], 25.0, places=5)
+    self.assertAlmostEqual(messages[1].values[1], 90.0, places=5)
+
+  def test_set_timescale_changes_units(self):
+    """SET TIMESCALE ms changes bin width from µs to ms.
+
+    With ms timescale, BIN(1s) creates bins 1000-wide (not 1_000_000).
+
+    Pipeline: temp → temp_bin → temp_rs → sensor
+    """
+    rt = rtbot_sql.RtBotSql()
+
+    # -- Change timescale to milliseconds -------------------------------
+    rt.execute("SET TIMESCALE ms")
+
+    # -- Create aligned stream with 1s bins (now 1000ms wide) ----------
+    rt.execute(
+        "CREATE ALIGNED STREAM sensor (temp DOUBLE) BIN(1s)"
+    )
+
+    # Promote the final combining view to MATERIALIZED_VIEW so its output
+    # is persisted in the store for assertion.
+    rt._catalog.lookup_view("sensor").entity_type = native.EntityType.MATERIALIZED_VIEW
+
+    # Verify catalog state
+    self.assertIsNotNone(rt._catalog.lookup_stream("temp"))
+    self.assertIsNotNone(rt._catalog.lookup_view("temp_bin"))
+    self.assertIsNotNone(rt._catalog.lookup_view("temp_rs"))
+    self.assertIsNotNone(rt._catalog.lookup_view("sensor"))
+
+    # -- Insert data at ms-scale timestamps -----------------------------
+    #
+    # temp stream inputs (bin 0, t < 1000ms):
+    #   (t=50ms, [20.0]), (t=300ms, [24.0]), (t=700ms, [26.0])
+    #   → AVG = (20+24+26)/3 = 23.333...
+    for ts, val in [(50, 20.0), (300, 24.0), (700, 26.0)]:
+      rt._append_and_propagate("temp", ts, [val])
+
+    # temp stream inputs (bin 1, 1000 ≤ t < 2000ms):
+    #   (t=1100ms, [30.0]), (t=1500ms, [36.0])
+    #   → AVG = (30+36)/2 = 33.0
+    #
+    # temp_bin output (flushed when first bin-1 message arrives):
+    #   (t=1100ms, [23.333...])  ← bin 0 avg flushed
+    #
+    # temp_rs output (after RESAMPLE_CONSTANT + TIMESHIFT):
+    #   Resampler init — first input, no output yet
+    for ts, val in [(1100, 30.0), (1500, 36.0)]:
+      rt._append_and_propagate("temp", ts, [val])
+
+    # temp stream inputs (bin 2, 2000 ≤ t < 3000ms):
+    #   (t=2100ms, [40.0]), (t=2500ms, [50.0])
+    #   → AVG = (40+50)/2 = 45.0
+    #
+    # temp_bin output (flushed when first bin-2 message arrives):
+    #   (t=2100ms, [33.0])  ← bin 1 avg flushed
+    #
+    # temp_rs output (resampler second input → produces first output):
+    #   (t=1000ms, [23.333...])  ← bin 0 avg, TIMESHIFT(-1000) corrected
+    for ts, val in [(2100, 40.0), (2500, 50.0)]:
+      rt._append_and_propagate("temp", ts, [val])
+
+    # Bin 3 trigger → flushes bin 2:
+    #   temp: (t=3100ms, [999.0]) → flushes bin-2 avg=45.0
+    #
+    # temp_rs output (resampler third input → produces second output):
+    #   (t=2000ms, [33.0])  ← bin 1 avg, TIMESHIFT(-1000) corrected
+    #
+    # sensor output:
+    #   (t=1000ms, [23.333...])  ← from bin 0
+    #   (t=2000ms, [33.0])       ← from bin 1
+    rt._append_and_propagate("temp", 3100, [999.0])
+
+    # -- Assert output at ms-scale timestamps ---------------------------
+    messages = rt._store.read("sensor")
+    self.assertEqual(len(messages), 2, "Expected exactly 2 outputs (bin 0 + bin 1)")
+
+    # First message: bin 0 at 1000ms boundary
+    self.assertEqual(messages[0].timestamp, 1000)
+    self.assertAlmostEqual(messages[0].values[0], 23.333333, places=3)
+
+    # Second message: bin 1 at 2000ms boundary
+    self.assertEqual(messages[1].timestamp, 2000)
+    self.assertAlmostEqual(messages[1].values[0], 33.0, places=5)
 
 
 if __name__ == "__main__":

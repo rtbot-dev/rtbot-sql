@@ -1815,6 +1815,523 @@ public class RtBotSqlRuntimeTest {
         assertEquals("Bay A", decoded2.get(locIdx));
     }
 
+    // =================================================================
+    // Exploratory: ALIGNED STREAM pipeline validation
+    // =================================================================
+
+    /**
+     * Manually execute the 7 SQL statements that the preprocessor would
+     * generate for:
+     *   CREATE ALIGNED STREAM input (vibration DOUBLE, bearing_temp DOUBLE) BIN(1s)
+     *
+     * with ts_units_per_second = 1000 (milliseconds).
+     *
+     * Then feed individual messages at irregular timestamps and observe
+     * what comes out of the combining view ("input").
+     *
+     * Bin size = 1000ms. Grid: 0, 1000, 2000, 3000, ...
+     *
+     * Vibration stream (5 samples per bin, irregular spacing):
+     *   bin 0 (t<1000):      t=50 v=8, t=200 v=12, t=400 v=10, t=600 v=14, t=900 v=6
+     *                        → avg = (8+12+10+14+6)/5 = 10.0
+     *   bin 1 (1000≤t<2000): t=1050 v=20, t=1300 v=22, t=1500 v=28, t=1800 v=30
+     *                        → avg = (20+22+28+30)/4 = 25.0
+     *   bin 2 (2000≤t<3000): t=2100 v=30, t=2400 v=40, t=2700 v=35
+     *                        → avg = (30+40+35)/3 = 35.0
+     *   bin 3 trigger:       t=3100 v=999 (just to flush bin 2)
+     *
+     * Bearing_temp stream (different sample count per bin):
+     *   bin 0 (t<1000):      t=100 v=68, t=300 v=72, t=500 v=74, t=700 v=78, t=850 v=76, t=950 v=82
+     *                        → avg = (68+72+74+78+76+82)/6 = 75.0
+     *   bin 1 (1000≤t<2000): t=1100 v=85, t=1400 v=90, t=1700 v=95
+     *                        → avg = (85+90+95)/3 = 90.0
+     *   bin 2 (2000≤t<3000): t=2200 v=96, t=2500 v=100, t=2800 v=104
+     *                        → avg = (96+100+104)/3 = 100.0
+     *   bin 3 trigger:       t=3200 v=999 (just to flush bin 2)
+     *
+     * Expected combined output (after resampler initialization + TIMESHIFT correction):
+     *   t=1000: vibration=10.0, bearing_temp=75.0  (bin 0 averages)
+     *   t=2000: vibration=25.0, bearing_temp=90.0  (bin 1 averages)
+     */
+    @Test
+    public void alignedStreamPipelineManualExecution() {
+        // -- Step 1: Execute the 7 statements the preprocessor would generate --
+        // (bin_units = 1000 for BIN(1s) with ts_units_per_second=1000)
+
+        // Per-column streams
+        runtime.execute("CREATE STREAM vibration (value DOUBLE)");
+        runtime.execute("CREATE STREAM bearing_temp (value DOUBLE)");
+
+        // Binning views
+        runtime.execute(
+            "CREATE VIEW vibration_bin AS SELECT AVG(value) AS vibration "
+            + "FROM vibration GROUP BY FLOOR(TS() / 1000)"
+        );
+        runtime.execute(
+            "CREATE VIEW bearing_temp_bin AS SELECT AVG(value) AS bearing_temp "
+            + "FROM bearing_temp GROUP BY FLOOR(TS() / 1000)"
+        );
+
+        // Resampler views (with TIMESHIFT to correct one-bin latency)
+        runtime.execute(
+            "CREATE VIEW vibration_rs AS SELECT TIMESHIFT(RESAMPLE_CONSTANT(vibration, 1000), -1000) AS vibration "
+            + "FROM vibration_bin"
+        );
+        runtime.execute(
+            "CREATE VIEW bearing_temp_rs AS SELECT TIMESHIFT(RESAMPLE_CONSTANT(bearing_temp, 1000), -1000) AS bearing_temp "
+            + "FROM bearing_temp_bin"
+        );
+
+        // Combining view (cross-join)
+        runtime.execute(
+            "CREATE VIEW input AS SELECT vibration, bearing_temp "
+            + "FROM vibration_rs, bearing_temp_rs"
+        );
+
+        // Subscribe to all views to see every message flowing through
+        CollectingListener vibBinListener = new CollectingListener();
+        CollectingListener tempBinListener = new CollectingListener();
+        CollectingListener vibRsListener = new CollectingListener();
+        CollectingListener tempRsListener = new CollectingListener();
+        CollectingListener inputListener = new CollectingListener();
+        runtime.subscribe("vibration_bin", vibBinListener);
+        runtime.subscribe("bearing_temp_bin", tempBinListener);
+        runtime.subscribe("vibration_rs", vibRsListener);
+        runtime.subscribe("bearing_temp_rs", tempRsListener);
+        runtime.subscribe("input", inputListener);
+
+        // -- Step 2: Feed messages one at a time --
+
+        // ---- Bin 0: fill both streams with many samples ----
+        // Vibration: 5 samples, avg = (8+12+10+14+6)/5 = 10.0
+        runtime.insert("vibration", 50L,  Arrays.asList(8.0));
+        runtime.insert("vibration", 200L, Arrays.asList(12.0));
+        runtime.insert("vibration", 400L, Arrays.asList(10.0));
+        runtime.insert("vibration", 600L, Arrays.asList(14.0));
+        runtime.insert("vibration", 900L, Arrays.asList(6.0));
+
+        // Bearing_temp: 6 samples, avg = (68+72+74+78+76+82)/6 = 75.0
+        runtime.insert("bearing_temp", 100L, Arrays.asList(68.0));
+        runtime.insert("bearing_temp", 300L, Arrays.asList(72.0));
+        runtime.insert("bearing_temp", 500L, Arrays.asList(74.0));
+        runtime.insert("bearing_temp", 700L, Arrays.asList(78.0));
+        runtime.insert("bearing_temp", 850L, Arrays.asList(76.0));
+        runtime.insert("bearing_temp", 950L, Arrays.asList(82.0));
+
+        // Still in bin 0 — nothing emitted yet
+        assertEquals("No _bin output yet (still in bin 0)",
+                     0, vibBinListener.count() + tempBinListener.count());
+
+        // ---- Bin 1: first message crosses into bin 1, flushing bin 0 ----
+        // Vibration bin 1: 4 samples, avg = (20+22+28+30)/4 = 25.0
+        runtime.insert("vibration", 1050L, Arrays.asList(20.0));  // triggers bin 0 flush
+        assertEquals("vibration_bin: bin 0 flushed", 1, vibBinListener.count());
+        assertEquals("Resampler init (first msg): no rs output", 0, vibRsListener.count());
+
+        runtime.insert("vibration", 1300L, Arrays.asList(22.0));
+        runtime.insert("vibration", 1500L, Arrays.asList(28.0));
+        runtime.insert("vibration", 1800L, Arrays.asList(30.0));
+
+        // Bearing_temp bin 1: 3 samples, avg = (85+90+95)/3 = 90.0
+        runtime.insert("bearing_temp", 1100L, Arrays.asList(85.0));  // triggers bin 0 flush
+        assertEquals("bearing_temp_bin: bin 0 flushed", 1, tempBinListener.count());
+        assertEquals("Resampler init (first msg): no rs output", 0, tempRsListener.count());
+
+        runtime.insert("bearing_temp", 1400L, Arrays.asList(90.0));
+        runtime.insert("bearing_temp", 1700L, Arrays.asList(95.0));
+
+        // No combined output yet — resamplers only initialized
+        assertEquals("No combined output yet", 0, inputListener.count());
+
+        // ---- Bin 2: crosses into bin 2, flushing bin 1 ----
+        // Vibration bin 2: 3 samples, avg = (30+40+35)/3 = 35.0
+        runtime.insert("vibration", 2100L, Arrays.asList(30.0));  // triggers bin 1 flush
+        assertEquals("vibration_bin: 2 flushes now", 2, vibBinListener.count());
+        assertEquals("vibration_rs emits at t=1000", 1, vibRsListener.count());
+
+        runtime.insert("vibration", 2400L, Arrays.asList(40.0));
+        runtime.insert("vibration", 2700L, Arrays.asList(35.0));
+
+        // Bearing_temp bin 2: 3 samples, avg = (96+100+104)/3 = 100.0
+        runtime.insert("bearing_temp", 2200L, Arrays.asList(96.0));  // triggers bin 1 flush
+        assertEquals("bearing_temp_bin: 2 flushes now", 2, tempBinListener.count());
+        assertEquals("bearing_temp_rs emits at t=1000", 1, tempRsListener.count());
+
+        runtime.insert("bearing_temp", 2500L, Arrays.asList(100.0));
+        runtime.insert("bearing_temp", 2800L, Arrays.asList(104.0));
+
+        // -- First combined output: t=1000, bin 0 averages --
+        assertEquals("First combined output", 1, inputListener.count());
+        assertEquals(1000L, (long) inputListener.timestamps.get(0));
+        assertEquals("vibration bin 0 avg", 10.0, inputListener.values.get(0).get(0), 1e-9);
+        assertEquals("bearing_temp bin 0 avg", 75.0, inputListener.values.get(0).get(1), 1e-9);
+
+        // ---- Bin 3 trigger: flush bin 2 ----
+        runtime.insert("vibration", 3100L, Arrays.asList(999.0));
+        runtime.insert("bearing_temp", 3200L, Arrays.asList(999.0));
+
+        // -- Second combined output: t=2000, bin 1 averages --
+        assertEquals("Two combined outputs total", 2, inputListener.count());
+        assertEquals(2000L, (long) inputListener.timestamps.get(1));
+        assertEquals("vibration bin 1 avg", 25.0, inputListener.values.get(1).get(0), 1e-9);
+        assertEquals("bearing_temp bin 1 avg", 90.0, inputListener.values.get(1).get(1), 1e-9);
+
+        // -- Print full trace --
+        System.out.println("\n=== ALIGNED STREAM PIPELINE — FULL TRACE ===");
+        System.out.println("vibration_bin (" + vibBinListener.count() + " outputs):");
+        for (int i = 0; i < vibBinListener.count(); i++) {
+            System.out.println("  t=" + vibBinListener.timestamps.get(i)
+                + "  avg=" + vibBinListener.values.get(i));
+        }
+        System.out.println("bearing_temp_bin (" + tempBinListener.count() + " outputs):");
+        for (int i = 0; i < tempBinListener.count(); i++) {
+            System.out.println("  t=" + tempBinListener.timestamps.get(i)
+                + "  avg=" + tempBinListener.values.get(i));
+        }
+        System.out.println("vibration_rs (" + vibRsListener.count() + " outputs):");
+        for (int i = 0; i < vibRsListener.count(); i++) {
+            System.out.println("  t=" + vibRsListener.timestamps.get(i)
+                + "  val=" + vibRsListener.values.get(i));
+        }
+        System.out.println("bearing_temp_rs (" + tempRsListener.count() + " outputs):");
+        for (int i = 0; i < tempRsListener.count(); i++) {
+            System.out.println("  t=" + tempRsListener.timestamps.get(i)
+                + "  val=" + tempRsListener.values.get(i));
+        }
+        System.out.println("input — combined (" + inputListener.count() + " outputs):");
+        for (int i = 0; i < inputListener.count(); i++) {
+            System.out.println("  t=" + inputListener.timestamps.get(i)
+                + "  [vibration, bearing_temp]=" + inputListener.values.get(i));
+        }
+    }
+
+    // =================================================================
+    // Sugar syntax: CREATE ALIGNED STREAM ... BIN() end-to-end
+    // =================================================================
+
+    /**
+     * End-to-end test for the sugar syntax:
+     *   CREATE ALIGNED STREAM input (vibration DOUBLE, bearing_temp DOUBLE) BIN(1s)
+     *
+     * Unlike {@link #alignedStreamPipelineManualExecution()} which manually
+     * executes 7 separate statements with ts_units_per_second=1000 (ms), this
+     * test issues a single {@code execute()} call with the real default
+     * timescale (1,000,000 μs) and lets the preprocessor expand it.
+     *
+     * With tsUnitsPerSecond=1,000,000 and BIN(1s), bin_units = 1,000,000.
+     * Grid: 0, 1_000_000, 2_000_000, 3_000_000, ...
+     *
+     * Vibration stream (5 samples per bin, irregular spacing):
+     *   bin 0 (t<1,000,000μs):          t=50000 v=8, t=200000 v=12, t=400000 v=10,
+     *                                    t=600000 v=14, t=900000 v=6
+     *                                    → avg = (8+12+10+14+6)/5 = 10.0
+     *   bin 1 (1,000,000≤t<2,000,000):  t=1050000 v=20, t=1300000 v=22,
+     *                                    t=1500000 v=28, t=1800000 v=30
+     *                                    → avg = (20+22+28+30)/4 = 25.0
+     *   bin 2 (2,000,000≤t<3,000,000):  t=2100000 v=30, t=2400000 v=40, t=2700000 v=35
+     *                                    → avg = (30+40+35)/3 = 35.0
+     *   bin 3 trigger:                   t=3100000 v=999 (flush bin 2)
+     *
+     * Bearing_temp stream (different sample count per bin):
+     *   bin 0 (t<1,000,000μs):          t=100000 v=68, t=300000 v=72, t=500000 v=74,
+     *                                    t=700000 v=78, t=850000 v=76, t=950000 v=82
+     *                                    → avg = (68+72+74+78+76+82)/6 = 75.0
+     *   bin 1 (1,000,000≤t<2,000,000):  t=1100000 v=85, t=1400000 v=90, t=1700000 v=95
+     *                                    → avg = (85+90+95)/3 = 90.0
+     *   bin 2 (2,000,000≤t<3,000,000):  t=2200000 v=96, t=2500000 v=100, t=2800000 v=104
+     *                                    → avg = (96+100+104)/3 = 100.0
+     *   bin 3 trigger:                   t=3200000 v=999 (flush bin 2)
+     *
+     * Expected combined output (after resampler initialization + TIMESHIFT correction):
+     *   t=1,000,000: vibration=10.0, bearing_temp=75.0  (bin 0 averages)
+     *   t=2,000,000: vibration=25.0, bearing_temp=90.0  (bin 1 averages)
+     */
+    @Test
+    public void alignedStreamSugarSyntax() {
+        // -- Step 1: Single sugar-syntax call (expands to 7 internal statements) --
+        //
+        // The preprocessor expands:
+        //   CREATE ALIGNED STREAM input (vibration DOUBLE, bearing_temp DOUBLE) BIN(1s)
+        // into:
+        //   1. CREATE STREAM vibration (value DOUBLE)
+        //   2. CREATE STREAM bearing_temp (value DOUBLE)
+        //   3. CREATE VIEW vibration_bin AS SELECT AVG(value) AS vibration
+        //        FROM vibration GROUP BY FLOOR(TS() / 1000000)
+        //   4. CREATE VIEW bearing_temp_bin AS SELECT AVG(value) AS bearing_temp
+        //        FROM bearing_temp GROUP BY FLOOR(TS() / 1000000)
+        //   5. CREATE VIEW vibration_rs AS SELECT TIMESHIFT(RESAMPLE_CONSTANT(vibration, 1000000), -1000000) AS vibration
+        //        FROM vibration_bin
+        //   6. CREATE VIEW bearing_temp_rs AS SELECT TIMESHIFT(RESAMPLE_CONSTANT(bearing_temp, 1000000), -1000000) AS bearing_temp
+        //        FROM bearing_temp_bin
+        //   7. CREATE VIEW input AS SELECT vibration, bearing_temp
+        //        FROM vibration_rs, bearing_temp_rs
+
+        RtBotSqlRuntime rt = new RtBotSqlRuntime();
+        try {
+            rt.execute(
+                "CREATE ALIGNED STREAM input (vibration DOUBLE, bearing_temp DOUBLE) BIN(1s)"
+            );
+
+            // -- Step 2: Verify catalog state --
+            // 2 streams created by the expansion
+            assertNotNull("vibration stream should exist",
+                          rt.getCatalog().lookupStream("vibration"));
+            assertNotNull("bearing_temp stream should exist",
+                          rt.getCatalog().lookupStream("bearing_temp"));
+
+            // 5 views created by the expansion
+            assertNotNull("vibration_bin view should exist",
+                          rt.getCatalog().lookupView("vibration_bin"));
+            assertNotNull("bearing_temp_bin view should exist",
+                          rt.getCatalog().lookupView("bearing_temp_bin"));
+            assertNotNull("vibration_rs view should exist",
+                          rt.getCatalog().lookupView("vibration_rs"));
+            assertNotNull("bearing_temp_rs view should exist",
+                          rt.getCatalog().lookupView("bearing_temp_rs"));
+            assertNotNull("input combining view should exist",
+                          rt.getCatalog().lookupView("input"));
+
+            // -- Step 3: Subscribe to intermediate views and the combining view --
+            CollectingListener vibBinListener = new CollectingListener();
+            CollectingListener tempBinListener = new CollectingListener();
+            CollectingListener vibRsListener = new CollectingListener();
+            CollectingListener tempRsListener = new CollectingListener();
+            CollectingListener inputListener = new CollectingListener();
+            rt.subscribe("vibration_bin", vibBinListener);
+            rt.subscribe("bearing_temp_bin", tempBinListener);
+            rt.subscribe("vibration_rs", vibRsListener);
+            rt.subscribe("bearing_temp_rs", tempRsListener);
+            rt.subscribe("input", inputListener);
+
+            // -- Step 4: Insert data into per-column streams --
+            //
+            // Java default tsUnitsPerSecond=1,000,000 (microseconds).
+            // BIN(1s) → bin_units = 1,000,000.  Grid: 0, 1000000, 2000000, ...
+
+            // ---- Bin 0: fill both streams with many samples ----
+            //
+            // Vibration stream inputs (bin 0):
+            //   (t=50000μs, [8.0]) → (t=200000μs, [12.0]) → (t=400000μs, [10.0])
+            //   → (t=600000μs, [14.0]) → (t=900000μs, [6.0]) → avg=10.0
+            //
+            // Pipeline: vibration → vibration_bin → vibration_rs → input
+            //   vibration:     (50000, [8.0]), (200000, [12.0]), (400000, [10.0]), (600000, [14.0]), (900000, [6.0])
+            //   vibration_bin: (1050000, [10.0])  ← flushed when bin 1 starts
+            //   vibration_rs:  (1000000, [10.0])  ← TIMESHIFT(-1000000) corrects the resampler latency
+            //   input:         (1000000, [10.0, 75.0])  ← cross-join of vibration_rs and bearing_temp_rs
+            rt.insert("vibration",  50000L, Arrays.asList(8.0));
+            rt.insert("vibration", 200000L, Arrays.asList(12.0));
+            rt.insert("vibration", 400000L, Arrays.asList(10.0));
+            rt.insert("vibration", 600000L, Arrays.asList(14.0));
+            rt.insert("vibration", 900000L, Arrays.asList(6.0));
+
+            // Bearing_temp stream inputs (bin 0):
+            //   (t=100000μs, [68.0]) → (t=300000μs, [72.0]) → (t=500000μs, [74.0])
+            //   → (t=700000μs, [78.0]) → (t=850000μs, [76.0]) → (t=950000μs, [82.0]) → avg=75.0
+            //
+            // Pipeline: bearing_temp → bearing_temp_bin → bearing_temp_rs → input
+            //   bearing_temp:     (100000, [68.0]), (300000, [72.0]), (500000, [74.0]),
+            //                     (700000, [78.0]), (850000, [76.0]), (950000, [82.0])
+            //   bearing_temp_bin: (1100000, [75.0])  ← flushed when bin 1 starts
+            //   bearing_temp_rs:  (1000000, [75.0])  ← TIMESHIFT(-1000000) corrects the resampler latency
+            //   input:            (1000000, [10.0, 75.0])  ← cross-join with vibration_rs
+            rt.insert("bearing_temp", 100000L, Arrays.asList(68.0));
+            rt.insert("bearing_temp", 300000L, Arrays.asList(72.0));
+            rt.insert("bearing_temp", 500000L, Arrays.asList(74.0));
+            rt.insert("bearing_temp", 700000L, Arrays.asList(78.0));
+            rt.insert("bearing_temp", 850000L, Arrays.asList(76.0));
+            rt.insert("bearing_temp", 950000L, Arrays.asList(82.0));
+
+            // Still in bin 0 — nothing emitted yet
+            assertEquals("No _bin output yet (still in bin 0)",
+                         0, vibBinListener.count() + tempBinListener.count());
+
+            // ---- Bin 1: first message crosses into bin 1, flushing bin 0 ----
+            //
+            // Vibration bin 1 inputs:
+            //   (t=1050000μs, [20.0]) → (t=1300000μs, [22.0]) → (t=1500000μs, [28.0])
+            //   → (t=1800000μs, [30.0]) → avg=25.0
+            //
+            // Pipeline trace for vibration (bin 0 flush):
+            //   vibration:     (1050000, [20.0])  ← first sample in bin 1 triggers bin 0 flush
+            //   vibration_bin: (1050000, [10.0])  ← bin 0 average emitted
+            //   vibration_rs:  <no output>        ← resampler initializes (needs 2 points)
+            rt.insert("vibration", 1050000L, Arrays.asList(20.0));
+            assertEquals("vibration_bin: bin 0 flushed", 1, vibBinListener.count());
+            assertEquals("Resampler init (first msg): no rs output", 0, vibRsListener.count());
+
+            rt.insert("vibration", 1300000L, Arrays.asList(22.0));
+            rt.insert("vibration", 1500000L, Arrays.asList(28.0));
+            rt.insert("vibration", 1800000L, Arrays.asList(30.0));
+
+            // Bearing_temp bin 1 inputs:
+            //   (t=1100000μs, [85.0]) → (t=1400000μs, [90.0]) → (t=1700000μs, [95.0]) → avg=90.0
+            //
+            // Pipeline trace for bearing_temp (bin 0 flush):
+            //   bearing_temp:     (1100000, [85.0])  ← first sample in bin 1 triggers bin 0 flush
+            //   bearing_temp_bin: (1100000, [75.0])  ← bin 0 average emitted
+            //   bearing_temp_rs:  <no output>        ← resampler initializes (needs 2 points)
+            rt.insert("bearing_temp", 1100000L, Arrays.asList(85.0));
+            assertEquals("bearing_temp_bin: bin 0 flushed", 1, tempBinListener.count());
+            assertEquals("Resampler init (first msg): no rs output", 0, tempRsListener.count());
+
+            rt.insert("bearing_temp", 1400000L, Arrays.asList(90.0));
+            rt.insert("bearing_temp", 1700000L, Arrays.asList(95.0));
+
+            // No combined output yet — resamplers only initialized
+            assertEquals("No combined output yet", 0, inputListener.count());
+
+            // ---- Bin 2: crosses into bin 2, flushing bin 1 ----
+            //
+            // Vibration bin 2 inputs:
+            //   (t=2100000μs, [30.0]) → (t=2400000μs, [40.0]) → (t=2700000μs, [35.0]) → avg=35.0
+            //
+            // Pipeline trace for vibration (bin 1 flush → resampler emits):
+            //   vibration:     (2100000, [30.0])    ← first sample in bin 2 triggers bin 1 flush
+            //   vibration_bin: (2100000, [25.0])    ← bin 1 average emitted (2nd bin output)
+            //   vibration_rs:  (1000000, [10.0])    ← TIMESHIFT(-1000000) on resampled bin 0 output
+            rt.insert("vibration", 2100000L, Arrays.asList(30.0));
+            assertEquals("vibration_bin: 2 flushes now", 2, vibBinListener.count());
+            assertEquals("vibration_rs emits at t=1000000", 1, vibRsListener.count());
+
+            rt.insert("vibration", 2400000L, Arrays.asList(40.0));
+            rt.insert("vibration", 2700000L, Arrays.asList(35.0));
+
+            // Bearing_temp bin 2 inputs:
+            //   (t=2200000μs, [96.0]) → (t=2500000μs, [100.0]) → (t=2800000μs, [104.0]) → avg=100.0
+            //
+            // Pipeline trace for bearing_temp (bin 1 flush → resampler emits → cross-join fires):
+            //   bearing_temp:     (2200000, [96.0])   ← first sample in bin 2 triggers bin 1 flush
+            //   bearing_temp_bin: (2200000, [90.0])   ← bin 1 average emitted (2nd bin output)
+            //   bearing_temp_rs:  (1000000, [75.0])   ← TIMESHIFT(-1000000) on resampled bin 0 output
+            //   input:            (1000000, [10.0, 75.0])  ← cross-join fires: both _rs now have t=1000000
+            rt.insert("bearing_temp", 2200000L, Arrays.asList(96.0));
+            assertEquals("bearing_temp_bin: 2 flushes now", 2, tempBinListener.count());
+            assertEquals("bearing_temp_rs emits at t=1000000", 1, tempRsListener.count());
+
+            rt.insert("bearing_temp", 2500000L, Arrays.asList(100.0));
+            rt.insert("bearing_temp", 2800000L, Arrays.asList(104.0));
+
+            // -- First combined output: t=1000000, bin 0 averages --
+            assertEquals("First combined output", 1, inputListener.count());
+            assertEquals(1000000L, (long) inputListener.timestamps.get(0));
+            assertEquals("vibration bin 0 avg", 10.0,
+                         inputListener.values.get(0).get(0), 1e-9);
+            assertEquals("bearing_temp bin 0 avg", 75.0,
+                         inputListener.values.get(0).get(1), 1e-9);
+
+            // ---- Bin 3 trigger: flush bin 2 ----
+            //
+            // Pipeline trace (bin 2 flush → resampler emits → cross-join fires):
+            //   vibration:     (3100000, [999.0])     ← triggers bin 2 flush
+            //   vibration_bin: (3100000, [35.0])      ← bin 2 average
+            //   vibration_rs:  (2000000, [25.0])      ← TIMESHIFT on resampled bin 1 output
+            //
+            //   bearing_temp:     (3200000, [999.0])  ← triggers bin 2 flush
+            //   bearing_temp_bin: (3200000, [100.0])  ← bin 2 average
+            //   bearing_temp_rs:  (2000000, [90.0])   ← TIMESHIFT on resampled bin 1 output
+            //   input:            (2000000, [25.0, 90.0])  ← cross-join fires
+            rt.insert("vibration",    3100000L, Arrays.asList(999.0));
+            rt.insert("bearing_temp", 3200000L, Arrays.asList(999.0));
+
+            // -- Second combined output: t=2000000, bin 1 averages --
+            assertEquals("Two combined outputs total", 2, inputListener.count());
+            assertEquals(2000000L, (long) inputListener.timestamps.get(1));
+            assertEquals("vibration bin 1 avg", 25.0,
+                         inputListener.values.get(1).get(0), 1e-9);
+            assertEquals("bearing_temp bin 1 avg", 90.0,
+                         inputListener.values.get(1).get(1), 1e-9);
+
+            // -- Print full trace --
+            System.out.println("\n=== ALIGNED STREAM SUGAR SYNTAX — FULL TRACE ===");
+            System.out.println("vibration_bin (" + vibBinListener.count() + " outputs):");
+            for (int i = 0; i < vibBinListener.count(); i++) {
+                System.out.println("  t=" + vibBinListener.timestamps.get(i)
+                    + "  avg=" + vibBinListener.values.get(i));
+            }
+            System.out.println("bearing_temp_bin (" + tempBinListener.count() + " outputs):");
+            for (int i = 0; i < tempBinListener.count(); i++) {
+                System.out.println("  t=" + tempBinListener.timestamps.get(i)
+                    + "  avg=" + tempBinListener.values.get(i));
+            }
+            System.out.println("vibration_rs (" + vibRsListener.count() + " outputs):");
+            for (int i = 0; i < vibRsListener.count(); i++) {
+                System.out.println("  t=" + vibRsListener.timestamps.get(i)
+                    + "  val=" + vibRsListener.values.get(i));
+            }
+            System.out.println("bearing_temp_rs (" + tempRsListener.count() + " outputs):");
+            for (int i = 0; i < tempRsListener.count(); i++) {
+                System.out.println("  t=" + tempRsListener.timestamps.get(i)
+                    + "  val=" + tempRsListener.values.get(i));
+            }
+            System.out.println("input — combined (" + inputListener.count() + " outputs):");
+            for (int i = 0; i < inputListener.count(); i++) {
+                System.out.println("  t=" + inputListener.timestamps.get(i)
+                    + "  [vibration, bearing_temp]=" + inputListener.values.get(i));
+            }
+        } finally {
+            rt.destroyAll();
+        }
+    }
+
+    /**
+     * Verify that SET TIMESCALE changes the bin units for subsequent
+     * CREATE ALIGNED STREAM ... BIN() calls.
+     *
+     * Default tsUnitsPerSecond = 1,000,000 (μs).
+     * After SET TIMESCALE ms → tsUnitsPerSecond = 1,000.
+     * BIN(1s) with ms timescale → bin_units = 1,000 (not 1,000,000).
+     *
+     * We verify this indirectly: with ms timescale, bin boundaries are at
+     * t=1000, 2000, ... so samples with t<1000 are in bin 0, and a sample
+     * at t>=1000 flushes bin 0.
+     */
+    @Test
+    public void setTimescaleChangesUnits() {
+        RtBotSqlRuntime rt = new RtBotSqlRuntime();
+        try {
+            // Change timescale from default μs to ms
+            rt.execute("SET TIMESCALE ms");
+
+            // Now BIN(1s) should produce bin_units=1000 (ms, not 1_000_000 μs)
+            rt.execute(
+                "CREATE ALIGNED STREAM sensor (temp DOUBLE) BIN(1s)"
+            );
+
+            // Verify catalog was populated
+            assertNotNull("temp stream should exist",
+                          rt.getCatalog().lookupStream("temp"));
+            assertNotNull("temp_bin view should exist",
+                          rt.getCatalog().lookupView("temp_bin"));
+            assertNotNull("sensor combining view should exist",
+                          rt.getCatalog().lookupView("sensor"));
+
+            CollectingListener binListener = new CollectingListener();
+            rt.subscribe("temp_bin", binListener);
+
+            // Insert samples in bin 0 (t < 1000ms): avg = (20+40)/2 = 30.0
+            //   temp: (100, [20.0]), (500, [40.0])
+            //   temp_bin: <no output yet, still accumulating>
+            rt.insert("temp", 100L, Arrays.asList(20.0));
+            rt.insert("temp", 500L, Arrays.asList(40.0));
+            assertEquals("Still in bin 0, no flush", 0, binListener.count());
+
+            // First sample in bin 1 (t >= 1000ms) triggers bin 0 flush
+            //   temp: (1100, [60.0])  ← crosses into bin 1
+            //   temp_bin: (1100, [30.0])  ← bin 0 average flushed
+            rt.insert("temp", 1100L, Arrays.asList(60.0));
+            assertEquals("Bin 0 should have flushed at t=1000 boundary", 1, binListener.count());
+            assertEquals("Bin 0 avg = (20+40)/2 = 30.0",
+                         30.0, binListener.values.get(0).get(0), 1e-9);
+
+            // If timescale were still μs, bin_units would be 1_000_000 and
+            // the sample at t=1100 would still be in bin 0 (no flush).
+            // The fact that we got a flush proves SET TIMESCALE took effect.
+        } finally {
+            rt.destroyAll();
+        }
+    }
+
     /**
      * Mixed path: insertMixed + SQL INSERT on the same stream.
      * Dictionary IDs must stay consistent across both insert paths.
