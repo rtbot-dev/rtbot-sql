@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <regex>
+#include <set>
 #include <stdexcept>
 #include <string>
 
@@ -45,6 +46,16 @@ std::string trim(const std::string& s) {
   if (start == std::string::npos) return "";
   auto end = s.find_last_not_of(" \t\n\r;");
   return s.substr(start, end - start + 1);
+}
+
+bool is_reserved_sql_keyword(const std::string& ident) {
+  static const std::set<std::string> kReserved = {
+      "select", "from", "where", "group", "by", "having", "order",
+      "limit", "join", "on", "as", "create", "stream", "table",
+      "view", "materialized", "insert", "into", "drop", "set", "timescale"};
+  std::string lowered = ident;
+  std::transform(lowered.begin(), lowered.end(), lowered.begin(), ::tolower);
+  return kReserved.count(lowered) > 0;
 }
 
 }  // namespace
@@ -107,6 +118,20 @@ PreprocessResult preprocess_sql(const std::string& sql,
       if (columns.empty()) {
         throw std::runtime_error(
             "CREATE ALIGNED STREAM requires at least one column");
+      }
+
+      if (is_reserved_sql_keyword(stream_name)) {
+        throw std::runtime_error(
+            "CREATE ALIGNED STREAM name cannot be an SQL keyword: " +
+            stream_name);
+      }
+
+      for (const auto& col : columns) {
+        if (is_reserved_sql_keyword(col.name)) {
+          throw std::runtime_error(
+              "CREATE ALIGNED STREAM column name cannot be an SQL keyword: " +
+              col.name);
+        }
       }
 
       std::string bin_str = std::to_string(bin_units);

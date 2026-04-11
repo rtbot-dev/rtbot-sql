@@ -83,6 +83,12 @@ TEST_F(PreprocessorTest, DurationHours) {
   EXPECT_NE(r.statements[2].find("3600000000"), std::string::npos);
 }
 
+TEST_F(PreprocessorTest, DurationFiveMinutes) {
+  auto r = preprocess_sql("CREATE ALIGNED STREAM s (a DOUBLE) BIN(5m)", 1000000);
+  EXPECT_NE(r.statements[1].find("300000000"), std::string::npos);
+  EXPECT_NE(r.statements[2].find("300000000"), std::string::npos);
+}
+
 TEST_F(PreprocessorTest, InvalidBinNoUnits) {
   EXPECT_THROW(
       preprocess_sql("CREATE ALIGNED STREAM s (a DOUBLE) BIN(1000)", 1000000),
@@ -135,6 +141,26 @@ TEST_F(PreprocessorTest, ThreeColumns) {
   // Combining materialized view references _rs views
   EXPECT_EQ(r.statements[9],
       "CREATE MATERIALIZED VIEW multi AS SELECT x, y, z FROM x_rs, y_rs, z_rs");
+}
+
+TEST_F(PreprocessorTest, FiveColumns) {
+  auto r = preprocess_sql(
+      "CREATE ALIGNED STREAM many (a DOUBLE, b DOUBLE, c DOUBLE, d DOUBLE, e DOUBLE) BIN(1s)",
+      1000000);
+  // 5 streams + 5 _bin + 5 _rs + 1 combining = 16
+  ASSERT_EQ(r.statements.size(), 16);
+  EXPECT_EQ(r.statements[0], "CREATE STREAM a (value DOUBLE)");
+  EXPECT_EQ(r.statements[4], "CREATE STREAM e (value DOUBLE)");
+  EXPECT_EQ(r.statements[15],
+            "CREATE MATERIALIZED VIEW many AS SELECT a, b, c, d, e "
+            "FROM a_rs, b_rs, c_rs, d_rs, e_rs");
+}
+
+TEST_F(PreprocessorTest, KeywordColumnNameThrows) {
+  EXPECT_THROW(
+      preprocess_sql("CREATE ALIGNED STREAM s (select DOUBLE) BIN(1s)",
+                     1000000),
+      std::runtime_error);
 }
 
 TEST_F(PreprocessorTest, EmptyColumnsThrows) {
