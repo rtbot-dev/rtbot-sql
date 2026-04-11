@@ -18,6 +18,14 @@ Expr func_expr(const std::string& name, std::vector<Expr> args) {
   return f;
 }
 
+Expr binary_expr(const std::string& op, Expr left, Expr right) {
+  auto e = std::make_unique<BinaryExpr>();
+  e->op = op;
+  e->left = std::move(left);
+  e->right = std::move(right);
+  return e;
+}
+
 SelectItem item(Expr expr, std::optional<std::string> alias = std::nullopt) {
   return {std::move(expr), alias};
 }
@@ -622,8 +630,8 @@ TEST_F(ClassificationTest, ClassifyMixed) {
 }
 
 // Test: function call on column (not a comparison) → SEGMENT_EXPRESSION
-TEST_F(ClassificationTest, ClassifyFunctionCallAsSegment) {
-  // GROUP BY ABS(amplitude) — a FuncCall, not a ColumnRef
+TEST_F(ClassificationTest, ClassifyFunctionCallAsSegmentExpression) {
+  // GROUP BY ABS(amplitude) — a FuncCall, not a ColumnRef → SEGMENT_EXPRESSION
   std::vector<Expr> group_by;
   std::vector<Expr> abs_args;
   abs_args.push_back(col("amplitude"));
@@ -1152,6 +1160,49 @@ TEST_F(SegmentGroupByTest, MixedGroupByJsonRoundTrip) {
   }
   EXPECT_TRUE(outer_has_pipeline)
       << "Outer prototype should contain a Pipeline after round-trip";
+}
+
+// Test: SELECT AVG(value) FROM sensor GROUP BY FLOOR(TS() / 1000000)
+// Numeric segment expression partitions data into time bins via Pipeline.
+TEST_F(GroupByTest, NumericSegmentFloorTsDivision) {
+  // Register a different stream for this test
+  StreamSchema sensor_schema{"sensor", {{"value", 0}}};
+  scope.register_stream("sensor", sensor_schema);
+
+  std::vector<SelectItem> select_list;
+  std::vector<Expr> avg_args;
+  avg_args.push_back(col("value"));
+  select_list.push_back(item(func_expr("AVG", std::move(avg_args)), "avg_value"));
+
+  // GROUP BY FLOOR(TS() / 1000000)
+  std::vector<Expr> group_by;
+  std::vector<Expr> floor_args;
+  floor_args.push_back(binary_expr("/", func_expr("TS", {}), num(1000000.0)));
+  group_by.push_back(func_expr("FLOOR", std::move(floor_args)));
+
+  auto [ep, field_map, is_seg] =
+      compile_group_by(select_list, group_by, std::nullopt, input, scope,
+                       builder, /*num_input_cols=*/1);
+
+  EXPECT_TRUE(is_seg) << "Numeric segment expression should produce segment-only view";
+
+  // Should have a Pipeline in the outer graph (not KeyedPipeline)
+  bool found_pipeline = false;
+  for (const auto& op : builder.operators()) {
+    EXPECT_NE(op.type, "KeyedPipeline") << "Should NOT use KeyedPipeline for numeric segments";
+    if (op.type == "Pipeline") {
+      found_pipeline = true;
+    }
+  }
+  EXPECT_TRUE(found_pipeline) << "Expected Pipeline in outer graph";
+
+  // Should have exactly one prototype
+  EXPECT_EQ(builder.prototypes().size(), 1u);
+
+  // field_map: just avg_value, no key column
+  EXPECT_EQ(field_map.size(), 1u);
+  EXPECT_EQ(field_map.count("avg_value"), 1u);
+  EXPECT_EQ(field_map.at("avg_value"), 0);
 }
 
 }  // namespace

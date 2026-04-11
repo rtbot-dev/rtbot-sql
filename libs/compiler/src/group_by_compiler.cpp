@@ -316,7 +316,9 @@ GroupByClassification classify_group_by(
         continue;
       }
     }
-    // Anything else is a segment expression
+    // Boolean-producing expressions → SEGMENT_EXPRESSION
+    // Numeric expressions (FuncCall, BinaryExpr) → also SEGMENT_EXPRESSION
+    // Everything else (boolean or numeric) is a segment expression
     result.items.push_back({GroupByItemKind::SEGMENT_EXPRESSION, -1, ""});
   }
   return result;
@@ -566,15 +568,29 @@ SelectResult compile_group_by(
           "multiple segment expressions in GROUP BY not yet supported");
     }
 
-    // Compile the segment expression as a predicate (BOOLEAN output)
-    // in the outer graph, then convert to Number for the Pipeline control port.
-    auto bool_ep =
-        compile_predicate(group_by[0], input_endpoint, scope, builder);
+    // Compile the segment expression in the outer graph.
+    // Boolean expressions → compile_predicate() + BooleanToNumber
+    // Numeric expressions → compile_expression() directly (feeds Pipeline c1)
+    const auto& seg_expr = group_by[0];
+    bool is_boolean =
+        std::get_if<std::unique_ptr<parser::ast::ComparisonExpr>>(&seg_expr) != nullptr
+     || std::get_if<std::unique_ptr<parser::ast::LogicalExpr>>(&seg_expr) != nullptr
+     || std::get_if<std::unique_ptr<parser::ast::NotExpr>>(&seg_expr) != nullptr
+     || std::get_if<std::unique_ptr<parser::ast::BetweenExpr>>(&seg_expr) != nullptr;
 
-    auto b2n_id = builder.next_id("b2n");
-    builder.add_operator(b2n_id, "BooleanToNumber");
-    builder.connect(bool_ep, {b2n_id, "i1"});
-    Endpoint num_ep{b2n_id, "o1"};
+    Endpoint num_ep;
+    if (is_boolean) {
+      auto bool_ep =
+          compile_predicate(seg_expr, input_endpoint, scope, builder);
+      auto b2n_id = builder.next_id("b2n");
+      builder.add_operator(b2n_id, "BooleanToNumber");
+      builder.connect(bool_ep, {b2n_id, "i1"});
+      num_ep = {b2n_id, "o1"};
+    } else {
+      // Numeric segment expression (e.g., FLOOR(TS() / N)) — feeds Pipeline c1 directly
+      auto result = compile_expression(seg_expr, input_endpoint, scope, builder);
+      num_ep = ensure_endpoint(std::move(result), input_endpoint, builder);
+    }
 
     // Build prototype sub-graph for aggregates
     GraphBuilder proto_builder;
