@@ -66,6 +66,7 @@ public class RtBotSqlRuntime {
 
     private long lastTimestamp = System.currentTimeMillis();
     private final Gson gson = new Gson();
+    private long tsUnitsPerSecond = 1_000_000L;
 
     private static final Pattern LIMIT_PATTERN =
             Pattern.compile("\\bLIMIT\\s+(\\d+)\\b", Pattern.CASE_INSENSITIVE);
@@ -86,39 +87,56 @@ public class RtBotSqlRuntime {
      * @throws SqlError if compilation or execution fails
      */
     public Object execute(String sql) {
-        String normalized = normalizeSql(sql);
         String catalogJson = catalog.snapshotJson();
-        String resultJson = RtBotSqlCompiler.compileSqlJson(normalized, catalogJson);
-        CompilationResult result = gson.fromJson(resultJson, CompilationResult.class);
+        String resultJson = RtBotSqlCompiler.compileSqlJson(sql, catalogJson, tsUnitsPerSecond);
 
-        if (result.hasErrors()) {
-            throw new SqlError(result.errors);
+        com.google.gson.JsonObject wrapper = gson.fromJson(resultJson, com.google.gson.JsonObject.class);
+
+        // Handle SET TIMESCALE
+        long newTsUnitsPerSecond = wrapper.get("new_ts_units_per_second").getAsLong();
+        if (newTsUnitsPerSecond > 0) {
+            tsUnitsPerSecond = newTsUnitsPerSecond;
+            return null;
         }
 
-        StatementType stType = result.statementTypeEnum();
-        if (stType == null) {
-            throw new SqlError("Unknown statement type: " + result.statementType);
+        com.google.gson.JsonArray results = wrapper.getAsJsonArray("results");
+        Object lastSelectResult = null;
+
+        for (int i = 0; i < results.size(); i++) {
+            CompilationResult result = gson.fromJson(results.get(i), CompilationResult.class);
+
+            if (result.hasErrors()) {
+                throw new SqlError(result.errors);
+            }
+
+            StatementType stType = result.statementTypeEnum();
+            if (stType == null) {
+                throw new SqlError("Unknown statement type: " + result.statementType);
+            }
+
+            switch (stType) {
+                case CREATE_STREAM:
+                    handleCreateStream(result);
+                    break;
+                case INSERT:
+                    handleInsert(result);
+                    break;
+                case CREATE_VIEW:
+                case CREATE_MATERIALIZED_VIEW:
+                    handleCreateView(result);
+                    break;
+                case DROP:
+                    handleDrop(result);
+                    break;
+                case SELECT:
+                    lastSelectResult = handleSelect(sql, result);
+                    break;
+                default:
+                    throw new SqlError("Unsupported statement type: " + result.statementType);
+            }
         }
 
-        switch (stType) {
-            case CREATE_STREAM:
-                handleCreateStream(result);
-                return null;
-            case INSERT:
-                handleInsert(result);
-                return null;
-            case CREATE_VIEW:
-            case CREATE_MATERIALIZED_VIEW:
-                handleCreateView(result);
-                return null;
-            case DROP:
-                handleDrop(result);
-                return null;
-            case SELECT:
-                return handleSelect(normalized, result);
-            default:
-                throw new SqlError("Unsupported statement type: " + result.statementType);
-        }
+        return lastSelectResult;
     }
 
     /**
@@ -755,8 +773,18 @@ public class RtBotSqlRuntime {
         }
         String wrappedSql = "CREATE MATERIALIZED VIEW __rtbot_sql_tmp AS " + selectSql;
         String catalogJson = catalog.snapshotJson();
-        String resultJson = RtBotSqlCompiler.compileSqlJson(wrappedSql, catalogJson);
-        return gson.fromJson(resultJson, CompilationResult.class);
+        String resultJson = RtBotSqlCompiler.compileSqlJson(wrappedSql, catalogJson, tsUnitsPerSecond);
+
+        com.google.gson.JsonObject wrapper = gson.fromJson(resultJson, com.google.gson.JsonObject.class);
+        com.google.gson.JsonArray results = wrapper.getAsJsonArray("results");
+        if (results.size() == 0) {
+            CompilationResult empty = new CompilationResult();
+            empty.errors = new java.util.ArrayList<>();
+            empty.errors.add(new CompilationError("No compilation results", -1, -1));
+            return empty;
+        }
+        // Return the last result (the CREATE MATERIALIZED VIEW)
+        return gson.fromJson(results.get(results.size() - 1), CompilationResult.class);
     }
 
     // =================================================================
