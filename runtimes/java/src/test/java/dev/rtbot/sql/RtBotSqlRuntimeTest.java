@@ -1426,6 +1426,35 @@ public class RtBotSqlRuntimeTest {
         assertEquals(2.0, ((Number)decoded.get(1)).doubleValue(), 1e-9);
     }
 
+    @Test
+    public void decodeRowOnMaterializedViewDecodesTextColumns() {
+        // Create a stream with TEXT columns, insert mixed data, then create
+        // a materialized view that passes through TEXT columns.
+        runtime.execute("CREATE STREAM sensors (device_id TEXT, location TEXT, value DOUBLE PRECISION)");
+        runtime.insertMixed("sensors", 1000L, List.of("Pump 01", "Bay A", 42.0));
+        runtime.insertMixed("sensors", 2000L, List.of("Pump 02", "Bay B", 99.0));
+
+        // Materialized view that selects TEXT columns alongside aggregated values
+        runtime.execute("CREATE MATERIALIZED VIEW sensor_output AS "
+                + "SELECT device_id, location, value FROM sensors");
+
+        // Read the view output to get raw double values (dictionary-encoded TEXT)
+        Object resultObj = runtime.execute("SELECT * FROM sensor_output LIMIT 2");
+        SelectResult result = (SelectResult) resultObj;
+        assertFalse("Expected view output rows", result.rows.isEmpty());
+
+        // decodeRow with the view name should decode TEXT columns back to strings
+        List<Object> decoded0 = runtime.decodeRow("sensor_output", result.rows.get(0));
+        assertEquals("device_id should decode to string", "Pump 01", decoded0.get(0));
+        assertEquals("location should decode to string", "Bay A", decoded0.get(1));
+        assertEquals(42.0, ((Number) decoded0.get(2)).doubleValue(), 1e-9);
+
+        List<Object> decoded1 = runtime.decodeRow("sensor_output", result.rows.get(1));
+        assertEquals("Pump 02", decoded1.get(0));
+        assertEquals("Bay B", decoded1.get(1));
+        assertEquals(99.0, ((Number) decoded1.get(2)).doubleValue(), 1e-9);
+    }
+
     // -----------------------------------------------------------------
     // Dictionary persistence across serialize/restore
     // -----------------------------------------------------------------

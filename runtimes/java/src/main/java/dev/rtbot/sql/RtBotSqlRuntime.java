@@ -328,11 +328,30 @@ public class RtBotSqlRuntime {
      * @return decoded values — String for TEXT columns, Double for DOUBLE columns
      */
     public List<Object> decodeRow(String streamName, List<Double> values) {
-        StreamSchema schema = catalog.lookupStream(streamName);
-        if (schema == null || values == null) {
-            return new ArrayList<>(values != null ? values : List.of());
+        if (values == null) {
+            return new ArrayList<>();
         }
 
+        StreamSchema schema = catalog.lookupStream(streamName);
+        if (schema != null) {
+            return decodeRowFromSchema(streamName, schema, values);
+        }
+
+        // Fall back to view: use the view's fieldMap + source stream schemas
+        // to determine which output columns are TEXT and need decoding.
+        ViewMeta view = catalog.lookupView(streamName);
+        if (view != null) {
+            return decodeRowFromView(view, values);
+        }
+
+        return new ArrayList<>(values);
+    }
+
+    /**
+     * Decode using a stream schema directly — the stream name is used as the
+     * dictionary key prefix.
+     */
+    private List<Object> decodeRowFromSchema(String streamName, StreamSchema schema, List<Double> values) {
         List<Object> decoded = new ArrayList<>(values.size());
         for (int i = 0; i < values.size(); i++) {
             if (i < schema.columns.size() && schema.columns.get(i).isText()) {
@@ -349,6 +368,64 @@ public class RtBotSqlRuntime {
             }
         }
         return decoded;
+    }
+
+    /**
+     * Decode a view output row by matching view field names to source stream
+     * column definitions. TEXT columns are dictionary-encoded as doubles during
+     * insertion into the source stream; the dictionary keys use the source
+     * stream name prefix ({@code "sourceStream.columnName"}).
+     *
+     * <p>For each view output column, if a matching TEXT column exists in any
+     * source stream, the corresponding dictionary is used to decode the value.
+     */
+    private List<Object> decodeRowFromView(ViewMeta view, List<Double> values) {
+        if (view.fieldMap == null || view.fieldMap.isEmpty()) {
+            return new ArrayList<>(values);
+        }
+
+        // Build ordered column list from fieldMap (sorted by index)
+        List<Map.Entry<String, Integer>> sortedFields = new ArrayList<>(view.fieldMap.entrySet());
+        sortedFields.sort(Map.Entry.comparingByValue());
+
+        List<Object> decoded = new ArrayList<>(values.size());
+        for (int i = 0; i < values.size(); i++) {
+            if (i < sortedFields.size()) {
+                String columnName = sortedFields.get(i).getKey();
+                Object decodedValue = tryDecodeViewColumn(view, columnName, values.get(i));
+                decoded.add(decodedValue);
+            } else {
+                decoded.add(values.get(i));
+            }
+        }
+        return decoded;
+    }
+
+    /**
+     * Tries to decode a single view output column value by searching the
+     * view's source streams for a matching TEXT column and its dictionary.
+     */
+    private Object tryDecodeViewColumn(ViewMeta view, String columnName, Double value) {
+        if (view.sourceStreams == null) {
+            return value;
+        }
+        for (String source : view.sourceStreams) {
+            StreamSchema sourceSchema = catalog.lookupStream(source);
+            if (sourceSchema == null) {
+                continue;
+            }
+            for (ColumnDef col : sourceSchema.columns) {
+                if (col.name.equals(columnName) && col.isText()) {
+                    String dictKey = source + "." + columnName;
+                    StringDictionary dict = catalog.lookupDictionary(dictKey);
+                    if (dict != null) {
+                        String str = dict.decode(value);
+                        return str != null ? str : value;
+                    }
+                }
+            }
+        }
+        return value;
     }
 
     // =================================================================
