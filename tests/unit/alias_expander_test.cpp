@@ -204,6 +204,53 @@ TEST(ExpandAliases, ChainedSubstitution) {
   EXPECT_NE(arg_bin, nullptr) << "AVG arg should be expanded from dp to 2*price";
 }
 
+TEST(ExpandAliases, ExcludeKeyPreventsSelfReferencing) {
+  // Simulate: SELECT RESAMPLE_CONSTANT(value, 1000) AS value
+  // alias_map has value → RESAMPLE_CONSTANT(value, 1000)
+  // Without exclude_key, expanding the inner ColumnRef "value" would match
+  // the alias "value" and create nested RESAMPLE_CONSTANT(RESAMPLE_CONSTANT(...)).
+  // With exclude_key="value", the inner ColumnRef "value" is left as-is.
+  std::vector<Expr> args;
+  args.push_back(col("value"));
+  args.push_back(num(1000.0));
+  AliasMap alias_map;
+  alias_map["value"] = func("RESAMPLE_CONSTANT", std::move(args));
+
+  // The expression to expand: RESAMPLE_CONSTANT(value, 1000)
+  std::vector<Expr> expr_args;
+  expr_args.push_back(col("value"));
+  expr_args.push_back(num(1000.0));
+  Expr expr = func("RESAMPLE_CONSTANT", std::move(expr_args));
+
+  // Without exclude_key: inner "value" gets replaced → nested function
+  Expr bad = expand_aliases(expr, alias_map);
+  const auto* bad_f = std::get_if<std::unique_ptr<FuncCall>>(&bad);
+  ASSERT_NE(bad_f, nullptr);
+  // First arg should be a FuncCall (the expanded alias), not a ColumnRef
+  const auto* nested =
+      std::get_if<std::unique_ptr<FuncCall>>(&(*bad_f)->args[0]);
+  EXPECT_NE(nested, nullptr)
+      << "Without exclude_key, inner 'value' should be expanded to nested func";
+
+  // With exclude_key="value": inner "value" stays as ColumnRef
+  std::vector<Expr> expr_args2;
+  expr_args2.push_back(col("value"));
+  expr_args2.push_back(num(1000.0));
+  Expr expr2 = func("RESAMPLE_CONSTANT", std::move(expr_args2));
+
+  Expr good = expand_aliases(expr2, alias_map, "value");
+  const auto* good_f = std::get_if<std::unique_ptr<FuncCall>>(&good);
+  ASSERT_NE(good_f, nullptr);
+  EXPECT_EQ((*good_f)->name, "RESAMPLE_CONSTANT");
+  // First arg should remain a ColumnRef (not expanded)
+  const auto* col_ref = std::get_if<ColumnRef>(&(*good_f)->args[0]);
+  EXPECT_NE(col_ref, nullptr)
+      << "With exclude_key, inner 'value' should NOT be expanded";
+  if (col_ref) {
+    EXPECT_EQ(col_ref->column_name, "value");
+  }
+}
+
 // ─── expr_has_aggregate tests ────────────────────────────────────────────────
 
 TEST(ExprHasAggregate, ReturnsTrueForSum) {

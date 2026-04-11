@@ -170,3 +170,12 @@ cc_test(
         "@com_google_googletest//:gtest_main",
     ],
 )
+
+cc_test(
+    name = "preprocessor_test",
+    srcs = ["preprocessor_test.cpp"],
+    deps = [
+        "//libs/api:api_preprocessor",
+        "@com_google_googletest//:gtest_main",
+    ],
+)

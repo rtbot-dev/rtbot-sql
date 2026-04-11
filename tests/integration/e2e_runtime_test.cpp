@@ -1574,5 +1574,1018 @@ TEST(E2ERuntimeTextTest, JsonCatalogRoundTrip) {
   EXPECT_DOUBLE_EQ(insert_result2.insert_payload[1], 3.0);  // next ID after 2.0
 }
 
+// ---------------------------------------------------------------------------
+// T_ts_bin: TS() + GROUP BY FLOOR(TS()/N) — time-bin aggregation
+// SELECT AVG(value) AS avg_value FROM sensor GROUP BY FLOOR(TS() / 1000000)
+// Messages with timestamps in the same 1-second bin are grouped together.
+// ---------------------------------------------------------------------------
+
+TEST_F(E2eRuntimeTest, T_ts_bin_GroupByFloorTsProducesCorrectBins) {
+  catalog.streams["sensor"] = StreamSchema{"sensor", {{"value", 0}}};
+
+  auto r = compile(
+      "SELECT AVG(value) AS avg_value "
+      "FROM sensor GROUP BY FLOOR(TS() / 1000000)");
+
+  ASSERT_FALSE(r.program_json.empty());
+  rtbot::Program program(r.program_json);
+
+  // Pipeline with numeric segment: output is [avg_value] only (no key prepended)
+  int avg_idx = r.field_map.at("avg_value");
+  EXPECT_EQ(avg_idx, 0) << "avg_value should be at index 0 (no key column in segment output)";
+
+  // Pipeline emits only at key transitions (when FLOOR(TS()/1000000) changes).
+  // Messages within the same bin accumulate without output.
+
+  // Collect all outputs
+  struct OutputRow {
+    rtbot::timestamp_t time;
+    std::vector<double> values;
+  };
+  std::vector<OutputRow> all_outputs;
+
+  auto collect = [&](const rtbot::ProgramMsgBatch& batch) {
+    for (const auto& [op_id, op_batch] : batch) {
+      for (const auto& [port, msgs] : op_batch) {
+        for (const auto& msg : msgs) {
+          auto* vec_msg =
+              dynamic_cast<rtbot::Message<rtbot::VectorNumberData>*>(msg.get());
+          if (vec_msg) {
+            all_outputs.push_back({vec_msg->time, vec_msg->data.values});
+          }
+        }
+      }
+    }
+  };
+
+  // Bin 0: timestamps 100000..500000 us → FLOOR(ts/1000000) = 0
+  // No output within this bin (Pipeline accumulates)
+  collect(send(program, 100000, {10.0}));
+  EXPECT_EQ(all_outputs.size(), 0u) << "No output within bin 0 (first message)";
+
+  collect(send(program, 200000, {20.0}));
+  EXPECT_EQ(all_outputs.size(), 0u) << "No output within bin 0 (accumulating)";
+
+  collect(send(program, 500000, {30.0}));
+  EXPECT_EQ(all_outputs.size(), 0u) << "No output within bin 0 (accumulating)";
+
+  // Bin 1: timestamp 1100000 us → FLOOR(ts/1000000) = 1 → KEY CHANGE!
+  // Pipeline emits accumulated bin 0 result: avg(10, 20, 30) = 20
+  collect(send(program, 1100000, {100.0}));
+  ASSERT_EQ(all_outputs.size(), 1u) << "Transition to bin 1 should emit bin 0 result";
+  EXPECT_DOUBLE_EQ(all_outputs[0].values[avg_idx], 20.0);  // avg(10, 20, 30)
+
+  // Still in bin 1: accumulate, no output
+  collect(send(program, 1500000, {200.0}));
+  EXPECT_EQ(all_outputs.size(), 1u) << "No output within bin 1 (accumulating)";
+
+  // Bin 2: timestamp 2100000 us → FLOOR(ts/1000000) = 2 → KEY CHANGE!
+  // Pipeline emits accumulated bin 1 result: avg(100, 200) = 150
+  collect(send(program, 2100000, {999.0}));
+  ASSERT_EQ(all_outputs.size(), 2u) << "Transition to bin 2 should emit bin 1 result";
+  EXPECT_DOUBLE_EQ(all_outputs[1].values[avg_idx], 150.0);  // avg(100, 200)
+}
+
+// ===========================================================================
+// RESAMPLE_CONSTANT integration tests
+//
+// These tests verify the RESAMPLE_CONSTANT SQL function compiles to a working
+// ResamplerConstant operator and produces correctly timed output in the RTBot
+// runtime. They also test the full aligned stream pipeline chain:
+// binning → resampling → cross-stream combining.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// T_rs_1: RESAMPLE_CONSTANT standalone — scalar resampling
+//
+// A simple view that resamples a scalar column at a fixed interval.
+// Input arrives at irregular times; output snaps to grid (t0=0).
+// ---------------------------------------------------------------------------
+
+TEST_F(E2eRuntimeTest, ResampleConstantStandalone) {
+  // Register a simple single-column stream as a "binning view" output
+  // In real usage, this would be a view; for testing, use a stream directly.
+  catalog.streams["signal"] = StreamSchema{"signal", {{"value", 0}}};
+
+  auto r = compile(
+      "CREATE MATERIALIZED VIEW signal_rs AS "
+      "SELECT RESAMPLE_CONSTANT(value, 1000) AS value "
+      "FROM signal");
+
+  ASSERT_FALSE(r.has_errors());
+  ASSERT_FALSE(r.program_json.empty());
+
+  int val_idx = r.field_map.at("value");
+
+  rtbot::Program program(r.program_json);
+
+  // Collect all outputs with timestamps
+  struct OutputRow {
+    rtbot::timestamp_t time;
+    std::vector<double> values;
+  };
+  std::vector<OutputRow> all_outputs;
+
+  auto collect = [&](const rtbot::ProgramMsgBatch& batch) {
+    for (const auto& [op_id, op_batch] : batch) {
+      for (const auto& [port, msgs] : op_batch) {
+        for (const auto& msg : msgs) {
+          auto* vec_msg =
+              dynamic_cast<rtbot::Message<rtbot::VectorNumberData>*>(msg.get());
+          if (vec_msg) {
+            all_outputs.push_back({vec_msg->time, vec_msg->data.values});
+          }
+        }
+      }
+    }
+  };
+
+  // ResamplerConstant with interval=1000, t0=0 snaps to grid: 0, 1000, 2000, ...
+  // Feed irregular input:
+  //   t=100:  value=10.0 → first msg, initializes. Grid: next_emit = 1000
+  //   t=500:  value=20.0 → holds, next_emit still 1000
+  //   t=1500: value=30.0 → passes grid point 1000: emit(1000, 20.0). next_emit=2000
+  //   t=2500: value=40.0 → passes grid 2000: emit(2000, 30.0). next_emit=3000
+  //   t=4000: value=50.0 → passes grid 3000: emit(3000, 40.0). next_emit=4000.
+  //                         exact on 4000: emit(4000, 50.0). next_emit=5000.
+
+  collect(send(program, 100, {10.0}));
+  EXPECT_EQ(all_outputs.size(), 0u) << "First message initializes, no output yet";
+
+  collect(send(program, 500, {20.0}));
+  EXPECT_EQ(all_outputs.size(), 0u) << "Still before grid point 1000";
+
+  collect(send(program, 1500, {30.0}));
+  ASSERT_EQ(all_outputs.size(), 1u) << "Should emit at grid point 1000";
+  EXPECT_EQ(all_outputs[0].time, 1000u);
+  EXPECT_DOUBLE_EQ(all_outputs[0].values[val_idx], 20.0);  // last value before 1000
+
+  collect(send(program, 2500, {40.0}));
+  ASSERT_EQ(all_outputs.size(), 2u) << "Should emit at grid point 2000";
+  EXPECT_EQ(all_outputs[1].time, 2000u);
+  EXPECT_DOUBLE_EQ(all_outputs[1].values[val_idx], 30.0);
+
+  collect(send(program, 4000, {50.0}));
+  // Passes 3000 (emit 40.0) and lands exactly on 4000 (emit 50.0)
+  ASSERT_EQ(all_outputs.size(), 4u) << "Should emit at grid points 3000 and 4000";
+  EXPECT_EQ(all_outputs[2].time, 3000u);
+  EXPECT_DOUBLE_EQ(all_outputs[2].values[val_idx], 40.0);
+  EXPECT_EQ(all_outputs[3].time, 4000u);
+  EXPECT_DOUBLE_EQ(all_outputs[3].values[val_idx], 50.0);
+}
+
+// ---------------------------------------------------------------------------
+// T_rs_2: Binning → Resampler chain (single stream)
+//
+// Simulates the first half of the aligned stream pipeline:
+//   stream → binning_view (GROUP BY FLOOR(TS()/N)) → resampler_view (RESAMPLE_CONSTANT)
+//
+// The binning view emits at irregular times (segment transitions).
+// The resampler view snaps those to a regular grid.
+// ---------------------------------------------------------------------------
+
+TEST_F(E2eRuntimeTest, BinningThenResamplerChain) {
+  catalog.streams["sensor"] = StreamSchema{"sensor", {{"value", 0}}};
+
+  // Step 1: Compile binning view
+  auto r_bin = compile(
+      "SELECT AVG(value) AS avg_value "
+      "FROM sensor GROUP BY FLOOR(TS() / 1000)");
+
+  ASSERT_FALSE(r_bin.has_errors());
+  register_view("sensor_bin", r_bin);
+
+  // Step 2: Compile resampler view from binning view
+  auto r_rs = compile(
+      "CREATE MATERIALIZED VIEW sensor_rs AS "
+      "SELECT RESAMPLE_CONSTANT(avg_value, 1000) AS avg_value "
+      "FROM sensor_bin");
+
+  ASSERT_FALSE(r_rs.has_errors());
+
+  int avg_idx_rs = r_rs.field_map.at("avg_value");
+
+  rtbot::Program prog_bin(r_bin.program_json);
+  rtbot::Program prog_rs(r_rs.program_json);
+
+  // Collect resampler outputs
+  struct OutputRow {
+    rtbot::timestamp_t time;
+    std::vector<double> values;
+  };
+  std::vector<OutputRow> rs_outputs;
+
+  auto collect_rs = [&](const rtbot::ProgramMsgBatch& batch) {
+    for (const auto& [op_id, op_batch] : batch) {
+      for (const auto& [port, msgs] : op_batch) {
+        for (const auto& msg : msgs) {
+          auto* vec_msg =
+              dynamic_cast<rtbot::Message<rtbot::VectorNumberData>*>(msg.get());
+          if (vec_msg) {
+            rs_outputs.push_back({vec_msg->time, vec_msg->data.values});
+          }
+        }
+      }
+    }
+  };
+
+  // Feed data into binning view, pipe output to resampler
+  //
+  // Bin size = 1000. Timestamps in microseconds.
+  //
+  // Bin 0 (ts 0-999): t=100 val=10, t=300 val=20, t=800 val=30
+  //   → avg(10,20,30) = 20, emitted at bin transition
+  //
+  // Bin 1 (ts 1000-1999): t=1200 val=40, t=1800 val=60
+  //   → avg(40,60) = 50, emitted at bin transition
+  //
+  // Bin 2 (ts 2000-2999): t=2500 val=100
+  //   → triggers bin 1 emission, no output for bin 2 yet
+
+  auto pipe = [&](rtbot::timestamp_t t, double value) {
+    auto batch_bin = send(prog_bin, t, {value});
+    for (const auto& [op_id, op_batch] : batch_bin) {
+      for (const auto& [port, msgs] : op_batch) {
+        for (const auto& msg : msgs) {
+          auto* vec_msg =
+              dynamic_cast<rtbot::Message<rtbot::VectorNumberData>*>(msg.get());
+          if (vec_msg) {
+            // Pipe binning output into resampler
+            auto batch_rs = prog_rs.receive(
+                make_msg(vec_msg->time, vec_msg->data.values));
+            collect_rs(batch_rs);
+          }
+        }
+      }
+    }
+  };
+
+  // Bin 0
+  pipe(100, 10.0);
+  pipe(300, 20.0);
+  pipe(800, 30.0);
+  EXPECT_EQ(rs_outputs.size(), 0u) << "No output until bin transition";
+
+  // Transition to bin 1 — bin 0 emitted
+  // Pipeline emits bin 0 at the transition timestamp (t=1200)
+  pipe(1200, 40.0);
+  // Binning emits: avg(10,20,30) = 20 at time=1200.
+  // Resampler receives FIRST message (t=1200, val=20). t0=0, interval=1000.
+  // ResamplerConstant initialization: k=(1200-0)/1000=1, next_emit=(1+1)*1000=2000.
+  // First message is consumed for init — no output yet.
+  EXPECT_EQ(rs_outputs.size(), 0u)
+      << "Resampler init on first message — no output";
+
+  pipe(1800, 60.0);
+
+  // Transition to bin 2 — bin 1 emitted
+  pipe(2500, 100.0);
+  // Binning emits: avg(40,60) = 50 at time=2500.
+  // Resampler receives SECOND message (t=2500, val=50). next_emit=2000.
+  // Emit loop: 2000 < 2500 → emit(2000, last_value=20.0), next_emit=3000.
+  // 3000 >= 2500 → stop. Update last_value=50.0.
+  ASSERT_EQ(rs_outputs.size(), 1u) << "Resampler should emit at grid point 2000";
+  EXPECT_EQ(rs_outputs[0].time, 2000u);
+  EXPECT_DOUBLE_EQ(rs_outputs[0].values[avg_idx_rs], 20.0);
+
+  // Transition to bin 3 — bin 2 emitted
+  pipe(3200, 999.0);
+  // Binning emits: avg(100) = 100 at time=3200.
+  // Resampler receives (t=3200, val=100). next_emit=3000.
+  // Emit loop: 3000 < 3200 → emit(3000, last_value=50.0), next_emit=4000.
+  ASSERT_EQ(rs_outputs.size(), 2u) << "Resampler should emit at grid point 3000";
+  EXPECT_EQ(rs_outputs[1].time, 3000u);
+  EXPECT_DOUBLE_EQ(rs_outputs[1].values[avg_idx_rs], 50.0);
+}
+
+// ---------------------------------------------------------------------------
+// T_rs_3: Full aligned stream pipeline — 2 streams with cross-join
+//
+// Simulates the complete desugaring of CREATE ALIGNED STREAM:
+//   stream_a → a_bin (GROUP BY FLOOR(TS()/N))
+//            → a_rs  (RESAMPLE_CONSTANT)  ─┐
+//                                           ├→ combined (cross-join)
+//   stream_b → b_bin (GROUP BY FLOOR(TS()/N))
+//            → b_rs  (RESAMPLE_CONSTANT)  ─┘
+//
+// The two streams have data arriving at different irregular times.
+// After binning + resampling, their timestamps align to the same grid,
+// enabling the cross-join to produce output.
+// ---------------------------------------------------------------------------
+
+TEST_F(E2eRuntimeTest, FullAlignedStreamTwoStreamCrossJoin) {
+  catalog.streams["vibration"] =
+      StreamSchema{"vibration", {{"value", 0}}};
+  catalog.streams["temperature"] =
+      StreamSchema{"temperature", {{"value", 0}}};
+
+  // Compile binning views
+  auto r_vib_bin = compile(
+      "SELECT AVG(value) AS vibration "
+      "FROM vibration GROUP BY FLOOR(TS() / 1000)");
+  register_view("vibration_bin", r_vib_bin);
+
+  auto r_temp_bin = compile(
+      "SELECT AVG(value) AS bearing_temp "
+      "FROM temperature GROUP BY FLOOR(TS() / 1000)");
+  register_view("temperature_bin", r_temp_bin);
+
+  // Compile resampler views
+  auto r_vib_rs = compile(
+      "CREATE MATERIALIZED VIEW vibration_rs AS "
+      "SELECT RESAMPLE_CONSTANT(vibration, 1000) AS vibration "
+      "FROM vibration_bin");
+  register_view("vibration_rs", r_vib_rs);
+
+  auto r_temp_rs = compile(
+      "CREATE MATERIALIZED VIEW temperature_rs AS "
+      "SELECT RESAMPLE_CONSTANT(bearing_temp, 1000) AS bearing_temp "
+      "FROM temperature_bin");
+  register_view("temperature_rs", r_temp_rs);
+
+  // Compile combining view (cross-join)
+  auto r_combined = compile(
+      "CREATE MATERIALIZED VIEW input AS "
+      "SELECT vibration, bearing_temp "
+      "FROM vibration_rs v, temperature_rs t");
+
+  ASSERT_FALSE(r_combined.has_errors());
+  ASSERT_EQ(r_combined.source_streams.size(), 2u);
+
+  int vib_idx = r_combined.field_map.at("vibration");
+  int temp_idx = r_combined.field_map.at("bearing_temp");
+
+  // Create all programs
+  rtbot::Program prog_vib_bin(r_vib_bin.program_json);
+  rtbot::Program prog_temp_bin(r_temp_bin.program_json);
+  rtbot::Program prog_vib_rs(r_vib_rs.program_json);
+  rtbot::Program prog_temp_rs(r_temp_rs.program_json);
+  rtbot::Program prog_combined(r_combined.program_json);
+
+  // Collect combined outputs
+  struct OutputRow {
+    rtbot::timestamp_t time;
+    std::vector<double> values;
+  };
+  std::vector<OutputRow> combined_outputs;
+
+  auto collect_combined = [&](const rtbot::ProgramMsgBatch& batch) {
+    for (const auto& [op_id, op_batch] : batch) {
+      for (const auto& [port, msgs] : op_batch) {
+        for (const auto& msg : msgs) {
+          auto* vec_msg =
+              dynamic_cast<rtbot::Message<rtbot::VectorNumberData>*>(msg.get());
+          if (vec_msg) {
+            combined_outputs.push_back({vec_msg->time, vec_msg->data.values});
+          }
+        }
+      }
+    }
+  };
+
+  // Helper: pipe through the chain for each stream
+  // Returns resampler outputs (to be fed into combining view)
+  auto pipe_vib = [&](rtbot::timestamp_t t, double value) {
+    std::vector<std::pair<rtbot::timestamp_t, std::vector<double>>> rs_msgs;
+    auto batch_bin = prog_vib_bin.receive(make_msg(t, {value}));
+    for (const auto& [op_id, op_batch] : batch_bin) {
+      for (const auto& [port, msgs] : op_batch) {
+        for (const auto& msg : msgs) {
+          auto* vm = dynamic_cast<rtbot::Message<rtbot::VectorNumberData>*>(msg.get());
+          if (vm) {
+            auto batch_rs = prog_vib_rs.receive(make_msg(vm->time, vm->data.values));
+            for (const auto& [op2, ob2] : batch_rs) {
+              for (const auto& [p2, ms2] : ob2) {
+                for (const auto& m2 : ms2) {
+                  auto* vm2 = dynamic_cast<rtbot::Message<rtbot::VectorNumberData>*>(m2.get());
+                  if (vm2) {
+                    rs_msgs.push_back({vm2->time, vm2->data.values});
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    return rs_msgs;
+  };
+
+  auto pipe_temp = [&](rtbot::timestamp_t t, double value) {
+    std::vector<std::pair<rtbot::timestamp_t, std::vector<double>>> rs_msgs;
+    auto batch_bin = prog_temp_bin.receive(make_msg(t, {value}));
+    for (const auto& [op_id, op_batch] : batch_bin) {
+      for (const auto& [port, msgs] : op_batch) {
+        for (const auto& msg : msgs) {
+          auto* vm = dynamic_cast<rtbot::Message<rtbot::VectorNumberData>*>(msg.get());
+          if (vm) {
+            auto batch_rs = prog_temp_rs.receive(make_msg(vm->time, vm->data.values));
+            for (const auto& [op2, ob2] : batch_rs) {
+              for (const auto& [p2, ms2] : ob2) {
+                for (const auto& m2 : ms2) {
+                  auto* vm2 = dynamic_cast<rtbot::Message<rtbot::VectorNumberData>*>(m2.get());
+                  if (vm2) {
+                    rs_msgs.push_back({vm2->time, vm2->data.values});
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    return rs_msgs;
+  };
+
+  // Feed vibration and temperature data at DIFFERENT irregular times
+  // Bin size = 1000, grid: 0, 1000, 2000, ...
+  //
+  // ResamplerConstant behavior: first message is consumed for initialization
+  // (sets next_emit, stores last_value), NO output. Subsequent messages emit
+  // catch-up grid points using the held value.
+  //
+  // Vibration stream bins:
+  //   bin 0 (t<1000): t=100 val=5, t=500 val=15 → avg=10
+  //   bin 1 (1000≤t<2000): t=1200 val=25 → avg=25
+  //   bin 2 (2000≤t<3000): t=2300 val=35 → avg=35
+  //   bin 3 trigger: t=3100 val=999
+  //
+  // Temperature stream bins:
+  //   bin 0 (t<1000): t=200 val=70, t=800 val=80 → avg=75
+  //   bin 1 (1000≤t<2000): t=1500 val=90 → avg=90
+  //   bin 2 (2000≤t<3000): t=2600 val=100 → avg=100
+  //   bin 3 trigger: t=3200 val=999
+
+  // Bin 0 data for both streams
+  pipe_vib(100, 5.0);
+  pipe_vib(500, 15.0);
+  pipe_temp(200, 70.0);
+  pipe_temp(800, 80.0);
+
+  // Trigger bin 0 → bin 1 transitions (resampler INITIALIZATION — no output)
+  auto vib_rs_1 = pipe_vib(1200, 25.0);
+  // Bin 0 vib emitted at t=1200, avg=10.
+  // Resampler: FIRST msg (init). t0=0, interval=1000.
+  //   k=(1200-0)/1000=1, next_emit=(1+1)*1000=2000. last_value=10. No output.
+  EXPECT_TRUE(vib_rs_1.empty()) << "Resampler init — no output on first msg";
+  for (const auto& [t, vals] : vib_rs_1) {
+    collect_combined(prog_combined.receive(make_msg(t, vals), "i1"));
+  }
+
+  auto temp_rs_1 = pipe_temp(1500, 90.0);
+  // Bin 0 temp emitted at t=1500, avg=75.
+  // Resampler: FIRST msg (init). k=(1500-0)/1000=1, next_emit=2000. last_value=75.
+  EXPECT_TRUE(temp_rs_1.empty()) << "Resampler init — no output on first msg";
+  for (const auto& [t, vals] : temp_rs_1) {
+    collect_combined(prog_combined.receive(make_msg(t, vals), "i2"));
+  }
+
+  EXPECT_EQ(combined_outputs.size(), 0u)
+      << "No combined output yet — both resamplers only initialized";
+
+  // Trigger bin 1 → bin 2 transitions (resampler EMITS at grid point 2000)
+  auto vib_rs_2 = pipe_vib(2300, 35.0);
+  // Bin 1 vib emitted at t=2300, avg=25.
+  // Resampler: SECOND msg (t=2300). next_emit=2000. 2000<2300 → emit(2000, 10.0).
+  //   next_emit=3000. last_value=25.
+  ASSERT_EQ(vib_rs_2.size(), 1u) << "Resampler should emit at grid 2000";
+  EXPECT_EQ(vib_rs_2[0].first, 2000u);
+  for (const auto& [t, vals] : vib_rs_2) {
+    collect_combined(prog_combined.receive(make_msg(t, vals), "i1"));
+  }
+
+  auto temp_rs_2 = pipe_temp(2600, 100.0);
+  // Bin 1 temp emitted at t=2600, avg=90.
+  // Resampler: SECOND msg (t=2600). next_emit=2000. 2000<2600 → emit(2000, 75.0).
+  //   next_emit=3000. last_value=90.
+  ASSERT_EQ(temp_rs_2.size(), 1u) << "Resampler should emit at grid 2000";
+  EXPECT_EQ(temp_rs_2[0].first, 2000u);
+  for (const auto& [t, vals] : temp_rs_2) {
+    collect_combined(prog_combined.receive(make_msg(t, vals), "i2"));
+  }
+
+  // Both resamplers emitted at t=2000 with aligned timestamps!
+  // Cross-join should produce output.
+  ASSERT_GE(combined_outputs.size(), 1u)
+      << "Cross-join should produce output when both streams emit at t=2000";
+  EXPECT_EQ(combined_outputs[0].time, 2000u)
+      << "Combined output at grid-aligned timestamp";
+  EXPECT_DOUBLE_EQ(combined_outputs[0].values[vib_idx], 10.0);
+  EXPECT_DOUBLE_EQ(combined_outputs[0].values[temp_idx], 75.0);
+
+  // Trigger bin 2 → bin 3 transitions (resampler emits at grid point 3000)
+  auto vib_rs_3 = pipe_vib(3100, 999.0);
+  // Bin 2 vib emitted at t=3100, avg=35.
+  // Resampler: msg at t=3100. next_emit=3000. 3000<3100 → emit(3000, 25.0).
+  //   next_emit=4000.
+  ASSERT_EQ(vib_rs_3.size(), 1u);
+  EXPECT_EQ(vib_rs_3[0].first, 3000u);
+  for (const auto& [t, vals] : vib_rs_3) {
+    collect_combined(prog_combined.receive(make_msg(t, vals), "i1"));
+  }
+
+  auto temp_rs_3 = pipe_temp(3200, 999.0);
+  // Bin 2 temp emitted at t=3200, avg=100.
+  // Resampler: msg at t=3200. next_emit=3000. 3000<3200 → emit(3000, 90.0).
+  //   next_emit=4000.
+  ASSERT_EQ(temp_rs_3.size(), 1u);
+  EXPECT_EQ(temp_rs_3[0].first, 3000u);
+  for (const auto& [t, vals] : temp_rs_3) {
+    collect_combined(prog_combined.receive(make_msg(t, vals), "i2"));
+  }
+
+  // Second combined output at t=3000
+  ASSERT_GE(combined_outputs.size(), 2u)
+      << "Cross-join should produce second output at t=3000";
+  EXPECT_EQ(combined_outputs[1].time, 3000u);
+  // Values at t=3000: held values from previous resampler output
+  // Vib: last_value was 25.0 (bin 1 avg), temp: last_value was 90.0 (bin 1 avg)
+  EXPECT_DOUBLE_EQ(combined_outputs[1].values[vib_idx], 25.0);
+  EXPECT_DOUBLE_EQ(combined_outputs[1].values[temp_idx], 90.0);
+}
+
+// ---------------------------------------------------------------------------
+// T_rs_4: Full aligned stream pipeline with TIMESHIFT correction
+//
+// Same as T_rs_3 but with TIMESHIFT(-interval) wrapping RESAMPLE_CONSTANT,
+// which compensates the one-bin latency inherent in the pipeline:
+//   stream → _bin (GROUP BY FLOOR(TS()/N)) → _rs (TIMESHIFT(RESAMPLE_CONSTANT(...)))
+//
+// Without TIMESHIFT: bin 0 avg appears at t=2000 (one bin late)
+// With TIMESHIFT(-1000): bin 0 avg appears at t=1000 (correct)
+// ---------------------------------------------------------------------------
+
+TEST_F(E2eRuntimeTest, AlignedStreamPipelineWithTimeShiftCorrection) {
+  catalog.streams["vibration"] =
+      StreamSchema{"vibration", {{"value", 0}}};
+  catalog.streams["temperature"] =
+      StreamSchema{"temperature", {{"value", 0}}};
+
+  // Compile binning views
+  auto r_vib_bin = compile(
+      "SELECT AVG(value) AS vibration "
+      "FROM vibration GROUP BY FLOOR(TS() / 1000)");
+  register_view("vibration_bin", r_vib_bin);
+
+  auto r_temp_bin = compile(
+      "SELECT AVG(value) AS bearing_temp "
+      "FROM temperature GROUP BY FLOOR(TS() / 1000)");
+  register_view("temperature_bin", r_temp_bin);
+
+  // Compile resampler views WITH TIMESHIFT correction
+  auto r_vib_rs = compile(
+      "CREATE MATERIALIZED VIEW vibration_rs AS "
+      "SELECT TIMESHIFT(RESAMPLE_CONSTANT(vibration, 1000), -1000) AS vibration "
+      "FROM vibration_bin");
+  register_view("vibration_rs", r_vib_rs);
+
+  auto r_temp_rs = compile(
+      "CREATE MATERIALIZED VIEW temperature_rs AS "
+      "SELECT TIMESHIFT(RESAMPLE_CONSTANT(bearing_temp, 1000), -1000) AS bearing_temp "
+      "FROM temperature_bin");
+  register_view("temperature_rs", r_temp_rs);
+
+  // Compile combining view (cross-join)
+  auto r_combined = compile(
+      "CREATE MATERIALIZED VIEW input AS "
+      "SELECT vibration, bearing_temp "
+      "FROM vibration_rs v, temperature_rs t");
+
+  ASSERT_FALSE(r_combined.has_errors());
+
+  int vib_idx = r_combined.field_map.at("vibration");
+  int temp_idx = r_combined.field_map.at("bearing_temp");
+
+  // Create all programs
+  rtbot::Program prog_vib_bin(r_vib_bin.program_json);
+  rtbot::Program prog_temp_bin(r_temp_bin.program_json);
+  rtbot::Program prog_vib_rs(r_vib_rs.program_json);
+  rtbot::Program prog_temp_rs(r_temp_rs.program_json);
+  rtbot::Program prog_combined(r_combined.program_json);
+
+  // Collect combined outputs
+  struct OutputRow {
+    rtbot::timestamp_t time;
+    std::vector<double> values;
+  };
+  std::vector<OutputRow> combined_outputs;
+
+  auto collect_combined = [&](const rtbot::ProgramMsgBatch& batch) {
+    for (const auto& [op_id, op_batch] : batch) {
+      for (const auto& [port, msgs] : op_batch) {
+        for (const auto& msg : msgs) {
+          auto* vec_msg =
+              dynamic_cast<rtbot::Message<rtbot::VectorNumberData>*>(msg.get());
+          if (vec_msg) {
+            combined_outputs.push_back({vec_msg->time, vec_msg->data.values});
+          }
+        }
+      }
+    }
+  };
+
+  // Helper: pipe through chain for each stream (bin → rs with TIMESHIFT)
+  auto pipe_vib = [&](rtbot::timestamp_t t, double value) {
+    std::vector<std::pair<rtbot::timestamp_t, std::vector<double>>> rs_msgs;
+    auto batch_bin = prog_vib_bin.receive(make_msg(t, {value}));
+    for (const auto& [op_id, op_batch] : batch_bin) {
+      for (const auto& [port, msgs] : op_batch) {
+        for (const auto& msg : msgs) {
+          auto* vm = dynamic_cast<rtbot::Message<rtbot::VectorNumberData>*>(msg.get());
+          if (vm) {
+            auto batch_rs = prog_vib_rs.receive(make_msg(vm->time, vm->data.values));
+            for (const auto& [op2, ob2] : batch_rs) {
+              for (const auto& [p2, ms2] : ob2) {
+                for (const auto& m2 : ms2) {
+                  auto* vm2 = dynamic_cast<rtbot::Message<rtbot::VectorNumberData>*>(m2.get());
+                  if (vm2) {
+                    rs_msgs.push_back({vm2->time, vm2->data.values});
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    return rs_msgs;
+  };
+
+  auto pipe_temp = [&](rtbot::timestamp_t t, double value) {
+    std::vector<std::pair<rtbot::timestamp_t, std::vector<double>>> rs_msgs;
+    auto batch_bin = prog_temp_bin.receive(make_msg(t, {value}));
+    for (const auto& [op_id, op_batch] : batch_bin) {
+      for (const auto& [port, msgs] : op_batch) {
+        for (const auto& msg : msgs) {
+          auto* vm = dynamic_cast<rtbot::Message<rtbot::VectorNumberData>*>(msg.get());
+          if (vm) {
+            auto batch_rs = prog_temp_rs.receive(make_msg(vm->time, vm->data.values));
+            for (const auto& [op2, ob2] : batch_rs) {
+              for (const auto& [p2, ms2] : ob2) {
+                for (const auto& m2 : ms2) {
+                  auto* vm2 = dynamic_cast<rtbot::Message<rtbot::VectorNumberData>*>(m2.get());
+                  if (vm2) {
+                    rs_msgs.push_back({vm2->time, vm2->data.values});
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    return rs_msgs;
+  };
+
+  // Same data as T_rs_3:
+  //
+  // Vibration bins:
+  //   bin 0 (t<1000): t=100 val=5, t=500 val=15 → avg=10
+  //   bin 1 (1000≤t<2000): t=1200 val=25 → avg=25
+  //   bin 2 (2000≤t<3000): t=2300 val=35 → avg=35
+  //   bin 3 trigger: t=3100
+  //
+  // Temperature bins:
+  //   bin 0 (t<1000): t=200 val=70, t=800 val=80 → avg=75
+  //   bin 1 (1000≤t<2000): t=1500 val=90 → avg=90
+  //   bin 2 (2000≤t<3000): t=2600 val=100 → avg=100
+  //   bin 3 trigger: t=3200
+
+  // Bin 0 data
+  pipe_vib(100, 5.0);
+  pipe_vib(500, 15.0);
+  pipe_temp(200, 70.0);
+  pipe_temp(800, 80.0);
+
+  // Trigger bin 0→1 (resampler init, no output)
+  auto vib_rs_1 = pipe_vib(1200, 25.0);
+  EXPECT_TRUE(vib_rs_1.empty()) << "Resampler init — no output on first msg";
+  for (const auto& [t, vals] : vib_rs_1) {
+    collect_combined(prog_combined.receive(make_msg(t, vals), "i1"));
+  }
+
+  auto temp_rs_1 = pipe_temp(1500, 90.0);
+  EXPECT_TRUE(temp_rs_1.empty()) << "Resampler init — no output on first msg";
+  for (const auto& [t, vals] : temp_rs_1) {
+    collect_combined(prog_combined.receive(make_msg(t, vals), "i2"));
+  }
+
+  EXPECT_EQ(combined_outputs.size(), 0u)
+      << "No combined output yet — both resamplers only initialized";
+
+  // Trigger bin 1→2 (resampler emits at grid 2000, TIMESHIFT shifts to 1000)
+  auto vib_rs_2 = pipe_vib(2300, 35.0);
+  ASSERT_EQ(vib_rs_2.size(), 1u) << "Should emit one message";
+  EXPECT_EQ(vib_rs_2[0].first, 1000u)
+      << "TIMESHIFT(-1000) corrects t=2000 → t=1000 (bin 0 avg)";
+  for (const auto& [t, vals] : vib_rs_2) {
+    collect_combined(prog_combined.receive(make_msg(t, vals), "i1"));
+  }
+
+  auto temp_rs_2 = pipe_temp(2600, 100.0);
+  ASSERT_EQ(temp_rs_2.size(), 1u) << "Should emit one message";
+  EXPECT_EQ(temp_rs_2[0].first, 1000u)
+      << "TIMESHIFT(-1000) corrects t=2000 → t=1000 (bin 0 avg)";
+  for (const auto& [t, vals] : temp_rs_2) {
+    collect_combined(prog_combined.receive(make_msg(t, vals), "i2"));
+  }
+
+  // Combined output should be at t=1000 (corrected), with bin 0 averages
+  ASSERT_GE(combined_outputs.size(), 1u)
+      << "Cross-join should produce output when both streams emit at t=1000";
+  EXPECT_EQ(combined_outputs[0].time, 1000u)
+      << "Combined output at CORRECTED timestamp (bin 0 avg at t=1000)";
+  EXPECT_DOUBLE_EQ(combined_outputs[0].values[vib_idx], 10.0);   // bin 0 vib avg
+  EXPECT_DOUBLE_EQ(combined_outputs[0].values[temp_idx], 75.0);  // bin 0 temp avg
+
+  // Trigger bin 2→3 (resampler emits at grid 3000, TIMESHIFT shifts to 2000)
+  auto vib_rs_3 = pipe_vib(3100, 999.0);
+  ASSERT_EQ(vib_rs_3.size(), 1u);
+  EXPECT_EQ(vib_rs_3[0].first, 2000u)
+      << "TIMESHIFT(-1000) corrects t=3000 → t=2000 (bin 1 avg)";
+  for (const auto& [t, vals] : vib_rs_3) {
+    collect_combined(prog_combined.receive(make_msg(t, vals), "i1"));
+  }
+
+  auto temp_rs_3 = pipe_temp(3200, 999.0);
+  ASSERT_EQ(temp_rs_3.size(), 1u);
+  EXPECT_EQ(temp_rs_3[0].first, 2000u)
+      << "TIMESHIFT(-1000) corrects t=3000 → t=2000 (bin 1 avg)";
+  for (const auto& [t, vals] : temp_rs_3) {
+    collect_combined(prog_combined.receive(make_msg(t, vals), "i2"));
+  }
+
+  // Second combined output at t=2000 (corrected), with bin 1 averages
+  ASSERT_GE(combined_outputs.size(), 2u)
+      << "Cross-join should produce second output at t=2000";
+  EXPECT_EQ(combined_outputs[1].time, 2000u);
+  EXPECT_DOUBLE_EQ(combined_outputs[1].values[vib_idx], 25.0);   // bin 1 vib avg
+  EXPECT_DOUBLE_EQ(combined_outputs[1].values[temp_idx], 90.0);  // bin 1 temp avg
+}
+
+// ---------------------------------------------------------------------------
+// compile_sql_expanded tests
+// ---------------------------------------------------------------------------
+
+TEST_F(E2eRuntimeTest, ExpandedPassthroughSingleStatement) {
+  // Regular SQL should produce exactly one CompilationResult.
+  CatalogSnapshot empty_catalog;
+  auto expanded = compile_sql_expanded(
+      "CREATE STREAM sensor (value DOUBLE)", empty_catalog, 1000);
+
+  EXPECT_EQ(expanded.new_ts_units_per_second, -1);
+  ASSERT_EQ(expanded.results.size(), 1u);
+  EXPECT_FALSE(expanded.results[0].has_errors());
+  EXPECT_EQ(expanded.results[0].statement_type, StatementType::CREATE_STREAM);
+  EXPECT_EQ(expanded.results[0].entity_name, "sensor");
+}
+
+TEST_F(E2eRuntimeTest, ExpandedAlignedStreamProduces7Results) {
+  // CREATE ALIGNED STREAM with 2 columns + BIN(1s) should expand to 7 statements,
+  // each successfully compiled.
+  CatalogSnapshot empty_catalog;
+  auto expanded = compile_sql_expanded(
+      "CREATE ALIGNED STREAM input (vibration DOUBLE, bearing_temp DOUBLE) BIN(1s)",
+      empty_catalog, 1000);
+
+  EXPECT_EQ(expanded.new_ts_units_per_second, -1);
+  ASSERT_EQ(expanded.results.size(), 7u);
+
+  // All should compile without errors
+  for (size_t i = 0; i < expanded.results.size(); i++) {
+    EXPECT_FALSE(expanded.results[i].has_errors())
+        << "Statement " << i << " has errors: "
+        << (expanded.results[i].errors.empty()
+                ? ""
+                : expanded.results[i].errors[0].message);
+  }
+
+  // Statement 0: CREATE STREAM vibration (value DOUBLE)
+  EXPECT_EQ(expanded.results[0].statement_type, StatementType::CREATE_STREAM);
+  EXPECT_EQ(expanded.results[0].entity_name, "vibration");
+
+  // Statement 1: CREATE STREAM bearing_temp (value DOUBLE)
+  EXPECT_EQ(expanded.results[1].statement_type, StatementType::CREATE_STREAM);
+  EXPECT_EQ(expanded.results[1].entity_name, "bearing_temp");
+
+  // Statement 2: CREATE VIEW vibration_bin
+  EXPECT_EQ(expanded.results[2].statement_type, StatementType::CREATE_VIEW);
+  EXPECT_EQ(expanded.results[2].entity_name, "vibration_bin");
+  EXPECT_EQ(expanded.results[2].source_streams.size(), 1u);
+  EXPECT_EQ(expanded.results[2].source_streams[0], "vibration");
+
+  // Statement 3: CREATE VIEW bearing_temp_bin
+  EXPECT_EQ(expanded.results[3].statement_type, StatementType::CREATE_VIEW);
+  EXPECT_EQ(expanded.results[3].entity_name, "bearing_temp_bin");
+
+  // Statement 4: CREATE VIEW vibration_rs (resampler + timeshift)
+  EXPECT_EQ(expanded.results[4].statement_type, StatementType::CREATE_VIEW);
+  EXPECT_EQ(expanded.results[4].entity_name, "vibration_rs");
+  EXPECT_FALSE(expanded.results[4].program_json.empty());
+
+  // Statement 5: CREATE VIEW bearing_temp_rs
+  EXPECT_EQ(expanded.results[5].statement_type, StatementType::CREATE_VIEW);
+  EXPECT_EQ(expanded.results[5].entity_name, "bearing_temp_rs");
+
+  // Statement 6: CREATE VIEW input (combining view)
+  EXPECT_EQ(expanded.results[6].statement_type, StatementType::CREATE_VIEW);
+  EXPECT_EQ(expanded.results[6].entity_name, "input");
+  EXPECT_EQ(expanded.results[6].source_streams.size(), 2u);
+}
+
+TEST_F(E2eRuntimeTest, ExpandedSetTimescaleReturnsNewValue) {
+  CatalogSnapshot empty_catalog;
+  auto expanded = compile_sql_expanded(
+      "SET TIMESCALE us", empty_catalog, 1000);
+
+  EXPECT_EQ(expanded.new_ts_units_per_second, 1000000);
+  EXPECT_TRUE(expanded.results.empty());
+}
+
+TEST_F(E2eRuntimeTest, ExpandedAlignedStreamRuntime) {
+  // Full runtime test: compile_sql_expanded, deploy each pipeline, feed data,
+  // verify output matches expected aligned stream behavior with TIMESHIFT.
+  CatalogSnapshot empty_catalog;
+  auto expanded = compile_sql_expanded(
+      "CREATE ALIGNED STREAM input (vibration DOUBLE, bearing_temp DOUBLE) BIN(1s)",
+      empty_catalog, 1000);
+
+  ASSERT_EQ(expanded.results.size(), 7u);
+  for (const auto& r : expanded.results) {
+    ASSERT_FALSE(r.has_errors());
+  }
+
+  // Deploy pipelines for views that have program_json (statements 2-6)
+  struct PipelineInfo {
+    std::unique_ptr<rtbot::Program> program;
+    std::string name;
+    std::vector<std::string> sources;
+  };
+  std::vector<PipelineInfo> pipelines;
+
+  for (size_t i = 2; i < expanded.results.size(); i++) {
+    const auto& r = expanded.results[i];
+    if (!r.program_json.empty()) {
+      PipelineInfo pi;
+      pi.program = std::make_unique<rtbot::Program>(r.program_json);
+      pi.name = r.entity_name;
+      pi.sources = r.source_streams;
+      pipelines.push_back(std::move(pi));
+    }
+  }
+
+  // Helper: find pipeline by name
+  auto find_pipeline = [&](const std::string& name) -> rtbot::Program* {
+    for (auto& pi : pipelines) {
+      if (pi.name == name) return pi.program.get();
+    }
+    return nullptr;
+  };
+
+  // Feed vibration stream through bin → rs pipeline
+  auto* vib_bin = find_pipeline("vibration_bin");
+  auto* vib_rs = find_pipeline("vibration_rs");
+  auto* temp_bin = find_pipeline("bearing_temp_bin");
+  auto* temp_rs = find_pipeline("bearing_temp_rs");
+  auto* input_view = find_pipeline("input");
+  ASSERT_NE(vib_bin, nullptr);
+  ASSERT_NE(vib_rs, nullptr);
+  ASSERT_NE(temp_bin, nullptr);
+  ASSERT_NE(temp_rs, nullptr);
+  ASSERT_NE(input_view, nullptr);
+
+  // Helper to feed a message and collect outputs through a pipeline chain
+  using Msg = rtbot::Message<rtbot::NumberData>;
+  using VecMsg = rtbot::Message<rtbot::VectorNumberData>;
+
+  auto feed_single = [](rtbot::Program* p, uint64_t ts,
+                        const std::vector<double>& vals,
+                        const std::string& port) {
+    auto msg = rtbot::create_message<rtbot::VectorNumberData>(
+        ts, rtbot::VectorNumberData{vals});
+    return p->receive(std::move(msg), port);
+  };
+
+  auto collect_outputs = [](const rtbot::ProgramMsgBatch& batch) {
+    std::vector<std::pair<uint64_t, std::vector<double>>> out;
+    for (const auto& [op_id, op_batch] : batch) {
+      for (const auto& [port, msgs] : op_batch) {
+        for (const auto& m : msgs) {
+          if (auto* vec = dynamic_cast<rtbot::Message<rtbot::VectorNumberData>*>(m.get())) {
+            out.push_back({vec->time, vec->data.values});
+          } else if (auto* num = dynamic_cast<rtbot::Message<rtbot::NumberData>*>(m.get())) {
+            out.push_back({num->time, {num->data.value}});
+          }
+        }
+      }
+    }
+    return out;
+  };
+
+  // Helper to cascade: feed msg to bin, forward outputs to rs
+  auto cascade_bin_rs = [&](rtbot::Program* bin, rtbot::Program* rs,
+                            uint64_t ts, double value) {
+    auto bin_out = feed_single(bin, ts, {value}, "i1");
+    std::vector<std::pair<uint64_t, std::vector<double>>> rs_outputs;
+    for (auto& [op_id, op_batch] : bin_out) {
+      for (auto& [port, msgs] : op_batch) {
+        for (auto& m : msgs) {
+          if (auto* vec = dynamic_cast<rtbot::Message<rtbot::VectorNumberData>*>(m.get())) {
+            auto rs_batch = feed_single(rs, vec->time, vec->data.values, "i1");
+            auto outs = collect_outputs(rs_batch);
+            rs_outputs.insert(rs_outputs.end(), outs.begin(), outs.end());
+          } else if (auto* num = dynamic_cast<rtbot::Message<rtbot::NumberData>*>(m.get())) {
+            auto rs_batch = feed_single(rs, num->time, {num->data.value}, "i1");
+            auto outs = collect_outputs(rs_batch);
+            rs_outputs.insert(rs_outputs.end(), outs.begin(), outs.end());
+          }
+        }
+      }
+    }
+    return rs_outputs;
+  };
+
+  // Track rs outputs to feed into combining view
+  std::vector<std::pair<uint64_t, std::vector<double>>> vib_rs_outputs;
+  std::vector<std::pair<uint64_t, std::vector<double>>> temp_rs_outputs;
+  std::vector<std::pair<uint64_t, std::vector<double>>> combined_outputs;
+
+  auto feed_to_combiner = [&]() {
+    // Feed all new vib_rs outputs to input on port i1
+    for (auto& [ts, vals] : vib_rs_outputs) {
+      auto batch = feed_single(input_view, ts, vals, "i1");
+      auto outs = collect_outputs(batch);
+      combined_outputs.insert(combined_outputs.end(), outs.begin(), outs.end());
+    }
+    vib_rs_outputs.clear();
+    // Feed all new temp_rs outputs to input on port i2
+    for (auto& [ts, vals] : temp_rs_outputs) {
+      auto batch = feed_single(input_view, ts, vals, "i2");
+      auto outs = collect_outputs(batch);
+      combined_outputs.insert(combined_outputs.end(), outs.begin(), outs.end());
+    }
+    temp_rs_outputs.clear();
+  };
+
+  // Bin 0: vibration samples (avg = 10.0)
+  for (auto [ts, v] : std::vector<std::pair<uint64_t, double>>{
+           {50, 8}, {200, 12}, {400, 10}, {600, 14}, {900, 6}}) {
+    auto outs = cascade_bin_rs(vib_bin, vib_rs, ts, v);
+    vib_rs_outputs.insert(vib_rs_outputs.end(), outs.begin(), outs.end());
+  }
+  // Bin 0: bearing_temp samples (avg = 75.0)
+  for (auto [ts, v] : std::vector<std::pair<uint64_t, double>>{
+           {100, 68}, {300, 72}, {500, 74}, {700, 78}, {850, 76}, {950, 82}}) {
+    auto outs = cascade_bin_rs(temp_bin, temp_rs, ts, v);
+    temp_rs_outputs.insert(temp_rs_outputs.end(), outs.begin(), outs.end());
+  }
+  EXPECT_TRUE(vib_rs_outputs.empty()) << "No rs output yet (bin 0)";
+  EXPECT_TRUE(temp_rs_outputs.empty()) << "No rs output yet (bin 0)";
+
+  // Bin 1: first message triggers bin 0 flush
+  // vibration
+  for (auto [ts, v] : std::vector<std::pair<uint64_t, double>>{
+           {1050, 20}, {1300, 22}, {1500, 28}, {1800, 30}}) {
+    auto outs = cascade_bin_rs(vib_bin, vib_rs, ts, v);
+    vib_rs_outputs.insert(vib_rs_outputs.end(), outs.begin(), outs.end());
+  }
+  // Resampler init: no output from first bin flush
+  EXPECT_TRUE(vib_rs_outputs.empty()) << "Resampler init — no output";
+
+  // bearing_temp
+  for (auto [ts, v] : std::vector<std::pair<uint64_t, double>>{
+           {1100, 85}, {1400, 90}, {1700, 95}}) {
+    auto outs = cascade_bin_rs(temp_bin, temp_rs, ts, v);
+    temp_rs_outputs.insert(temp_rs_outputs.end(), outs.begin(), outs.end());
+  }
+  EXPECT_TRUE(temp_rs_outputs.empty()) << "Resampler init — no output";
+
+  // Bin 2: triggers bin 1 flush → resampler produces output
+  {
+    auto outs = cascade_bin_rs(vib_bin, vib_rs, 2100, 30);
+    vib_rs_outputs.insert(vib_rs_outputs.end(), outs.begin(), outs.end());
+  }
+  ASSERT_EQ(vib_rs_outputs.size(), 1u);
+  EXPECT_EQ(vib_rs_outputs[0].first, 1000u)  // TIMESHIFT corrected
+      << "vibration_rs should emit bin 0 avg at t=1000";
+  EXPECT_DOUBLE_EQ(vib_rs_outputs[0].second[0], 10.0);
+
+  {
+    auto outs = cascade_bin_rs(temp_bin, temp_rs, 2200, 96);
+    temp_rs_outputs.insert(temp_rs_outputs.end(), outs.begin(), outs.end());
+  }
+  ASSERT_EQ(temp_rs_outputs.size(), 1u);
+  EXPECT_EQ(temp_rs_outputs[0].first, 1000u);
+  EXPECT_DOUBLE_EQ(temp_rs_outputs[0].second[0], 75.0);
+
+  // Feed to combiner
+  feed_to_combiner();
+  ASSERT_EQ(combined_outputs.size(), 1u)
+      << "First combined output after both rs emit at t=1000";
+  EXPECT_EQ(combined_outputs[0].first, 1000u);
+  EXPECT_DOUBLE_EQ(combined_outputs[0].second[0], 10.0);   // vibration
+  EXPECT_DOUBLE_EQ(combined_outputs[0].second[1], 75.0);   // bearing_temp
+}
+
 }  // namespace
 }  // namespace rtbot_sql::api
