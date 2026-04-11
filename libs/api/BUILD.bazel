@@ -13,12 +13,21 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":api",
+        ":api_preprocessor",
         "//libs/analyzer",
         "//libs/catalog",
         "//libs/compiler",
         "//libs/parser",
         "//libs/planner",
     ],
+)
+
+cc_library(
+    name = "api_preprocessor",
+    hdrs = ["include/rtbot_sql/api/preprocessor.h"],
+    srcs = ["src/preprocessor.cpp"],
+    strip_include_prefix = "include",
+    visibility = ["//visibility:public"],
 )
 
 cc_test(

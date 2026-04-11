@@ -87,12 +87,16 @@ Expr deep_clone(const Expr& expr) {
 
 // ─── expand_aliases ──────────────────────────────────────────────────────────
 
-Expr expand_aliases(const Expr& expr, const AliasMap& alias_map) {
+Expr expand_aliases(const Expr& expr, const AliasMap& alias_map,
+                    const std::string& exclude_key) {
   return std::visit(
       [&](const auto& v) -> Expr {
         using T = std::decay_t<decltype(v)>;
 
         if constexpr (std::is_same_v<T, ColumnRef>) {
+          if (!exclude_key.empty() && v.column_name == exclude_key) {
+            return v;  // skip self-referencing alias
+          }
           auto it = alias_map.find(v.column_name);
           if (it != alias_map.end()) {
             return deep_clone(it->second);
@@ -107,23 +111,23 @@ Expr expand_aliases(const Expr& expr, const AliasMap& alias_map) {
                                              std::unique_ptr<BinaryExpr>>) {
           auto p = std::make_unique<BinaryExpr>();
           p->op = v->op;
-          p->left = expand_aliases(v->left, alias_map);
-          p->right = expand_aliases(v->right, alias_map);
+          p->left = expand_aliases(v->left, alias_map, exclude_key);
+          p->right = expand_aliases(v->right, alias_map, exclude_key);
           return p;
 
         } else if constexpr (std::is_same_v<T,
                                              std::unique_ptr<ComparisonExpr>>) {
           auto p = std::make_unique<ComparisonExpr>();
           p->op = v->op;
-          p->left = expand_aliases(v->left, alias_map);
-          p->right = expand_aliases(v->right, alias_map);
+          p->left = expand_aliases(v->left, alias_map, exclude_key);
+          p->right = expand_aliases(v->right, alias_map, exclude_key);
           return p;
 
         } else if constexpr (std::is_same_v<T, std::unique_ptr<FuncCall>>) {
           auto p = std::make_unique<FuncCall>();
           p->name = v->name;
           for (const auto& arg : v->args) {
-            p->args.push_back(expand_aliases(arg, alias_map));
+            p->args.push_back(expand_aliases(arg, alias_map, exclude_key));
           }
           return p;
 
@@ -131,31 +135,33 @@ Expr expand_aliases(const Expr& expr, const AliasMap& alias_map) {
                                              std::unique_ptr<LogicalExpr>>) {
           auto p = std::make_unique<LogicalExpr>();
           p->op = v->op;
-          p->left = expand_aliases(v->left, alias_map);
-          p->right = expand_aliases(v->right, alias_map);
+          p->left = expand_aliases(v->left, alias_map, exclude_key);
+          p->right = expand_aliases(v->right, alias_map, exclude_key);
           return p;
 
         } else if constexpr (std::is_same_v<T, std::unique_ptr<NotExpr>>) {
           auto p = std::make_unique<NotExpr>();
-          p->operand = expand_aliases(v->operand, alias_map);
+          p->operand = expand_aliases(v->operand, alias_map, exclude_key);
           return p;
 
         } else if constexpr (std::is_same_v<T,
                                              std::unique_ptr<BetweenExpr>>) {
           auto p = std::make_unique<BetweenExpr>();
-          p->expr = expand_aliases(v->expr, alias_map);
-          p->low = expand_aliases(v->low, alias_map);
-          p->high = expand_aliases(v->high, alias_map);
+          p->expr = expand_aliases(v->expr, alias_map, exclude_key);
+          p->low = expand_aliases(v->low, alias_map, exclude_key);
+          p->high = expand_aliases(v->high, alias_map, exclude_key);
           return p;
 
         } else if constexpr (std::is_same_v<T, std::unique_ptr<CaseExpr>>) {
           auto p = std::make_unique<CaseExpr>();
           for (const auto& wc : v->when_clauses) {
-            p->when_clauses.push_back({expand_aliases(wc.condition, alias_map),
-                                       expand_aliases(wc.result, alias_map)});
+            p->when_clauses.push_back(
+                {expand_aliases(wc.condition, alias_map, exclude_key),
+                 expand_aliases(wc.result, alias_map, exclude_key)});
           }
           if (v->else_result.has_value()) {
-            p->else_result = expand_aliases(*v->else_result, alias_map);
+            p->else_result =
+                expand_aliases(*v->else_result, alias_map, exclude_key);
           }
           return p;
 

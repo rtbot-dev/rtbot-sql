@@ -10,6 +10,7 @@
 #include <variant>
 
 #include "rtbot_sql/analyzer/scope.h"
+#include "rtbot_sql/api/preprocessor.h"
 #include "rtbot_sql/catalog/catalog.h"
 #include "rtbot_sql/catalog/string_dictionary.h"
 #include "rtbot_sql/compiler/alias_expander.h"
@@ -152,8 +153,9 @@ CompilationResult compile_stream_cross_select(
   std::vector<parser::ast::SelectItem> expanded_select;
   expanded_select.reserve(stmt.select_list.size());
   for (const auto& item : stmt.select_list) {
+    std::string excl = item.alias.has_value() ? *item.alias : "";
     expanded_select.push_back(
-        {compiler::expand_aliases(item.expr, alias_map), item.alias});
+        {compiler::expand_aliases(item.expr, alias_map, excl), item.alias});
   }
 
   std::optional<parser::ast::Expr> expanded_where;
@@ -249,8 +251,13 @@ CompilationResult compile_select_to_program(
   std::vector<parser::ast::SelectItem> expanded_select;
   expanded_select.reserve(stmt.select_list.size());
   for (const auto& item : stmt.select_list) {
+    // Exclude the item's own alias to prevent self-referencing expansion
+    // (e.g., RESAMPLE_CONSTANT(value, 1000) AS value would otherwise replace
+    // the inner ColumnRef "value" with the alias definition, creating a nested
+    // duplicate).
+    std::string excl = item.alias.has_value() ? *item.alias : "";
     expanded_select.push_back(
-        {compiler::expand_aliases(item.expr, alias_map), item.alias});
+        {compiler::expand_aliases(item.expr, alias_map, excl), item.alias});
   }
 
   // Expand WHERE; reject aggregate aliases (those belong in HAVING)
@@ -617,8 +624,10 @@ CompilationResult handle_select(const parser::ast::SelectStmt& stmt,
       expanded_stmt_t12.from_tables = stmt.from_tables;
       expanded_stmt_t12.limit = stmt.limit;
       for (const auto& item : stmt.select_list) {
+        std::string excl = item.alias.has_value() ? *item.alias : "";
         expanded_stmt_t12.select_list.push_back(
-            {compiler::expand_aliases(item.expr, alias_map_t12), item.alias});
+            {compiler::expand_aliases(item.expr, alias_map_t12, excl),
+             item.alias});
       }
       if (stmt.where_clause.has_value()) {
         expanded_stmt_t12.where_clause =
@@ -993,6 +1002,83 @@ CompilationResult compile_sql(const std::string& sql,
   } catch (const std::exception& e) {
     return make_error(e.what());
   }
+}
+
+// ---------------------------------------------------------------------------
+// compile_sql_expanded: preprocess + compile loop with catalog updates
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Update catalog snapshot from a successful CompilationResult so that
+// subsequent statements in the same expansion can resolve names.
+void apply_result_to_catalog(CatalogSnapshot& catalog,
+                             const CompilationResult& r) {
+  switch (r.statement_type) {
+    case StatementType::CREATE_STREAM: {
+      catalog.streams[r.entity_name] = r.stream_schema;
+      break;
+    }
+    case StatementType::CREATE_VIEW:
+    case StatementType::CREATE_MATERIALIZED_VIEW: {
+      ViewMeta vm;
+      vm.name = r.entity_name;
+      vm.entity_type = (r.statement_type == StatementType::CREATE_VIEW)
+                            ? EntityType::VIEW
+                            : EntityType::MATERIALIZED_VIEW;
+      vm.view_type = r.view_type;
+      vm.field_map = r.field_map;
+      vm.source_streams = r.source_streams;
+      vm.program_json = r.program_json;
+      vm.key_index = r.key_index;
+      catalog.views[r.entity_name] = vm;
+      break;
+    }
+    case StatementType::CREATE_TABLE: {
+      catalog.tables[r.entity_name] = r.table_schema;
+      break;
+    }
+    case StatementType::DROP: {
+      catalog.streams.erase(r.drop_entity_name);
+      catalog.views.erase(r.drop_entity_name);
+      catalog.tables.erase(r.drop_entity_name);
+      break;
+    }
+    default:
+      break;
+  }
+}
+
+}  // namespace
+
+ExpandedCompilationResult compile_sql_expanded(
+    const std::string& sql, const CatalogSnapshot& catalog,
+    int64_t ts_units_per_second) {
+  ExpandedCompilationResult out;
+
+  // Step 1: Preprocess (expand sugar, handle SET TIMESCALE)
+  auto pp = preprocess_sql(sql, ts_units_per_second);
+
+  if (pp.new_ts_units_per_second > 0) {
+    out.new_ts_units_per_second = pp.new_ts_units_per_second;
+    return out;  // SET TIMESCALE — no statements to compile
+  }
+
+  // Step 2: Compile each expanded statement, updating catalog between steps
+  CatalogSnapshot evolving_catalog = catalog;
+
+  for (const auto& stmt : pp.statements) {
+    auto result = compile_sql(stmt, evolving_catalog);
+    if (result.has_errors()) {
+      // Stop on first error — return just this error result
+      out.results.push_back(std::move(result));
+      return out;
+    }
+    apply_result_to_catalog(evolving_catalog, result);
+    out.results.push_back(std::move(result));
+  }
+
+  return out;
 }
 
 Tier2FilterResult apply_tier2_filter(

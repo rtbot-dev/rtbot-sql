@@ -19,9 +19,12 @@ AliasMap build_alias_map(
 
 // Return a new Expr with every ColumnRef whose name is an alias key substituted
 // by a deep clone of the mapped defining expression. Non-alias refs are cloned
-// as-is.
-parser::ast::Expr expand_aliases(const parser::ast::Expr& expr,
-                                 const AliasMap& alias_map);
+// as-is.  When exclude_key is non-empty, that alias is skipped during expansion
+// (prevents self-referencing when an alias name matches a column in its own
+// defining expression, e.g. RESAMPLE_CONSTANT(value, 1000) AS value).
+parser::ast::Expr expand_aliases(
+    const parser::ast::Expr& expr, const AliasMap& alias_map,
+    const std::string& exclude_key = "");
 
 // True if expr (after expansion) contains a top-level or nested aggregate call
 // (SUM, COUNT, AVG, MIN, MAX). Used to reject aggregate aliases in WHERE.
