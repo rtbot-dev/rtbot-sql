@@ -732,7 +732,7 @@ describe("CREATE ALIGNED STREAM BIN() sugar syntax catalog", () => {
     };
   }
 
-  it("aligned stream sugar populates catalog with streams and views", () => {
+  it("aligned stream sugar populates catalog with streams and final materialized view", () => {
     const alignedSql = "CREATE ALIGNED STREAM input (vibration DOUBLE, bearing_temp DOUBLE) BIN(1s)";
 
     const mockWasm: RtBotSqlWasmModule = {
@@ -790,9 +790,9 @@ describe("CREATE ALIGNED STREAM BIN() sugar syntax catalog", () => {
                 field_map: { bearing_temp: 0 },
                 program_json: '{"operators":[{"type":"TIMESHIFT"}],"connections":[]}',
               }),
-              // Result 7: CREATE_VIEW for "input" (cross-join)
+              // Result 7: CREATE_MATERIALIZED_VIEW for "input" (cross-join)
               baseResult({
-                statement_type: "CREATE_VIEW",
+                statement_type: "CREATE_MATERIALIZED_VIEW",
                 entity_name: "input",
                 source_streams: ["vibration_rs", "bearing_temp_rs"],
                 field_map: { vibration: 0, bearing_temp: 1 },
@@ -845,6 +845,7 @@ describe("CREATE ALIGNED STREAM BIN() sugar syntax catalog", () => {
 
     const inputView = rtbotSql.getCatalog().lookupView("input");
     expect(inputView).toBeDefined();
+    expect(inputView!.entity_type).toBe("MATERIALIZED_VIEW");
     expect(inputView!.source_streams).toEqual(["vibration_rs", "bearing_temp_rs"]);
   });
 

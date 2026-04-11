@@ -143,7 +143,7 @@ PreprocessResult preprocess_sql(const std::string& sql,
         select_cols += columns[i].name;
         from_sources += columns[i].name + "_rs";
       }
-      stmts.push_back("CREATE VIEW " + stream_name + " AS SELECT " +
+      stmts.push_back("CREATE MATERIALIZED VIEW " + stream_name + " AS SELECT " +
                        select_cols + " FROM " + from_sources);
 
       return {stmts, -1};

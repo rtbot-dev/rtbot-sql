@@ -451,6 +451,9 @@ TEST_F(CompilerIntegrationTest, MultiFromCrossStreamSelect) {
   auto program = json::parse(r.program_json);
   bool has_two_port_input = false;
   bool has_subtraction = false;
+  bool has_join = false;
+  bool has_compose = false;
+  int addition_count = 0;
   for (const auto& op : program["operators"]) {
     if (op["type"] == "Input") {
       const auto& pt = op["portTypes"];
@@ -461,9 +464,24 @@ TEST_F(CompilerIntegrationTest, MultiFromCrossStreamSelect) {
     if (op["type"] == "Subtraction") {
       has_subtraction = true;
     }
+    if (op["type"] == "Join") {
+      has_join = true;
+    }
+    if (op["type"] == "VectorCompose") {
+      has_compose = true;
+    }
+    if (op["type"] == "Addition") {
+      addition_count++;
+    }
   }
   EXPECT_TRUE(has_two_port_input);
   EXPECT_TRUE(has_subtraction);
+  EXPECT_TRUE(has_compose)
+      << "Cross-stream projection must include VectorCompose";
+  EXPECT_FALSE(has_join)
+      << "No extra explicit Join operators should be synthesized";
+  EXPECT_EQ(addition_count, 0)
+      << "No arithmetic Addition operator should be synthesized for sync";
 }
 
 // --- Test 16: Tier 2 cross-key aggregation via apply_tier2_filter ---

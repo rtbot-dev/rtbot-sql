@@ -16,7 +16,7 @@ TEST_F(PreprocessorTest, AlignedStreamTwoColumns) {
   auto r = preprocess_sql(
       "CREATE ALIGNED STREAM input (vibration DOUBLE, bearing_temp DOUBLE) BIN(1s)",
       1000000);
-  // 2 streams + 2 _bin views + 2 _rs views + 1 combining view = 7
+  // 2 streams + 2 _bin views + 2 _rs views + 1 combining materialized view = 7
   ASSERT_EQ(r.statements.size(), 7);
   // Per-column streams
   EXPECT_EQ(r.statements[0], "CREATE STREAM vibration (value DOUBLE)");
@@ -35,9 +35,9 @@ TEST_F(PreprocessorTest, AlignedStreamTwoColumns) {
   EXPECT_EQ(r.statements[5],
       "CREATE VIEW bearing_temp_rs AS SELECT TIMESHIFT(RESAMPLE_CONSTANT(bearing_temp, 1000000), -1000000) "
       "AS bearing_temp FROM bearing_temp_bin");
-  // Combining view references _rs views
+  // Combining materialized view references _rs views
   EXPECT_EQ(r.statements[6],
-      "CREATE VIEW input AS SELECT vibration, bearing_temp "
+      "CREATE MATERIALIZED VIEW input AS SELECT vibration, bearing_temp "
       "FROM vibration_rs, bearing_temp_rs");
 }
 
@@ -54,7 +54,7 @@ TEST_F(PreprocessorTest, AlignedStreamSingleColumn) {
       "CREATE VIEW pressure_rs AS SELECT TIMESHIFT(RESAMPLE_CONSTANT(pressure, 500000), -500000) "
       "AS pressure FROM pressure_bin");
   EXPECT_EQ(r.statements[3],
-      "CREATE VIEW data AS SELECT pressure FROM pressure_rs");
+      "CREATE MATERIALIZED VIEW data AS SELECT pressure FROM pressure_rs");
 }
 
 TEST_F(PreprocessorTest, DurationSeconds) {
@@ -132,9 +132,9 @@ TEST_F(PreprocessorTest, ThreeColumns) {
   EXPECT_NE(r.statements[6].find("TIMESHIFT(RESAMPLE_CONSTANT"), std::string::npos);
   EXPECT_NE(r.statements[7].find("y_rs"), std::string::npos);
   EXPECT_NE(r.statements[8].find("z_rs"), std::string::npos);
-  // Combining view references _rs views
+  // Combining materialized view references _rs views
   EXPECT_EQ(r.statements[9],
-      "CREATE VIEW multi AS SELECT x, y, z FROM x_rs, y_rs, z_rs");
+      "CREATE MATERIALIZED VIEW multi AS SELECT x, y, z FROM x_rs, y_rs, z_rs");
 }
 
 TEST_F(PreprocessorTest, EmptyColumnsThrows) {

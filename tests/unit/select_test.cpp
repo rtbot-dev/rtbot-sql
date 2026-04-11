@@ -230,5 +230,51 @@ TEST_F(SelectTest, ComplexExpressionMixingFunctionsAndArithmetic) {
   EXPECT_EQ(field_map.at("upper_band"), 1);
 }
 
+// Multi-source projection should rely on VectorCompose synchronization
+// (VectorCompose is Join-based in RTBot), without extra explicit sync operators.
+//
+// Data flow intent (tuple notation):
+//   trades:o1      -> (t=1000, [price=10.0])
+//   eth:o2         -> (t=1000, [eth_price=11.0])
+//   SELECT output  -> (t=1000, [10.0, 11.0])
+// Synchronization must come from VectorCompose itself, not extra Join/Add ops.
+TEST_F(SelectTest, MultiSourceProjectionUsesOnlyVectorComposeForSync) {
+  StreamSchema eth_schema{"eth", {{"eth_price", 0}}};
+  scope.register_stream("eth", eth_schema);
+
+  std::vector<SelectItem> select_list;
+  select_list.push_back(item(col("price"), "trade_price"));
+  select_list.push_back(item(col("eth_price"), "eth_price"));
+
+  std::map<std::string, Endpoint> source_endpoints{
+      {"trades", {"input_0", "o1"}},
+      {"eth", {"input_0", "o2"}},
+  };
+
+  auto [ep, field_map, _seg] =
+      compile_select_projection(select_list, input, scope, builder,
+                                &source_endpoints);
+
+  int vector_compose_count = 0;
+  int join_count = 0;
+  int addition_count = 0;
+  for (const auto& op : builder.operators()) {
+    if (op.type == "VectorCompose") vector_compose_count++;
+    if (op.type == "Join") join_count++;
+    if (op.type == "Addition") addition_count++;
+  }
+
+  EXPECT_EQ(vector_compose_count, 1)
+      << "Expected a single VectorCompose to synchronize selected columns";
+  EXPECT_EQ(join_count, 0)
+      << "No extra explicit Join operators should be synthesized";
+  EXPECT_EQ(addition_count, 0)
+      << "No arithmetic Addition should be synthesized for synchronization";
+
+  EXPECT_EQ(field_map.at("trade_price"), 0);
+  EXPECT_EQ(field_map.at("eth_price"), 1);
+  EXPECT_FALSE(ep.operator_id.empty());
+}
+
 }  // namespace
 }  // namespace rtbot_sql::compiler

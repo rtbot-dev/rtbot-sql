@@ -2063,7 +2063,7 @@ public class RtBotSqlRuntimeTest {
         //        FROM vibration_bin
         //   6. CREATE VIEW bearing_temp_rs AS SELECT TIMESHIFT(RESAMPLE_CONSTANT(bearing_temp, 1000000), -1000000) AS bearing_temp
         //        FROM bearing_temp_bin
-        //   7. CREATE VIEW input AS SELECT vibration, bearing_temp
+        //   7. CREATE MATERIALIZED VIEW input AS SELECT vibration, bearing_temp
         //        FROM vibration_rs, bearing_temp_rs
 
         RtBotSqlRuntime rt = new RtBotSqlRuntime();
@@ -2088,7 +2088,7 @@ public class RtBotSqlRuntimeTest {
                           rt.getCatalog().lookupView("vibration_rs"));
             assertNotNull("bearing_temp_rs view should exist",
                           rt.getCatalog().lookupView("bearing_temp_rs"));
-            assertNotNull("input combining view should exist",
+            assertNotNull("input combining materialized view should exist",
                           rt.getCatalog().lookupView("input"));
 
             // -- Step 3: Subscribe to intermediate views and the combining view --

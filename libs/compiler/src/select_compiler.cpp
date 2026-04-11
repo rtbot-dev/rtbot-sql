@@ -132,46 +132,12 @@ SelectResult compile_select_projection(
   std::vector<Endpoint> endpoints;
   FieldMap field_map;
 
-  std::optional<Endpoint> sync_zero_ep;
-  if (source_endpoints && source_endpoints->size() > 1) {
-    std::vector<Endpoint> source_clocks;
-    source_clocks.reserve(source_endpoints->size());
-    for (const auto& [_, source_ep] : *source_endpoints) {
-      auto clock_id = builder.next_id("clock");
-      builder.add_operator(clock_id, "VectorExtract", {{"index", 0.0}});
-      builder.connect(source_ep, {clock_id, "i1"});
-      source_clocks.push_back({clock_id, "o1"});
-    }
-
-    Endpoint any_clock = source_clocks.front();
-    for (size_t i = 1; i < source_clocks.size(); ++i) {
-      auto add_id = builder.next_id("clock_sync");
-      builder.add_operator(add_id, "Addition", {{"numPorts", 2.0}});
-      builder.connect(any_clock, {add_id, "i1"});
-      builder.connect(source_clocks[i], {add_id, "i2"});
-      any_clock = {add_id, "o1"};
-    }
-
-    auto zero_id = builder.next_id("const");
-    builder.add_operator(zero_id, "ConstantNumber", {{"value", 0.0}});
-    builder.connect(any_clock, {zero_id, "i1"});
-    sync_zero_ep = Endpoint{zero_id, "o1"};
-  }
-
   for (size_t i = 0; i < select_list.size(); ++i) {
     const auto& item = select_list[i];
     auto result =
         compile_expression(item.expr, input_endpoint, scope, builder, nullptr,
                             source_endpoints);
     auto ep = ensure_endpoint(std::move(result), input_endpoint, builder);
-
-    if (sync_zero_ep.has_value()) {
-      auto sync_id = builder.next_id("col_sync");
-      builder.add_operator(sync_id, "Addition", {{"numPorts", 2.0}});
-      builder.connect(ep, {sync_id, "i1"});
-      builder.connect(*sync_zero_ep, {sync_id, "i2"});
-      ep = {sync_id, "o1"};
-    }
 
     endpoints.push_back(ep);
 

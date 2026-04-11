@@ -677,7 +677,7 @@ class AlignedStreamSugarTest(unittest.TestCase):
       CREATE VIEW bearing_temp_bin AS ... BIN_AVG(bearing_temp, 1s)
       CREATE VIEW vibration_rs AS ... RESAMPLE_CONSTANT + TIMESHIFT
       CREATE VIEW bearing_temp_rs AS ... RESAMPLE_CONSTANT + TIMESHIFT
-      CREATE VIEW input AS ... cross-join vibration_rs, bearing_temp_rs
+      CREATE MATERIALIZED VIEW input AS ... cross-join vibration_rs, bearing_temp_rs
     """
     rt = rtbot_sql.RtBotSql()
 
@@ -685,11 +685,6 @@ class AlignedStreamSugarTest(unittest.TestCase):
     rt.execute(
         "CREATE ALIGNED STREAM input (vibration DOUBLE, bearing_temp DOUBLE) BIN(1s)"
     )
-
-    # The sugar creates all views as plain VIEWs (not materialized).
-    # Promote the final combining view to MATERIALIZED_VIEW so its output
-    # is stored and we can assert via rt._store.read("input").
-    rt._catalog.lookup_view("input").entity_type = native.EntityType.MATERIALIZED_VIEW
 
     # -- Verify catalog state -------------------------------------------
     self.assertIsNotNone(rt._catalog.lookup_stream("vibration"))
@@ -824,10 +819,6 @@ class AlignedStreamSugarTest(unittest.TestCase):
     rt.execute(
         "CREATE ALIGNED STREAM sensor (temp DOUBLE) BIN(1s)"
     )
-
-    # Promote the final combining view to MATERIALIZED_VIEW so its output
-    # is persisted in the store for assertion.
-    rt._catalog.lookup_view("sensor").entity_type = native.EntityType.MATERIALIZED_VIEW
 
     # Verify catalog state
     self.assertIsNotNone(rt._catalog.lookup_stream("temp"))

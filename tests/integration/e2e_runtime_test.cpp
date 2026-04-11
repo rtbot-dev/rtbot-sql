@@ -1293,6 +1293,26 @@ TEST_F(E2eRuntimeTest, MultiStreamNonMatchingTimestampsProduceNoOutput) {
       "FROM stream_a a, stream_b b");
 
   ASSERT_EQ(r.source_streams.size(), 2u);
+
+  // Graph shape check (tuple intent):
+  //   stream_a: (t, [a]) + stream_b: (t, [b]) -> (t, [a, b, a+b])
+  // Time synchronization for projection comes from VectorCompose.
+  auto program_json = json::parse(r.program_json);
+  bool has_join = false;
+  bool has_compose = false;
+  int addition_count = 0;
+  for (const auto& op : program_json["operators"]) {
+    if (op["type"] == "Join") has_join = true;
+    if (op["type"] == "VectorCompose") has_compose = true;
+    if (op["type"] == "Addition") addition_count++;
+  }
+  EXPECT_TRUE(has_compose)
+      << "Cross-stream projection must compile to VectorCompose";
+  EXPECT_FALSE(has_join)
+      << "No extra explicit Join operators should be synthesized";
+  EXPECT_EQ(addition_count, 1)
+      << "Only the SQL expression a.value + b.value should compile to Addition";
+
   rtbot::Program program(r.program_json);
 
   size_t total_outputs = 0;
@@ -1308,7 +1328,7 @@ TEST_F(E2eRuntimeTest, MultiStreamNonMatchingTimestampsProduceNoOutput) {
   EXPECT_EQ(total_outputs, 0u)
       << "Non-matching timestamps must never produce output. "
          "The program synchronizes on timestamps — if stream A sends at t=300 "
-         "and stream B sends at t=400, the Addition operator waits for a "
+         "and stream B sends at t=400, the projection synchronization waits for a "
          "matching timestamp on the other port that never arrives.";
 }
 
@@ -2387,8 +2407,9 @@ TEST_F(E2eRuntimeTest, ExpandedAlignedStreamProduces7Results) {
   EXPECT_EQ(expanded.results[5].statement_type, StatementType::CREATE_VIEW);
   EXPECT_EQ(expanded.results[5].entity_name, "bearing_temp_rs");
 
-  // Statement 6: CREATE VIEW input (combining view)
-  EXPECT_EQ(expanded.results[6].statement_type, StatementType::CREATE_VIEW);
+  // Statement 6: CREATE MATERIALIZED VIEW input (combining view)
+  EXPECT_EQ(expanded.results[6].statement_type,
+            StatementType::CREATE_MATERIALIZED_VIEW);
   EXPECT_EQ(expanded.results[6].entity_name, "input");
   EXPECT_EQ(expanded.results[6].source_streams.size(), 2u);
 }
