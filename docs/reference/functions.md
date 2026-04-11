@@ -153,18 +153,45 @@ The filter starts with zero initial state for both feedforward and feedback hist
 
 Compiles to: `InfiniteImpulseResponse(ff_coefficients=[...], fb_coefficients=[...])` operator.
 
-### RESAMPLE(expr, interval)
+### RESAMPLE_CONSTANT(expr, interval)
 
-Resamples the signal to a constant rate. Outputs one value per `interval` time units using interpolation.
+Resamples an irregular signal onto a fixed interval grid using held-last-value behavior.
 
 ```sql
--- Resample to 1-second intervals (assuming millisecond timestamps)
-SELECT RESAMPLE(temperature, 1000) AS temp_1hz FROM sensors
+SELECT RESAMPLE_CONSTANT(temperature, 1000) AS temp_1hz FROM sensors
 ```
 
-Useful when input data arrives at irregular intervals and you need a uniform sampling rate for downstream computation.
+Useful when input data arrives irregularly and downstream operators require aligned timestamps.
 
-Compiles to: `ResamplerConstant(interval=N)` operator.
+Compiles to: `ResamplerConstant(interval=N, t0=0)` operator.
+
+### TIMESHIFT(expr, shift)
+
+Shifts output timestamps by a constant amount.
+
+```sql
+SELECT TIMESHIFT(temperature, -1000) AS temp_shifted FROM sensors
+```
+
+Commonly composed with `RESAMPLE_CONSTANT` in aligned-stream pipelines to compensate
+the one-bin latency introduced by resampler initialization.
+
+Compiles to: `TimeShift(shift=N)` operator.
+
+### TS()
+
+Returns the current message timestamp as a numeric value.
+
+```sql
+SELECT FLOOR(TS() / 1000) AS second_bucket, AVG(value)
+FROM sensors
+GROUP BY FLOOR(TS() / 1000)
+```
+
+This is used for explicit time-bucket segmentation and is the foundation of
+`CREATE ALIGNED STREAM ... BIN(...)` preprocessing.
+
+Compiles to: `TimestampExtract` operator.
 
 ### PEAK_DETECT(expr, N)
 

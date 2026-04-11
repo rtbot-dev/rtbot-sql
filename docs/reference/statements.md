@@ -5,7 +5,26 @@ sidebar_position: 2
 
 # Statements
 
-RtBot SQL supports eight statement types. Each compiles differently and produces a different effect on the catalog and runtime.
+RtBot SQL supports multiple statement types. Each compiles differently and produces a different effect on the catalog and runtime.
+
+## CREATE ALIGNED STREAM
+
+Declares a convenience "sugar" statement for aligned multi-sensor ingestion.
+
+```sql
+CREATE ALIGNED STREAM input (vibration DOUBLE, bearing_temp DOUBLE) BIN(1s)
+```
+
+This statement is preprocessed into standard SQL statements:
+
+1. One `CREATE STREAM <column> (value <type>)` per column
+2. One `<column>_bin` view with `AVG(value)` grouped by `FLOOR(TS()/bin)`
+3. One `<column>_rs` view with `TIMESHIFT(RESAMPLE_CONSTANT(...), -bin)`
+4. One final `CREATE MATERIALIZED VIEW <name> AS SELECT ... FROM <column>_rs...`
+
+For the 2-column example above, the expansion yields 7 statements.
+
+**Effect:** creates per-column input streams and a materialized aligned output view.
 
 ## CREATE STREAM
 
@@ -158,3 +177,23 @@ DELETE FROM thresholds WHERE instrument_id = 42
 ```
 
 **Effect:** Removes the row and emits a changelog event.
+
+## SET TIMESCALE
+
+Changes the timestamp unit used by SQL preprocessing/runtime command handling.
+
+```sql
+SET TIMESCALE ms
+```
+
+Supported units:
+
+- `ms` (milliseconds)
+- `us` (microseconds)
+- `s`  (seconds)
+
+This mainly affects duration-based sugar expansions such as `BIN(1s)` in
+`CREATE ALIGNED STREAM`, because interval constants are computed from the current
+timescale.
+
+**Effect:** updates runtime timescale state; no stream/view is created.
