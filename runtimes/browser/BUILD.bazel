@@ -24,6 +24,7 @@ cc_binary(
     tags = ["manual"],
     deps = [
         "//libs/api:api_compiler",
+        "//libs/api:api_preprocessor",
         "//libs/parser",
         "@json-cpp//:lib",
     ],
@@ -42,8 +43,9 @@ genrule(
     cmd = """
     cat > $@ <<'DECL'
 export interface RtBotSqlWasmModule {
-  compileSqlJson(sql: string, catalogJson: string): string;
+  compileSqlJson(sql: string, catalogJson: string, tsUnitsPerSecond: number): string;
   validateSql(sql: string): string;
+  preprocessSqlJson(sql: string, tsUnitsPerSecond: number): string;
 }
 declare function factory(): Promise<RtBotSqlWasmModule>;
 export default factory;

@@ -78,6 +78,7 @@ cc_binary(
     linkshared = 1,
     deps = [
         "//libs/api:api_compiler",
+        "//libs/api:api_preprocessor",
         "@rtbot//libs/api:rtbot-api",
         "@pybind11",
         "@python_3_11//:python_headers",
@@ -138,6 +139,7 @@ _WHEEL_MATRIX = [
     linkshared = 1,
     deps = [
         "//libs/api:api_compiler",
+        "//libs/api:api_preprocessor",
         "@rtbot//libs/api:rtbot-api",
         "@pybind11",
         "%s//:python_headers" % _entry["python_repo"],

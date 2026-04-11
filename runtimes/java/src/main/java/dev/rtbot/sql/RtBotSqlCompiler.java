@@ -28,17 +28,38 @@ public final class RtBotSqlCompiler {
     private RtBotSqlCompiler() {}
 
     // -----------------------------------------------------------------
+    // SQL preprocessing
+    // -----------------------------------------------------------------
+
+    /**
+     * Preprocess a SQL statement, expanding sugar syntax like
+     * {@code CREATE ALIGNED STREAM ... BIN()} and {@code SET TIMESCALE}.
+     *
+     * @param sql                the SQL statement to preprocess
+     * @param tsUnitsPerSecond   current timescale (e.g. 1000000 for microseconds)
+     * @return JSON string with {@code "statements"} array and
+     *         {@code "new_ts_units_per_second"} (-1 if unchanged)
+     */
+    public static native String preprocessSqlJson(String sql, long tsUnitsPerSecond);
+
+    // -----------------------------------------------------------------
     // SQL compilation
     // -----------------------------------------------------------------
 
     /**
-     * Compile a SQL statement against a catalog snapshot.
+     * Preprocess and compile a SQL statement against a catalog snapshot.
      *
-     * @param sql         the SQL statement to compile
-     * @param catalogJson JSON representation of the catalog snapshot
-     * @return JSON string of the {@link CompilationResult}
+     * <p>Sugar syntax (CREATE ALIGNED STREAM ... BIN()) is expanded and each
+     * resulting statement is compiled against an incrementally updated catalog.
+     * SET TIMESCALE returns empty results with the new timescale value.
+     *
+     * @param sql              the SQL statement to compile
+     * @param catalogJson      JSON representation of the catalog snapshot
+     * @param tsUnitsPerSecond current timescale (e.g. 1000000 for microseconds)
+     * @return JSON string with {@code "results"} array of compilation results
+     *         and {@code "new_ts_units_per_second"} (-1 if unchanged)
      */
-    public static native String compileSqlJson(String sql, String catalogJson);
+    public static native String compileSqlJson(String sql, String catalogJson, long tsUnitsPerSecond);
 
     /**
      * Validate a SQL statement (syntax check only, no catalog required).

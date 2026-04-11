@@ -5,6 +5,7 @@
 #include <string>
 
 #include "rtbot_sql/api/compiler.h"
+#include "rtbot_sql/api/preprocessor.h"
 #include "rtbot_sql/api/types.h"
 #include "rtbot_sql/parser/parser.h"
 
@@ -257,16 +258,28 @@ json result_to_json(const CompilationResult& r) {
 // --- Exported functions ---
 
 std::string compile_sql_json(const std::string& sql,
-                             const std::string& catalog_json) {
+                             const std::string& catalog_json,
+                             int ts_units_per_second) {
   try {
     auto catalog = catalog_from_json(catalog_json);
-    // compile_sql already calls normalize_sql internally, so pass sql directly.
-    auto result = api::compile_sql(sql, catalog);
-    return result_to_json(result).dump();
+    auto expanded = api::compile_sql_expanded(
+        sql, catalog, static_cast<int64_t>(ts_units_per_second));
+    json j;
+    json results_arr = json::array();
+    for (const auto& r : expanded.results) {
+      results_arr.push_back(result_to_json(r));
+    }
+    j["results"] = results_arr;
+    j["new_ts_units_per_second"] = expanded.new_ts_units_per_second;
+    return j.dump();
   } catch (const std::exception& e) {
-    json err;
-    err["errors"] = {{{"message", e.what()}, {"line", -1}, {"column", -1}}};
-    return err.dump();
+    json j;
+    json results_arr = json::array();
+    results_arr.push_back(
+        {{"errors", {{{"message", e.what()}, {"line", -1}, {"column", -1}}}}});
+    j["results"] = results_arr;
+    j["new_ts_units_per_second"] = -1;
+    return j.dump();
   }
 }
 
@@ -291,9 +304,30 @@ std::string validate_sql(const std::string& sql) {
   }
 }
 
+std::string preprocess_sql_json(const std::string& sql,
+                                int ts_units_per_second) {
+  try {
+    auto result = api::preprocess_sql(sql,
+                                      static_cast<int64_t>(ts_units_per_second));
+    json j;
+    json stmts = json::array();
+    for (const auto& s : result.statements) {
+      stmts.push_back(s);
+    }
+    j["statements"] = stmts;
+    j["new_ts_units_per_second"] = result.new_ts_units_per_second;
+    return j.dump();
+  } catch (const std::exception& e) {
+    json err;
+    err["error"] = e.what();
+    return err.dump();
+  }
+}
+
 }  // namespace
 
 EMSCRIPTEN_BINDINGS(RtBotSql) {
   emscripten::function("compileSqlJson", &compile_sql_json);
   emscripten::function("validateSql", &validate_sql);
+  emscripten::function("preprocessSqlJson", &preprocess_sql_json);
 }

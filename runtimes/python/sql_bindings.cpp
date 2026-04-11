@@ -10,6 +10,7 @@
 #include "rtbot/Message.h"
 #include "rtbot/Program.h"
 #include "rtbot_sql/api/compiler.h"
+#include "rtbot_sql/api/preprocessor.h"
 #include "rtbot_sql/api/types.h"
 #include "rtbot_sql/parser/parser.h"
 
@@ -275,9 +276,23 @@ PYBIND11_MODULE(_rtbot_sql_native, m) {
            py::arg("port") = "i1")
       .def("run", &NativePipeline::run, py::arg("inputs"));
 
-  m.def("compile_sql", &rtbot_sql::api::compile_sql,
-        "Compile SQL to a CompilationResult",
-        py::arg("sql"), py::arg("catalog"));
+  m.def(
+      "compile_sql",
+      [](const std::string& sql, const rtbot_sql::CatalogSnapshot& catalog,
+         int64_t ts_units_per_second) {
+        auto expanded = rtbot_sql::api::compile_sql_expanded(
+            sql, catalog, ts_units_per_second);
+        py::dict out;
+        py::list results;
+        for (const auto& r : expanded.results) {
+          results.append(r);
+        }
+        out["results"] = results;
+        out["new_ts_units_per_second"] = expanded.new_ts_units_per_second;
+        return out;
+      },
+      "Preprocess and compile SQL in one step",
+      py::arg("sql"), py::arg("catalog"), py::arg("ts_units_per_second"));
 
   m.def(
       "validate_sql",
@@ -301,4 +316,21 @@ PYBIND11_MODULE(_rtbot_sql_native, m) {
       },
       "Parse-level SQL validation",
       py::arg("sql"));
+
+  m.def(
+      "preprocess_sql",
+      [](const std::string& sql, int64_t ts_units_per_second) {
+        auto result =
+            rtbot_sql::api::preprocess_sql(sql, ts_units_per_second);
+        py::dict out;
+        py::list stmts;
+        for (const auto& s : result.statements) {
+          stmts.append(s);
+        }
+        out["statements"] = stmts;
+        out["new_ts_units_per_second"] = result.new_ts_units_per_second;
+        return out;
+      },
+      "Preprocess SQL — expand sugar syntax (ALIGNED STREAM, SET TIMESCALE)",
+      py::arg("sql"), py::arg("ts_units_per_second"));
 }

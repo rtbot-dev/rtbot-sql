@@ -78,6 +78,11 @@ export interface CompilationResult {
   dictionary_updates?: Record<string, Record<string, string>>;
 }
 
+export interface ExpandedCompilationResult {
+  results: CompilationResult[];
+  new_ts_units_per_second: number;
+}
+
 export interface ValidationResult {
   valid: boolean;
   errors: CompilationError[];

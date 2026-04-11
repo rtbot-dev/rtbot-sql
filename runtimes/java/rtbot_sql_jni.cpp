@@ -10,6 +10,7 @@
 #include "rtbot/Message.h"
 #include "rtbot/Program.h"
 #include "rtbot_sql/api/compiler.h"
+#include "rtbot_sql/api/preprocessor.h"
 #include "rtbot_sql/api/types.h"
 #include "rtbot_sql/parser/parser.h"
 
@@ -344,17 +345,53 @@ extern "C" {
 // ---- SQL compilation ----
 
 JNIEXPORT jstring JNICALL
-Java_dev_rtbot_sql_RtBotSqlCompiler_compileSqlJson(JNIEnv* env, jclass,
-                                                    jstring sql,
-                                                    jstring catalogJson) {
+Java_dev_rtbot_sql_RtBotSqlCompiler_preprocessSqlJson(JNIEnv* env, jclass,
+                                                       jstring sql,
+                                                       jlong tsUnitsPerSecond) {
   try {
-    auto catalog = catalog_from_json(jstring_to_std(env, catalogJson));
-    auto result = api::compile_sql(jstring_to_std(env, sql), catalog);
-    return std_to_jstring(env, result_to_json(result).dump());
+    auto result = api::preprocess_sql(jstring_to_std(env, sql),
+                                      static_cast<int64_t>(tsUnitsPerSecond));
+    json j;
+    json stmts = json::array();
+    for (const auto& s : result.statements) {
+      stmts.push_back(s);
+    }
+    j["statements"] = stmts;
+    j["new_ts_units_per_second"] = result.new_ts_units_per_second;
+    return std_to_jstring(env, j.dump());
   } catch (const std::exception& e) {
     json err;
-    err["errors"] = {{{"message", e.what()}, {"line", -1}, {"column", -1}}};
+    err["error"] = e.what();
     return std_to_jstring(env, err.dump());
+  }
+}
+
+JNIEXPORT jstring JNICALL
+Java_dev_rtbot_sql_RtBotSqlCompiler_compileSqlJson(JNIEnv* env, jclass,
+                                                     jstring sql,
+                                                     jstring catalogJson,
+                                                     jlong tsUnitsPerSecond) {
+  try {
+    auto catalog = catalog_from_json(jstring_to_std(env, catalogJson));
+    auto expanded = api::compile_sql_expanded(
+        jstring_to_std(env, sql), catalog,
+        static_cast<int64_t>(tsUnitsPerSecond));
+    json j;
+    json results_arr = json::array();
+    for (const auto& r : expanded.results) {
+      results_arr.push_back(result_to_json(r));
+    }
+    j["results"] = results_arr;
+    j["new_ts_units_per_second"] = expanded.new_ts_units_per_second;
+    return std_to_jstring(env, j.dump());
+  } catch (const std::exception& e) {
+    json j;
+    json results_arr = json::array();
+    results_arr.push_back(
+        {{"errors", {{{"message", e.what()}, {"line", -1}, {"column", -1}}}}});
+    j["results"] = results_arr;
+    j["new_ts_units_per_second"] = -1;
+    return std_to_jstring(env, j.dump());
   }
 }
 
