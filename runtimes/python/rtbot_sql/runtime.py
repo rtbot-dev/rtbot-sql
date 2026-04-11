@@ -70,6 +70,7 @@ class RtBotSql:
     self._time_column_name = "time"
     self._time_unit_override: Optional[str] = None
     self._time_formatter: Optional[Callable[[List[int]], List[Any]]] = None
+    self._ts_units_per_second: int = 1_000_000
 
   def _next_timestamp(self) -> int:
     now = int(time.time() * 1000)
@@ -87,36 +88,41 @@ class RtBotSql:
     return out
 
   def execute(self, sql: str):
-    normalized = self._normalize_sql(sql)
+    compilation = compile_sql(sql, self._catalog.snapshot(), self._ts_units_per_second)
 
-    result = compile_sql(normalized, self._catalog.snapshot())
-    if result.has_errors():
-      raise SqlError(result.errors)
-
-    statement = result.statement_type
-    if statement == native.StatementType.CREATE_STREAM:
-      self._handle_create_stream(result)
+    new_ts = compilation["new_ts_units_per_second"]
+    if new_ts > 0:
+      self._ts_units_per_second = new_ts
       return None
 
-    if statement == native.StatementType.INSERT:
-      self._handle_insert(result)
-      return None
+    last_select_result = None
+    for result in compilation["results"]:
+      if result.has_errors():
+        raise SqlError(result.errors)
 
-    if statement in (
-        native.StatementType.CREATE_VIEW,
-        native.StatementType.CREATE_MATERIALIZED_VIEW,
-    ):
-      self._handle_create_view(result, statement)
-      return None
+      statement = result.statement_type
+      if statement == native.StatementType.CREATE_STREAM:
+        self._handle_create_stream(result)
 
-    if statement == native.StatementType.DROP:
-      self._handle_drop(result)
-      return None
+      elif statement == native.StatementType.INSERT:
+        self._handle_insert(result)
 
-    if statement == native.StatementType.SELECT:
-      return self._handle_select(normalized, result)
+      elif statement in (
+          native.StatementType.CREATE_VIEW,
+          native.StatementType.CREATE_MATERIALIZED_VIEW,
+      ):
+        self._handle_create_view(result, statement)
 
-    raise SqlError([f"Unsupported statement type: {statement}"])
+      elif statement == native.StatementType.DROP:
+        self._handle_drop(result)
+
+      elif statement == native.StatementType.SELECT:
+        last_select_result = self._handle_select(sql, result)
+
+      else:
+        raise SqlError([f"Unsupported statement type: {statement}"])
+
+    return last_select_result
 
   def _handle_create_stream(self, result: native.CompilationResult) -> None:
     self._catalog.register_stream(result.entity_name, result.stream_schema)
@@ -429,7 +435,7 @@ class RtBotSql:
     original_field_map = dict(result.field_map)
     runtime_result = result
     if not runtime_result.program_json:
-      runtime_result = compile_select_to_program(sql, self._catalog.snapshot())
+      runtime_result = compile_select_to_program(sql, self._catalog.snapshot(), self._ts_units_per_second)
       if runtime_result.has_errors():
         raise SqlError(runtime_result.errors)
 
@@ -484,8 +490,8 @@ class RtBotSql:
     return self._execute_with_pipeline(sql, result)
 
   def explain(self, sql: str) -> Dict[str, Any]:
-    normalized = self._normalize_sql(sql)
-    result = compile_sql(normalized, self._catalog.snapshot())
+    compilation = compile_sql(sql, self._catalog.snapshot(), self._ts_units_per_second)
+    result = compilation["results"][0]
 
     output = {
         "statement_type": _enum_name(result.statement_type),
