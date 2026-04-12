@@ -49,7 +49,7 @@ namespace {
 
 static const std::set<std::string> int_params = {
     "index", "numPorts", "window", "window_size", "interval", "key_index",
-    "numInputPorts", "k", "score_index", "t0", "shift"};
+    "numInputPorts", "k", "score_index", "t0", "shift", "snapFirst"};
 
 json operator_to_json(const OperatorDef& op) {
   json j;

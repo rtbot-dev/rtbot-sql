@@ -339,11 +339,11 @@ ExprResult compile_expression(const parser::ast::Expr& expr,
       return r;
     }
 
-    // RESAMPLE_CONSTANT(expr, interval) — resampler with fixed grid (t0=0)
+    // RESAMPLE_CONSTANT(expr, interval [, snap_first]) — resampler with fixed grid (t0=0)
     if (upper_name == "RESAMPLE_CONSTANT") {
-      if (func.args.size() != 2) {
+      if (func.args.size() < 2 || func.args.size() > 3) {
         throw std::runtime_error(
-            "RESAMPLE_CONSTANT requires exactly 2 arguments");
+            "RESAMPLE_CONSTANT requires 2 or 3 arguments");
       }
       auto signal = compile_expression(func.args[0], input_endpoint, scope,
                                        builder, cache, source_endpoints);
@@ -356,12 +356,29 @@ ExprResult compile_expression(const parser::ast::Expr& expr,
             "RESAMPLE_CONSTANT interval must be a constant");
       }
 
+      // Optional 3rd arg: snap_first flag (default 0)
+      double snap_first_val = 0.0;
+      if (func.args.size() == 3) {
+        auto snap_result =
+            compile_expression(func.args[2], input_endpoint, scope, builder,
+                               cache, source_endpoints);
+        auto* snap_const = std::get_if<ConstantMarker>(&snap_result);
+        if (!snap_const) {
+          throw std::runtime_error(
+              "RESAMPLE_CONSTANT snap_first must be a constant");
+        }
+        snap_first_val = snap_const->value;
+      }
+
       auto signal_ep =
           ensure_endpoint_local(std::move(signal), input_endpoint, builder);
       auto id = builder.next_id("resample");
-      builder.add_operator(
-          id, "ResamplerConstant",
-          {{"interval", interval_const->value}, {"t0", 0.0}});
+      std::map<std::string, double> params = {
+          {"interval", interval_const->value}, {"t0", 0.0}};
+      if (snap_first_val != 0.0) {
+        params["snapFirst"] = 1.0;
+      }
+      builder.add_operator(id, "ResamplerConstant", params);
       builder.connect(signal_ep, {id, "i1"});
       ExprResult r = Endpoint{id, "o1"};
       maybe_cache(expr, r);
