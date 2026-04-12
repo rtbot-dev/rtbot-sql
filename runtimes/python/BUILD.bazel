@@ -223,3 +223,12 @@ py_test(
     timeout = "moderate",  # 300s — memory profiling needs headroom
     deps = [":rtbot_sql"],
 )
+
+py_test(
+    name = "aligned_stream_irregular_demo_test",
+    srcs = ["test/aligned_stream_irregular_demo_test.py"],
+    main = "test/aligned_stream_irregular_demo_test.py",
+    timeout = "eternal",
+    tags = ["manual"],
+    deps = [":rtbot_sql"],
+)
