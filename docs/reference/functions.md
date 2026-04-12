@@ -153,7 +153,7 @@ The filter starts with zero initial state for both feedforward and feedback hist
 
 Compiles to: `InfiniteImpulseResponse(ff_coefficients=[...], fb_coefficients=[...])` operator.
 
-### RESAMPLE_CONSTANT(expr, interval)
+### RESAMPLE_CONSTANT(expr, interval [, snap_first])
 
 Resamples an irregular signal onto a fixed interval grid using held-last-value behavior.
 
@@ -163,7 +163,12 @@ SELECT RESAMPLE_CONSTANT(temperature, 1000) AS temp_1hz FROM sensors
 
 Useful when input data arrives irregularly and downstream operators require aligned timestamps.
 
-Compiles to: `ResamplerConstant(interval=N, t0=0)` operator.
+The optional `snap_first` argument (0 or 1, default 0) enables snap-to-grid mode: the resampler
+snaps to the current grid point on first message and uses each incoming value immediately at the
+next grid point (rather than holding the previous value). This is used internally by
+`CREATE ALIGNED STREAM` to eliminate one bin of latency.
+
+Compiles to: `ResamplerConstant(interval=N, t0=0 [, snapFirst=1])` operator.
 
 ### TIMESHIFT(expr, shift)
 
@@ -172,9 +177,6 @@ Shifts output timestamps by a constant amount.
 ```sql
 SELECT TIMESHIFT(temperature, -1000) AS temp_shifted FROM sensors
 ```
-
-Commonly composed with `RESAMPLE_CONSTANT` in aligned-stream pipelines to compensate
-the one-bin latency introduced by resampler initialization.
 
 Compiles to: `TimeShift(shift=N)` operator.
 

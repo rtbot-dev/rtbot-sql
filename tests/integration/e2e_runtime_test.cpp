@@ -2564,14 +2564,19 @@ TEST_F(E2eRuntimeTest, ExpandedAlignedStreamRuntime) {
   EXPECT_TRUE(temp_rs_outputs.empty()) << "No rs output yet (bin 0)";
 
   // Bin 1: first message triggers bin 0 flush
+  // With snap_first, the resampler emits immediately on first bin flush
   // vibration
   for (auto [ts, v] : std::vector<std::pair<uint64_t, double>>{
            {1050, 20}, {1300, 22}, {1500, 28}, {1800, 30}}) {
     auto outs = cascade_bin_rs(vib_bin, vib_rs, ts, v);
     vib_rs_outputs.insert(vib_rs_outputs.end(), outs.begin(), outs.end());
   }
-  // Resampler init: no output from first bin flush
-  EXPECT_TRUE(vib_rs_outputs.empty()) << "Resampler init — no output";
+  // snap_first: resampler emits bin 0 avg immediately
+  ASSERT_EQ(vib_rs_outputs.size(), 1u)
+      << "snap_first resampler emits on first bin flush";
+  EXPECT_EQ(vib_rs_outputs[0].first, 1000u)
+      << "vibration_rs should emit bin 0 avg at t=1000";
+  EXPECT_DOUBLE_EQ(vib_rs_outputs[0].second[0], 10.0);
 
   // bearing_temp
   for (auto [ts, v] : std::vector<std::pair<uint64_t, double>>{
@@ -2579,27 +2584,12 @@ TEST_F(E2eRuntimeTest, ExpandedAlignedStreamRuntime) {
     auto outs = cascade_bin_rs(temp_bin, temp_rs, ts, v);
     temp_rs_outputs.insert(temp_rs_outputs.end(), outs.begin(), outs.end());
   }
-  EXPECT_TRUE(temp_rs_outputs.empty()) << "Resampler init — no output";
-
-  // Bin 2: triggers bin 1 flush → resampler produces output
-  {
-    auto outs = cascade_bin_rs(vib_bin, vib_rs, 2100, 30);
-    vib_rs_outputs.insert(vib_rs_outputs.end(), outs.begin(), outs.end());
-  }
-  ASSERT_EQ(vib_rs_outputs.size(), 1u);
-  EXPECT_EQ(vib_rs_outputs[0].first, 1000u)  // TIMESHIFT corrected
-      << "vibration_rs should emit bin 0 avg at t=1000";
-  EXPECT_DOUBLE_EQ(vib_rs_outputs[0].second[0], 10.0);
-
-  {
-    auto outs = cascade_bin_rs(temp_bin, temp_rs, 2200, 96);
-    temp_rs_outputs.insert(temp_rs_outputs.end(), outs.begin(), outs.end());
-  }
-  ASSERT_EQ(temp_rs_outputs.size(), 1u);
+  ASSERT_EQ(temp_rs_outputs.size(), 1u)
+      << "snap_first resampler emits on first bin flush";
   EXPECT_EQ(temp_rs_outputs[0].first, 1000u);
   EXPECT_DOUBLE_EQ(temp_rs_outputs[0].second[0], 75.0);
 
-  // Feed to combiner
+  // Feed to combiner — both resamplers have emitted at t=1000
   feed_to_combiner();
   ASSERT_EQ(combined_outputs.size(), 1u)
       << "First combined output after both rs emit at t=1000";

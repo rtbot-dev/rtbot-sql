@@ -28,12 +28,12 @@ TEST_F(PreprocessorTest, AlignedStreamTwoColumns) {
   EXPECT_EQ(r.statements[3],
       "CREATE VIEW bearing_temp_bin AS SELECT AVG(value) AS bearing_temp "
       "FROM bearing_temp GROUP BY FLOOR(TS() / 1000000)");
-  // Resampler views (with TIMESHIFT to compensate one-bin latency)
+  // Resampler views (snap_first mode, no TIMESHIFT needed)
   EXPECT_EQ(r.statements[4],
-      "CREATE VIEW vibration_rs AS SELECT TIMESHIFT(RESAMPLE_CONSTANT(vibration, 1000000), -1000000) "
+      "CREATE VIEW vibration_rs AS SELECT RESAMPLE_CONSTANT(vibration, 1000000, 1) "
       "AS vibration FROM vibration_bin");
   EXPECT_EQ(r.statements[5],
-      "CREATE VIEW bearing_temp_rs AS SELECT TIMESHIFT(RESAMPLE_CONSTANT(bearing_temp, 1000000), -1000000) "
+      "CREATE VIEW bearing_temp_rs AS SELECT RESAMPLE_CONSTANT(bearing_temp, 1000000, 1) "
       "AS bearing_temp FROM bearing_temp_bin");
   // Combining materialized view references _rs views
   EXPECT_EQ(r.statements[6],
@@ -51,7 +51,7 @@ TEST_F(PreprocessorTest, AlignedStreamSingleColumn) {
       "CREATE VIEW pressure_bin AS SELECT AVG(value) AS pressure "
       "FROM pressure GROUP BY FLOOR(TS() / 500000)");
   EXPECT_EQ(r.statements[2],
-      "CREATE VIEW pressure_rs AS SELECT TIMESHIFT(RESAMPLE_CONSTANT(pressure, 500000), -500000) "
+      "CREATE VIEW pressure_rs AS SELECT RESAMPLE_CONSTANT(pressure, 500000, 1) "
       "AS pressure FROM pressure_bin");
   EXPECT_EQ(r.statements[3],
       "CREATE MATERIALIZED VIEW data AS SELECT pressure FROM pressure_rs");
@@ -135,7 +135,7 @@ TEST_F(PreprocessorTest, ThreeColumns) {
   EXPECT_NE(r.statements[5].find("z_bin"), std::string::npos);
   // _rs views
   EXPECT_NE(r.statements[6].find("x_rs"), std::string::npos);
-  EXPECT_NE(r.statements[6].find("TIMESHIFT(RESAMPLE_CONSTANT"), std::string::npos);
+  EXPECT_NE(r.statements[6].find("RESAMPLE_CONSTANT(x, 100000, 1)"), std::string::npos);
   EXPECT_NE(r.statements[7].find("y_rs"), std::string::npos);
   EXPECT_NE(r.statements[8].find("z_rs"), std::string::npos);
   // Combining materialized view references _rs views
@@ -176,8 +176,8 @@ TEST_F(PreprocessorTest, BinIntervalMatchesBetweenBinAndRs) {
   ASSERT_EQ(r.statements.size(), 4);
   // _bin: GROUP BY FLOOR(TS() / 2000000)
   EXPECT_NE(r.statements[1].find("FLOOR(TS() / 2000000)"), std::string::npos);
-  // _rs: TIMESHIFT(RESAMPLE_CONSTANT(val, 2000000), -2000000)
-  EXPECT_NE(r.statements[2].find("TIMESHIFT(RESAMPLE_CONSTANT(val, 2000000), -2000000)"), std::string::npos);
+  // _rs: RESAMPLE_CONSTANT(val, 2000000, 1)
+  EXPECT_NE(r.statements[2].find("RESAMPLE_CONSTANT(val, 2000000, 1)"), std::string::npos);
 }
 
 TEST_F(PreprocessorTest, TrailingSemicolonAndWhitespace) {

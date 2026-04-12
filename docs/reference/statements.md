@@ -19,7 +19,7 @@ This statement is preprocessed into standard SQL statements:
 
 1. One `CREATE STREAM <column> (value <type>)` per column
 2. One `<column>_bin` view with `AVG(value)` grouped by `FLOOR(TS()/bin)`
-3. One `<column>_rs` view with `TIMESHIFT(RESAMPLE_CONSTANT(...), -bin)`
+3. One `<column>_rs` view with `RESAMPLE_CONSTANT(..., bin, 1)` (snap-to-grid mode)
 4. One final `CREATE MATERIALIZED VIEW <name> AS SELECT ... FROM <column>_rs...`
 
 For the 2-column example above, the expansion yields 7 statements.

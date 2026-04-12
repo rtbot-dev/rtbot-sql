@@ -491,13 +491,14 @@ TEST_F(ExpressionTest, ResampleConstantWrongArgCountThrows) {
                            input, scope, b2),
         std::runtime_error);
   }
-  // Three args
+  // Four args
   {
     GraphBuilder b3;
     auto f = std::make_unique<FuncCall>();
     f->name = "RESAMPLE_CONSTANT";
     f->args.push_back(col("price"));
     f->args.push_back(num(1000.0));
+    f->args.push_back(num(1.0));
     f->args.push_back(num(0.0));
     Expr expr = std::move(f);
     EXPECT_THROW(

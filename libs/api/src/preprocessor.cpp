@@ -150,11 +150,11 @@ PreprocessResult preprocess_sql(const std::string& sql,
                          col.name + " GROUP BY FLOOR(TS() / " + bin_str + ")");
       }
 
-      // CREATE VIEW per column with resampler + timeshift (_rs suffix)
+      // CREATE VIEW per column with snap resampler (_rs suffix)
       for (const auto& col : columns) {
         stmts.push_back("CREATE VIEW " + col.name +
-                         "_rs AS SELECT TIMESHIFT(RESAMPLE_CONSTANT(" +
-                         col.name + ", " + bin_str + "), -" + bin_str +
+                         "_rs AS SELECT RESAMPLE_CONSTANT(" +
+                         col.name + ", " + bin_str + ", 1" +
                          ") AS " + col.name + " FROM " + col.name + "_bin");
       }
 
