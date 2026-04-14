@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <iomanip>
@@ -130,6 +131,7 @@ struct Config {
   int samples_per_burst = 512;
   int bursts = 300;
   int progress_every = 10;
+  bool pure_cpp = false;
   std::vector<std::string> presets = {
       "01_rms",
       "02_kurtosis",
@@ -196,6 +198,8 @@ void print_help(const char* argv0) {
       << "  --progress-every N      Progress print interval in bursts (default: 10)\n"
       << "  --presets CSV           Active presets, comma-separated\n"
       << "                          Available: 01_rms,02_kurtosis,04_crest,05_dashboard\n"
+      << "  --pure-cpp              Skip rtbot SQL and compute burst metrics in pure C++\n"
+      << "                          (upper bound for this hardware; ignores --presets)\n"
       << "  --list-presets          Print available preset IDs and exit\n"
       << "  --help                  Show this message\n\n"
       << "Example:\n"
@@ -277,10 +281,15 @@ Config parse_args(int argc, char** argv) {
       continue;
     }
 
+    if (arg == "--pure-cpp") {
+      cfg.pure_cpp = true;
+      continue;
+    }
+
     throw std::runtime_error("Unknown argument: " + arg);
   }
 
-  if (cfg.presets.empty()) {
+  if (cfg.presets.empty() && !cfg.pure_cpp) {
     throw std::runtime_error("At least one preset is required");
   }
 
@@ -367,11 +376,185 @@ const PresetDef* find_preset(const std::string& preset_id) {
   return it == presets.end() ? nullptr : &(*it);
 }
 
+struct BurstMetrics {
+  std::uint64_t sample_count;
+  double mean_value;
+  double variance_value;
+  double std_value;
+  double rms_value;
+  double m3;
+  double m4;
+  double skewness_value;
+  double kurtosis_value;
+  double peak_value;
+  double peak_to_peak;
+  double crest_factor;
+  double clearance_factor;
+  double impulse_factor;
+  double shape_factor;
+};
+
+inline double safe_div(double numerator, double denominator) {
+  return denominator == 0.0 ? 0.0 : numerator / denominator;
+}
+
+BurstMetrics compute_burst_metrics(const double* samples, std::size_t n) {
+  BurstMetrics m{};
+  if (n == 0) {
+    return m;
+  }
+
+  double sum = 0.0;
+  double sum2 = 0.0;
+  double sum3 = 0.0;
+  double sum4 = 0.0;
+  double sum_abs = 0.0;
+  double sum_sqrt_abs = 0.0;
+  double peak = 0.0;
+  double min_v = samples[0];
+  double max_v = samples[0];
+
+  for (std::size_t i = 0; i < n; ++i) {
+    const double x = samples[i];
+    const double ax = std::fabs(x);
+    const double x2 = x * x;
+    sum += x;
+    sum2 += x2;
+    sum3 += x2 * x;
+    sum4 += x2 * x2;
+    sum_abs += ax;
+    sum_sqrt_abs += std::sqrt(ax);
+    if (ax > peak) peak = ax;
+    if (x < min_v) min_v = x;
+    if (x > max_v) max_v = x;
+  }
+
+  const double dn = static_cast<double>(n);
+  const double mean = sum / dn;
+  const double ex2 = sum2 / dn;
+  const double ex3 = sum3 / dn;
+  const double ex4 = sum4 / dn;
+  const double mean_abs = sum_abs / dn;
+  const double mean_sqrt_abs = sum_sqrt_abs / dn;
+
+  const double variance = ex2 - mean * mean;
+  const double std_value = std::sqrt(std::max(variance, 0.0));
+  const double rms = std::sqrt(ex2);
+  const double m3 = ex3 - 3.0 * ex2 * mean + 2.0 * mean * mean * mean;
+  const double m4 = ex4 - 4.0 * ex3 * mean
+                    + 6.0 * ex2 * mean * mean
+                    - 3.0 * mean * mean * mean * mean;
+
+  m.sample_count = static_cast<std::uint64_t>(n);
+  m.mean_value = mean;
+  m.variance_value = variance;
+  m.std_value = std_value;
+  m.rms_value = rms;
+  m.m3 = m3;
+  m.m4 = m4;
+  m.skewness_value = safe_div(m3, std_value * std_value * std_value);
+  m.kurtosis_value = safe_div(m4, variance * variance);
+  m.peak_value = peak;
+  m.peak_to_peak = max_v - min_v;
+  m.crest_factor = safe_div(peak, rms);
+  m.clearance_factor = safe_div(peak, mean_sqrt_abs * mean_sqrt_abs);
+  m.impulse_factor = safe_div(peak, mean_abs);
+  m.shape_factor = safe_div(rms, mean_abs);
+  return m;
+}
+
+int run_pure_cpp(const Config& cfg) {
+  std::cout << "\n================================================================\n";
+  std::cout << "IMS pure C++ upper-bound benchmark (no rtbot SQL)\n";
+  std::cout << "================================================================\n";
+  std::cout << "Config:\n";
+  std::cout << "  bearings            : " << cfg.bearings << "\n";
+  std::cout << "  samples_per_burst   : " << cfg.samples_per_burst << "\n";
+  std::cout << "  bursts              : " << cfg.bursts << "\n";
+  std::cout << "----------------------------------------------------------------\n";
+  std::cout << "  " << std::setw(6) << "Burst" << "  " << std::setw(14) << "Samples"
+            << "  " << std::setw(14) << "Samples/sec" << "  " << std::setw(12)
+            << "Bursts/sec" << "\n";
+
+  std::vector<double> buffer(static_cast<std::size_t>(cfg.samples_per_burst));
+  for (int i = 0; i < cfg.samples_per_burst; ++i) {
+    buffer[static_cast<std::size_t>(i)] = synthetic_amplitude(i);
+  }
+
+  std::uint64_t total_samples = 0;
+  std::uint64_t total_bursts = 0;
+
+  // Keep a sink to prevent the optimizer from throwing everything away.
+  double sink = 0.0;
+
+  const auto start = std::chrono::steady_clock::now();
+  auto last_report = start;
+  std::uint64_t last_report_samples = 0;
+
+  for (int burst = 1; burst <= cfg.bursts; ++burst) {
+    for (int bearing = 1; bearing <= cfg.bearings; ++bearing) {
+      (void)bearing;
+      const auto metrics = compute_burst_metrics(buffer.data(), buffer.size());
+      sink += metrics.rms_value + metrics.kurtosis_value + metrics.skewness_value
+              + metrics.crest_factor + metrics.clearance_factor
+              + metrics.impulse_factor + metrics.shape_factor
+              + metrics.peak_to_peak + metrics.m3 + metrics.m4;
+      total_samples += metrics.sample_count;
+      ++total_bursts;
+    }
+
+    if (burst % cfg.progress_every == 0 || burst == cfg.bursts) {
+      const auto now = std::chrono::steady_clock::now();
+      const std::chrono::duration<double> interval = now - last_report;
+      const std::chrono::duration<double> elapsed = now - start;
+      const auto interval_samples = total_samples - last_report_samples;
+      const double interval_rate =
+          interval_samples / std::max(interval.count(), 1e-9);
+      const double burst_rate =
+          total_bursts / std::max(elapsed.count(), 1e-9);
+
+      std::cout << "  " << std::setw(6) << burst << "  " << std::setw(14)
+                << total_samples << "  " << std::setw(14) << std::fixed
+                << std::setprecision(0) << interval_rate << "  "
+                << std::setw(12) << std::setprecision(1) << burst_rate << "\n";
+
+      last_report = now;
+      last_report_samples = total_samples;
+    }
+  }
+
+  const auto end = std::chrono::steady_clock::now();
+  const std::chrono::duration<double> elapsed = end - start;
+  const double samples_per_sec = total_samples / std::max(elapsed.count(), 1e-9);
+  const double bursts_per_sec = total_bursts / std::max(elapsed.count(), 1e-9);
+
+  std::cout << "================================================================\n";
+  std::cout << "Results (pure C++ upper bound)\n";
+  std::cout << "----------------------------------------------------------------\n";
+  std::cout << std::fixed << std::setprecision(6);
+  std::cout << "Elapsed wall time        : " << elapsed.count() << " s\n";
+  std::cout << std::setprecision(0);
+  std::cout << "Total bursts             : " << total_bursts << "\n";
+  std::cout << "Total samples            : " << total_samples << "\n";
+  std::cout << "Samples/sec              : " << samples_per_sec << "\n";
+  std::cout << std::setprecision(1);
+  std::cout << "Bursts/sec               : " << bursts_per_sec << "\n";
+  std::cout << std::setprecision(6);
+  std::cout << "(sink value, ignore)     : " << sink << "\n";
+  std::cout << "================================================================\n";
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   try {
     const Config cfg = parse_args(argc, argv);
+
+    if (cfg.pure_cpp) {
+      return run_pure_cpp(cfg);
+    }
+
     CatalogSnapshot catalog;
 
     const auto stream = compile_or_die(kStreamSql, catalog, "vibration_raw stream");
@@ -455,7 +638,7 @@ int main(int argc, char** argv) {
               ++pipeline->forwarded_messages;
               ++program_receive_calls;
               auto output_batch = pipeline->program.receive(
-                  make_vector_message(vec_msg->time, vec_msg->data.values), "i1");
+                  make_vector_message(vec_msg->time, *vec_msg->data.values), "i1");
               const auto produced = count_total_messages(output_batch);
               pipeline->output_messages += produced;
               materialized_outputs += produced;
