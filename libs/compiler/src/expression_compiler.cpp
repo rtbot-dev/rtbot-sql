@@ -500,4 +500,162 @@ ExprResult compile_expression(const parser::ast::Expr& expr,
   throw std::runtime_error("unsupported expression type");
 }
 
+namespace {
+
+// Map SQL function name to FusedExpression bytecode opcode.
+// Returns -1 if the function is not a fusable unary math function.
+double math_func_to_opcode(const std::string& name) {
+  std::string upper = name;
+  std::transform(upper.begin(), upper.end(), upper.begin(), ::toupper);
+  if (upper == "ABS") return 7;    // fused_op::ABS
+  if (upper == "SQRT") return 8;   // fused_op::SQRT
+  if (upper == "LN" || upper == "LOG") return 9;  // fused_op::LOG
+  if (upper == "LOG10") return 10;  // fused_op::LOG10
+  if (upper == "EXP") return 11;    // fused_op::EXP
+  if (upper == "SIN") return 12;    // fused_op::SIN
+  if (upper == "COS") return 13;    // fused_op::COS
+  if (upper == "TAN") return 14;    // fused_op::TAN
+  if (upper == "SIGN") return 15;   // fused_op::SIGN
+  if (upper == "FLOOR") return 16;  // fused_op::FLOOR
+  if (upper == "CEIL" || upper == "CEILING") return 17;  // fused_op::CEIL
+  if (upper == "ROUND") return 18;  // fused_op::ROUND
+  return -1;
+}
+
+// Map binary operator string to FusedExpression bytecode opcode.
+double binary_op_to_opcode(const std::string& op) {
+  if (op == "+") return 2;  // fused_op::ADD
+  if (op == "-") return 3;  // fused_op::SUB
+  if (op == "*") return 4;  // fused_op::MUL
+  if (op == "/") return 5;  // fused_op::DIV
+  return -1;
+}
+
+// Recursive bytecode compilation for a single expression.
+// Appends opcodes to `bytecode`. Returns false if expression is not fusable.
+bool compile_expr_bytecode_recursive(
+    const parser::ast::Expr& expr,
+    const analyzer::Scope& scope,
+    std::map<std::pair<std::string, int>, int>& column_to_input,
+    std::vector<double>& constants,
+    std::vector<double>& bytecode,
+    const std::map<std::string, Endpoint>* source_endpoints) {
+  using namespace parser::ast;
+
+  // ColumnRef → INPUT opcode
+  if (auto* col = std::get_if<ColumnRef>(&expr)) {
+    auto result = scope.resolve(*col);
+    if (auto* err = std::get_if<std::string>(&result)) {
+      return false;  // unresolved column
+    }
+    auto& binding = std::get<analyzer::ColumnBinding>(result);
+    auto key = std::make_pair(binding.stream_name, binding.index);
+    auto it = column_to_input.find(key);
+    int input_index;
+    if (it != column_to_input.end()) {
+      input_index = it->second;
+    } else {
+      input_index = static_cast<int>(column_to_input.size());
+      column_to_input[key] = input_index;
+    }
+    bytecode.push_back(0);  // fused_op::INPUT
+    bytecode.push_back(static_cast<double>(input_index));
+    return true;
+  }
+
+  // Constant → CONST opcode
+  if (auto* c = std::get_if<Constant>(&expr)) {
+    int const_index = static_cast<int>(constants.size());
+    constants.push_back(c->value);
+    bytecode.push_back(1);  // fused_op::CONST
+    bytecode.push_back(static_cast<double>(const_index));
+    return true;
+  }
+
+  // BinaryExpr → recurse left, recurse right, emit binary opcode
+  if (auto* bin_ptr = std::get_if<std::unique_ptr<BinaryExpr>>(&expr)) {
+    const auto& bin = **bin_ptr;
+    double opcode = binary_op_to_opcode(bin.op);
+    if (opcode < 0) return false;  // unknown binary operator
+    if (!compile_expr_bytecode_recursive(bin.left, scope, column_to_input,
+                                         constants, bytecode, source_endpoints))
+      return false;
+    if (!compile_expr_bytecode_recursive(bin.right, scope, column_to_input,
+                                         constants, bytecode, source_endpoints))
+      return false;
+    bytecode.push_back(opcode);
+    return true;
+  }
+
+  // FuncCall → math function opcodes
+  if (auto* func_ptr = std::get_if<std::unique_ptr<FuncCall>>(&expr)) {
+    const auto& func = **func_ptr;
+    std::string upper_name = func.name;
+    std::transform(upper_name.begin(), upper_name.end(), upper_name.begin(),
+                   ::toupper);
+
+    // POWER(expr, exponent) → recurse base, recurse exponent, emit POW
+    if (upper_name == "POWER") {
+      if (func.args.size() != 2) return false;
+      if (!compile_expr_bytecode_recursive(func.args[0], scope,
+                                            column_to_input, constants,
+                                            bytecode, source_endpoints))
+        return false;
+      if (!compile_expr_bytecode_recursive(func.args[1], scope,
+                                            column_to_input, constants,
+                                            bytecode, source_endpoints))
+        return false;
+      bytecode.push_back(6);  // fused_op::POW
+      return true;
+    }
+
+    // SQRT(expr) → recurse arg, emit SQRT
+    if (upper_name == "SQRT") {
+      if (func.args.size() != 1) return false;
+      if (!compile_expr_bytecode_recursive(func.args[0], scope,
+                                            column_to_input, constants,
+                                            bytecode, source_endpoints))
+        return false;
+      bytecode.push_back(8);  // fused_op::SQRT
+      return true;
+    }
+
+    // Unary math functions
+    double opcode = math_func_to_opcode(func.name);
+    if (opcode < 0) {
+      // Not a fusable function (aggregate, windowed, DSP, TS, TIMESHIFT, etc.)
+      return false;
+    }
+    if (func.args.size() != 1) return false;
+    if (!compile_expr_bytecode_recursive(func.args[0], scope,
+                                          column_to_input, constants,
+                                          bytecode, source_endpoints))
+      return false;
+    bytecode.push_back(opcode);
+    return true;
+  }
+
+  // Anything else (CaseExpr, StringConstant, ArrayLiteral, ComparisonExpr,
+  // LogicalExpr, NotExpr, BetweenExpr) is not fusable.
+  return false;
+}
+
+}  // anonymous namespace
+
+BytecodeResult compile_expression_to_bytecode(
+    const parser::ast::Expr& expr,
+    const analyzer::Scope& scope,
+    std::map<std::pair<std::string, int>, int>& column_to_input,
+    std::vector<double>& constants,
+    const std::map<std::string, Endpoint>* source_endpoints) {
+  BytecodeResult result;
+  result.success = compile_expr_bytecode_recursive(
+      expr, scope, column_to_input, constants, result.bytecode,
+      source_endpoints);
+  if (result.success) {
+    result.bytecode.push_back(20);  // fused_op::END
+  }
+  return result;
+}
+
 }  // namespace rtbot_sql::compiler
