@@ -102,8 +102,8 @@ TEST_F(SelectTest, PureColumnRefsUseVectorProject) {
 }
 
 // SELECT instrument_id, price * quantity AS trade_value
-// → VectorExtract(0) + expression chain + VectorCompose(2)
-TEST_F(SelectTest, MixedColumnsAndExpressionsUseVectorCompose) {
+// → FusedExpression with bytecode (all items are fusable pure arithmetic)
+TEST_F(SelectTest, MixedColumnsAndExpressionsUseFusedExpression) {
   std::vector<SelectItem> select_list;
   select_list.push_back(item(col("instrument_id")));
   select_list.push_back(
@@ -111,24 +111,24 @@ TEST_F(SelectTest, MixedColumnsAndExpressionsUseVectorCompose) {
   auto [ep, field_map, _seg] =
       compile_select_projection(select_list, input, scope, builder);
 
-  // Should have: VectorExtract(0), VectorExtract(1), VectorExtract(2),
-  //              Multiplication, VectorCompose
-  // instrument_id → VectorExtract(0)
-  // price → VectorExtract(1), quantity → VectorExtract(2) → Multiplication
-  // Both → VectorCompose
-
-  // Find the VectorCompose
-  const OperatorDef* compose = nullptr;
+  // All items are fusable → FusedExpression replaces VectorCompose
+  const OperatorDef* fused = nullptr;
   for (const auto& op : builder.operators()) {
-    if (op.type == "VectorCompose") {
-      compose = &op;
+    if (op.type == "FusedExpression") {
+      fused = &op;
       break;
     }
   }
-  ASSERT_NE(compose, nullptr);
-  EXPECT_EQ(compose->params.at("numPorts"), 2.0);
-  EXPECT_EQ(ep.operator_id, compose->id);
+  ASSERT_NE(fused, nullptr);
+  EXPECT_EQ(fused->params.at("numPorts"), 3.0);   // instrument_id, price, quantity
+  EXPECT_EQ(fused->params.at("numOutputs"), 2.0);  // 2 SELECT items
+  EXPECT_EQ(ep.operator_id, fused->id);
   EXPECT_EQ(ep.port, "o1");
+
+  // No VectorCompose should exist
+  for (const auto& op : builder.operators()) {
+    EXPECT_NE(op.type, "VectorCompose");
+  }
 
   EXPECT_EQ(field_map.at("instrument_id"), 0);
   EXPECT_EQ(field_map.at("trade_value"), 1);
@@ -230,15 +230,16 @@ TEST_F(SelectTest, ComplexExpressionMixingFunctionsAndArithmetic) {
   EXPECT_EQ(field_map.at("upper_band"), 1);
 }
 
-// Multi-source projection should rely on VectorCompose synchronization
-// (VectorCompose is Join-based in RTBot), without extra explicit sync operators.
+// Multi-source projection: columns from different sources are fusable
+// (plain column refs become INPUT opcodes in the bytecode).
+// With fusion enabled, a FusedExpression is emitted instead of VectorCompose.
 //
 // Data flow intent (tuple notation):
 //   trades:o1      -> (t=1000, [price=10.0])
 //   eth:o2         -> (t=1000, [eth_price=11.0])
 //   SELECT output  -> (t=1000, [10.0, 11.0])
-// Synchronization must come from VectorCompose itself, not extra Join/Add ops.
-TEST_F(SelectTest, MultiSourceProjectionUsesOnlyVectorComposeForSync) {
+// Synchronization comes from FusedExpression (inherits from VectorCompose/Join).
+TEST_F(SelectTest, MultiSourceProjectionUsesFusedExpression) {
   StreamSchema eth_schema{"eth", {{"eth_price", 0}}};
   scope.register_stream("eth", eth_schema);
 
@@ -255,17 +256,21 @@ TEST_F(SelectTest, MultiSourceProjectionUsesOnlyVectorComposeForSync) {
       compile_select_projection(select_list, input, scope, builder,
                                 &source_endpoints);
 
+  int fused_count = 0;
   int vector_compose_count = 0;
   int join_count = 0;
   int addition_count = 0;
   for (const auto& op : builder.operators()) {
+    if (op.type == "FusedExpression") fused_count++;
     if (op.type == "VectorCompose") vector_compose_count++;
     if (op.type == "Join") join_count++;
     if (op.type == "Addition") addition_count++;
   }
 
-  EXPECT_EQ(vector_compose_count, 1)
-      << "Expected a single VectorCompose to synchronize selected columns";
+  EXPECT_EQ(fused_count, 1)
+      << "Expected a single FusedExpression for fusable projection";
+  EXPECT_EQ(vector_compose_count, 0)
+      << "FusedExpression replaces VectorCompose when all items are fusable";
   EXPECT_EQ(join_count, 0)
       << "No extra explicit Join operators should be synthesized";
   EXPECT_EQ(addition_count, 0)

@@ -649,5 +649,196 @@ TEST_F(ExpressionTest, TimeShiftWrappingResampleConstant) {
   expect_conn(builder, rs.id, "o1", ts.id, "i1");
 }
 
+// --- Bytecode compilation tests ---
+
+class BytecodeTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    StreamSchema schema{
+        "trades",
+        {{"instrument_id", 0}, {"price", 1}, {"quantity", 2},
+         {"account_id", 3}},
+    };
+    scope.register_stream("trades", schema, "t");
+  }
+
+  analyzer::Scope scope;
+  std::map<std::pair<std::string, int>, int> column_to_input;
+  std::vector<double> constants;
+};
+
+// ColumnRef → INPUT opcode
+TEST_F(BytecodeTest, ColumnRefProducesInputOpcode) {
+  auto result = compile_expression_to_bytecode(
+      col("price"), scope, column_to_input, constants);
+  ASSERT_TRUE(result.success);
+  // Expected: INPUT 0 END (price maps to input port 0, first seen)
+  ASSERT_EQ(result.bytecode.size(), 3u);
+  EXPECT_EQ(result.bytecode[0], 0);  // INPUT
+  EXPECT_EQ(result.bytecode[1], 0);  // input index 0 (first column seen)
+  EXPECT_EQ(result.bytecode[2], 20); // END
+  EXPECT_EQ(column_to_input.size(), 1u);
+  auto key = std::make_pair(std::string("trades"), 1);
+  EXPECT_EQ(column_to_input[key], 0);
+}
+
+// Constant → CONST opcode
+TEST_F(BytecodeTest, ConstantProducesConstOpcode) {
+  auto result = compile_expression_to_bytecode(
+      num(42.0), scope, column_to_input, constants);
+  ASSERT_TRUE(result.success);
+  ASSERT_EQ(result.bytecode.size(), 3u);
+  EXPECT_EQ(result.bytecode[0], 1);  // CONST
+  EXPECT_EQ(result.bytecode[1], 0);  // constant index 0
+  EXPECT_EQ(result.bytecode[2], 20); // END
+  ASSERT_EQ(constants.size(), 1u);
+  EXPECT_EQ(constants[0], 42.0);
+}
+
+// price * quantity → INPUT 0 INPUT 1 MUL END
+TEST_F(BytecodeTest, BinaryExprProducesOpcodes) {
+  auto result = compile_expression_to_bytecode(
+      binary("*", col("price"), col("quantity")),
+      scope, column_to_input, constants);
+  ASSERT_TRUE(result.success);
+  // INPUT(price=0), INPUT(quantity=1), MUL, END
+  std::vector<double> expected = {0, 0, 0, 1, 4, 20};
+  ASSERT_EQ(result.bytecode.size(), expected.size());
+  for (size_t i = 0; i < expected.size(); i++) {
+    EXPECT_EQ(result.bytecode[i], expected[i]) << "at index " << i;
+  }
+  EXPECT_EQ(column_to_input.size(), 2u);
+}
+
+// Column deduplication: same column referenced twice shares input index
+TEST_F(BytecodeTest, ColumnDeduplication) {
+  // price * price → INPUT 0 INPUT 0 MUL END
+  auto result = compile_expression_to_bytecode(
+      binary("*", col("price"), col("price")),
+      scope, column_to_input, constants);
+  ASSERT_TRUE(result.success);
+  std::vector<double> expected = {0, 0, 0, 0, 4, 20};
+  ASSERT_EQ(result.bytecode.size(), expected.size());
+  for (size_t i = 0; i < expected.size(); i++) {
+    EXPECT_EQ(result.bytecode[i], expected[i]) << "at index " << i;
+  }
+  EXPECT_EQ(column_to_input.size(), 1u);  // only one unique column
+}
+
+// POWER(price, 2) → INPUT 0 CONST 0 POW END
+TEST_F(BytecodeTest, PowerFunction) {
+  auto result = compile_expression_to_bytecode(
+      func2("POWER", col("price"), num(2.0)),
+      scope, column_to_input, constants);
+  ASSERT_TRUE(result.success);
+  std::vector<double> expected = {0, 0, 1, 0, 6, 20};
+  ASSERT_EQ(result.bytecode.size(), expected.size());
+  for (size_t i = 0; i < expected.size(); i++) {
+    EXPECT_EQ(result.bytecode[i], expected[i]) << "at index " << i;
+  }
+  ASSERT_EQ(constants.size(), 1u);
+  EXPECT_EQ(constants[0], 2.0);
+}
+
+// ABS(price) → INPUT 0 ABS END
+TEST_F(BytecodeTest, UnaryMathFunction) {
+  auto result = compile_expression_to_bytecode(
+      func("ABS", col("price")),
+      scope, column_to_input, constants);
+  ASSERT_TRUE(result.success);
+  std::vector<double> expected = {0, 0, 7, 20};
+  ASSERT_EQ(result.bytecode.size(), expected.size());
+  for (size_t i = 0; i < expected.size(); i++) {
+    EXPECT_EQ(result.bytecode[i], expected[i]) << "at index " << i;
+  }
+}
+
+// SQRT(price) → INPUT 0 SQRT END
+TEST_F(BytecodeTest, SqrtFunction) {
+  auto result = compile_expression_to_bytecode(
+      func("SQRT", col("price")),
+      scope, column_to_input, constants);
+  ASSERT_TRUE(result.success);
+  std::vector<double> expected = {0, 0, 8, 20};
+  ASSERT_EQ(result.bytecode.size(), expected.size());
+  for (size_t i = 0; i < expected.size(); i++) {
+    EXPECT_EQ(result.bytecode[i], expected[i]) << "at index " << i;
+  }
+}
+
+// Aggregate function → not fusable
+TEST_F(BytecodeTest, AggregateFunctionNotFusable) {
+  auto result = compile_expression_to_bytecode(
+      func("SUM", col("price")),
+      scope, column_to_input, constants);
+  EXPECT_FALSE(result.success);
+}
+
+// CASE expression → not fusable
+TEST_F(BytecodeTest, CaseExprNotFusable) {
+  auto expr = case_when(
+      cmp(">", col("price"), num(100.0)),
+      col("price"),
+      num(0.0));
+  auto result = compile_expression_to_bytecode(
+      std::move(expr), scope, column_to_input, constants);
+  EXPECT_FALSE(result.success);
+}
+
+// TIMESHIFT → not fusable
+TEST_F(BytecodeTest, TimeShiftNotFusable) {
+  auto result = compile_expression_to_bytecode(
+      func2("TIMESHIFT", col("price"), num(-1000.0)),
+      scope, column_to_input, constants);
+  EXPECT_FALSE(result.success);
+}
+
+// Complex expression: POWER(price - quantity * quantity, 0.5)
+// → INPUT(price) INPUT(qty) INPUT(qty) MUL SUB CONST(0.5) POW END
+TEST_F(BytecodeTest, ComplexExpressionBytecode) {
+  auto expr = func2("POWER",
+      binary("-", col("price"),
+             binary("*", col("quantity"), col("quantity"))),
+      num(0.5));
+  auto result = compile_expression_to_bytecode(
+      std::move(expr), scope, column_to_input, constants);
+  ASSERT_TRUE(result.success);
+  // INPUT 0(price), INPUT 1(qty), INPUT 1(qty), MUL, SUB, CONST 0(0.5), POW, END
+  std::vector<double> expected = {0, 0, 0, 1, 0, 1, 4, 3, 1, 0, 6, 20};
+  ASSERT_EQ(result.bytecode.size(), expected.size());
+  for (size_t i = 0; i < expected.size(); i++) {
+    EXPECT_EQ(result.bytecode[i], expected[i]) << "at index " << i;
+  }
+  EXPECT_EQ(column_to_input.size(), 2u);
+  ASSERT_EQ(constants.size(), 1u);
+  EXPECT_EQ(constants[0], 0.5);
+}
+
+// Shared state across multiple expressions (column_to_input and constants persist)
+TEST_F(BytecodeTest, SharedStateAcrossExpressions) {
+  // First expression: price + 1.0
+  auto r1 = compile_expression_to_bytecode(
+      binary("+", col("price"), num(1.0)),
+      scope, column_to_input, constants);
+  ASSERT_TRUE(r1.success);
+  EXPECT_EQ(column_to_input.size(), 1u);
+  EXPECT_EQ(constants.size(), 1u);
+
+  // Second expression: quantity * 2.0 (quantity is new column, 2.0 is new constant)
+  auto r2 = compile_expression_to_bytecode(
+      binary("*", col("quantity"), num(2.0)),
+      scope, column_to_input, constants);
+  ASSERT_TRUE(r2.success);
+  EXPECT_EQ(column_to_input.size(), 2u);  // price + quantity
+  EXPECT_EQ(constants.size(), 2u);         // 1.0 + 2.0
+
+  // Second expression should use input index 1 for quantity and const index 1 for 2.0
+  std::vector<double> expected_r2 = {0, 1, 1, 1, 4, 20};
+  ASSERT_EQ(r2.bytecode.size(), expected_r2.size());
+  for (size_t i = 0; i < expected_r2.size(); i++) {
+    EXPECT_EQ(r2.bytecode[i], expected_r2[i]) << "at index " << i;
+  }
+}
+
 }  // namespace
 }  // namespace rtbot_sql::compiler
