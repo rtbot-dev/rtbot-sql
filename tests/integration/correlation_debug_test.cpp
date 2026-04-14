@@ -31,7 +31,7 @@ class CorrelationDebugTest : public ::testing::Test {
           auto* vec_msg = dynamic_cast<rtbot::Message<rtbot::VectorNumberData>*>(
               msgs[0].get());
           if (vec_msg) {
-            return vec_msg->data.values;
+            return *vec_msg->data.values;
           }
         }
       }
