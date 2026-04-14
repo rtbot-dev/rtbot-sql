@@ -132,6 +132,7 @@ struct Config {
   int bursts = 300;
   int progress_every = 10;
   bool pure_cpp = false;
+  bool batch = false;
   std::vector<std::string> presets = {
       "01_rms",
       "02_kurtosis",
@@ -200,6 +201,8 @@ void print_help(const char* argv0) {
       << "                          Available: 01_rms,02_kurtosis,04_crest,05_dashboard\n"
       << "  --pure-cpp              Skip rtbot SQL and compute burst metrics in pure C++\n"
       << "                          (upper bound for this hardware; ignores --presets)\n"
+      << "  --batch                 Feed the base program one burst per receive_batch\n"
+      << "                          call (batched propagation; amortizes scheduling)\n"
       << "  --list-presets          Print available preset IDs and exit\n"
       << "  --help                  Show this message\n\n"
       << "Example:\n"
@@ -283,6 +286,11 @@ Config parse_args(int argc, char** argv) {
 
     if (arg == "--pure-cpp") {
       cfg.pure_cpp = true;
+      continue;
+    }
+
+    if (arg == "--batch") {
+      cfg.batch = true;
       continue;
     }
 
@@ -657,16 +665,44 @@ int main(int argc, char** argv) {
       dispatch_base_batch(batch);
     };
 
+    // In batch mode we accumulate a full burst (all amplitude samples plus the
+    // sentinel) into a per-port message buffer and feed it to the base program
+    // as a single receive_batch call. Semantically equivalent to feeding
+    // messages one at a time because sync_data_inputs is state-preserving and
+    // monotone-per-port is preserved by appending a sorted vector.
+    auto feed_burst_batched = [&](int bearing) {
+      std::map<std::string, std::vector<std::unique_ptr<rtbot::BaseMessage>>> burst_buffer;
+      auto& port = burst_buffer["i1"];
+      port.reserve(static_cast<std::size_t>(cfg.samples_per_burst) + 1);
+      for (int sample = 0; sample < cfg.samples_per_burst; ++sample) {
+        port.push_back(make_vector_message(
+            timestamp + sample,
+            {static_cast<double>(bearing), 1.0, synthetic_amplitude(sample)}));
+      }
+      // Sentinel closes the current burst key (ABS(amplitude) > 0).
+      port.push_back(make_vector_message(
+          timestamp + cfg.samples_per_burst,
+          {static_cast<double>(bearing), 1.0, 0.0}));
+
+      ingress_messages += port.size();
+      ++program_receive_calls;  // one batched call per burst
+      auto batch = base_program.receive_batch(burst_buffer);
+      dispatch_base_batch(batch);
+    };
+
     for (int burst = 1; burst <= cfg.bursts; ++burst) {
       for (int bearing = 1; bearing <= cfg.bearings; ++bearing) {
-        for (int sample = 0; sample < cfg.samples_per_burst; ++sample) {
-          feed_raw(static_cast<double>(bearing), 1.0, synthetic_amplitude(sample),
-                   timestamp + sample);
+        if (cfg.batch) {
+          feed_burst_batched(bearing);
+        } else {
+          for (int sample = 0; sample < cfg.samples_per_burst; ++sample) {
+            feed_raw(static_cast<double>(bearing), 1.0, synthetic_amplitude(sample),
+                     timestamp + sample);
+          }
+          // Sentinel closes the current burst key (ABS(amplitude) > 0).
+          feed_raw(static_cast<double>(bearing), 1.0, 0.0,
+                   timestamp + cfg.samples_per_burst);
         }
-
-        // Sentinel closes the current burst key (ABS(amplitude) > 0).
-        feed_raw(static_cast<double>(bearing), 1.0, 0.0,
-                 timestamp + cfg.samples_per_burst);
         timestamp += cfg.samples_per_burst + 100;
       }
 
