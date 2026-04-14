@@ -128,7 +128,70 @@ SelectResult compile_select_projection(
     return {{proj_id, "o1"}, field_map};
   }
 
-  // Mixed: compile each item, compose with VectorCompose
+  // --- Attempt fused expression path ---
+  // Try to compile all SELECT items into bytecode for a single FusedExpression.
+  {
+    std::map<std::pair<std::string, int>, int> column_to_input;
+    std::vector<double> constants;
+    std::vector<double> all_bytecode;
+    FieldMap field_map;
+    bool all_fusable = true;
+
+    for (size_t i = 0; i < select_list.size(); ++i) {
+      auto bc = compile_expression_to_bytecode(
+          select_list[i].expr, scope, column_to_input, constants,
+          source_endpoints);
+      if (!bc.success) {
+        all_fusable = false;
+        break;
+      }
+      all_bytecode.insert(all_bytecode.end(), bc.bytecode.begin(),
+                          bc.bytecode.end());
+      std::string alias =
+          select_list[i].alias.value_or(default_alias(select_list[i].expr));
+      field_map[alias] = static_cast<int>(i);
+    }
+
+    if (all_fusable && !column_to_input.empty()) {
+      // Emit VectorExtract per unique input column
+      size_t num_inputs = column_to_input.size();
+      std::vector<Endpoint> extract_endpoints(num_inputs);
+
+      for (const auto& [col_key, input_idx] : column_to_input) {
+        const auto& [stream_name, col_index] = col_key;
+        Endpoint source_ep = input_endpoint;
+        if (source_endpoints) {
+          auto it = source_endpoints->find(stream_name);
+          if (it != source_endpoints->end()) {
+            source_ep = it->second;
+          }
+        }
+        auto ext_id = builder.next_id("ext");
+        builder.add_operator(ext_id, "VectorExtract",
+                             {{"index", static_cast<double>(col_index)}});
+        builder.connect(source_ep, {ext_id, "i1"});
+        extract_endpoints[input_idx] = {ext_id, "o1"};
+      }
+
+      // Emit single FusedExpression operator
+      auto fused_id = builder.next_id("fused");
+      builder.add_operator(
+          fused_id, "FusedExpression",
+          {{"numPorts", static_cast<double>(num_inputs)},
+           {"numOutputs", static_cast<double>(select_list.size())}},
+          {},  // no string params
+          {{"bytecode", all_bytecode}, {"constants", constants}});
+
+      for (size_t i = 0; i < num_inputs; ++i) {
+        builder.connect(extract_endpoints[i],
+                        {fused_id, "i" + std::to_string(i + 1)});
+      }
+
+      return {{fused_id, "o1"}, field_map};
+    }
+  }
+
+  // --- Fallback: compile each item as operator chains, compose with VectorCompose ---
   std::vector<Endpoint> endpoints;
   FieldMap field_map;
 
