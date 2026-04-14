@@ -54,22 +54,28 @@ std::vector<RuntimeOutputMessage> decode_batch(
         if (auto* vec =
                 dynamic_cast<rtbot::Message<rtbot::VectorNumberData>*>(
                     message.get())) {
-          out.push_back({static_cast<std::uint64_t>(vec->time),
-                         vec->data.values,
-                         operator_id,
-                         port});
+          RuntimeOutputMessage msg{};
+          msg.timestamp = static_cast<std::uint64_t>(vec->time);
+          if (vec->data.values) {
+            msg.values = *vec->data.values;
+          } else {
+            msg.values.clear();
+          }
+          msg.operator_id = operator_id;
+          msg.port = port;
+          out.push_back(msg);
           continue;
         }
 
         if (auto* num =
                 dynamic_cast<rtbot::Message<rtbot::NumberData>*>(
                     message.get())) {
-          out.push_back({
-              static_cast<std::uint64_t>(num->time),
-              {num->data.value},
-              operator_id,
-              port,
-          });
+          RuntimeOutputMessage msg{};
+          msg.timestamp = static_cast<std::uint64_t>(num->time);
+          msg.values = {num->data.value};
+          msg.operator_id = operator_id;
+          msg.port = port;
+          out.push_back(msg);
         }
       }
     }
