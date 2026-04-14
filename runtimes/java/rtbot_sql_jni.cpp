@@ -1,6 +1,8 @@
 #include <jni.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -18,6 +20,111 @@ using json = nlohmann::json;
 using namespace rtbot_sql;
 
 namespace {
+
+struct NativeFeedStats {
+  std::atomic<std::uint64_t> calls{0};
+  std::atomic<std::uint64_t> input_values{0};
+  std::atomic<std::uint64_t> total_ns{0};
+  std::atomic<std::uint64_t> values_copy_ns{0};
+  std::atomic<std::uint64_t> port_decode_ns{0};
+  std::atomic<std::uint64_t> message_build_ns{0};
+  std::atomic<std::uint64_t> receive_ns{0};
+  std::atomic<std::uint64_t> json_serialize_ns{0};
+  std::atomic<std::uint64_t> jstring_ns{0};
+  std::atomic<std::uint64_t> output_messages{0};
+  std::atomic<std::uint64_t> output_values{0};
+};
+
+NativeFeedStats g_native_feed_stats;
+std::atomic<bool> g_native_feed_stats_enabled{false};
+
+std::uint64_t now_ns() {
+  return static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
+
+void reset_native_feed_stats() {
+  g_native_feed_stats.calls.store(0, std::memory_order_relaxed);
+  g_native_feed_stats.input_values.store(0, std::memory_order_relaxed);
+  g_native_feed_stats.total_ns.store(0, std::memory_order_relaxed);
+  g_native_feed_stats.values_copy_ns.store(0, std::memory_order_relaxed);
+  g_native_feed_stats.port_decode_ns.store(0, std::memory_order_relaxed);
+  g_native_feed_stats.message_build_ns.store(0, std::memory_order_relaxed);
+  g_native_feed_stats.receive_ns.store(0, std::memory_order_relaxed);
+  g_native_feed_stats.json_serialize_ns.store(0, std::memory_order_relaxed);
+  g_native_feed_stats.jstring_ns.store(0, std::memory_order_relaxed);
+  g_native_feed_stats.output_messages.store(0, std::memory_order_relaxed);
+  g_native_feed_stats.output_values.store(0, std::memory_order_relaxed);
+}
+
+json native_feed_stats_to_json() {
+  return {
+      {"native_feed_calls",
+       g_native_feed_stats.calls.load(std::memory_order_relaxed)},
+      {"native_input_values",
+       g_native_feed_stats.input_values.load(std::memory_order_relaxed)},
+      {"native_total_ns",
+       g_native_feed_stats.total_ns.load(std::memory_order_relaxed)},
+      {"native_values_copy_ns",
+       g_native_feed_stats.values_copy_ns.load(std::memory_order_relaxed)},
+      {"native_port_decode_ns",
+       g_native_feed_stats.port_decode_ns.load(std::memory_order_relaxed)},
+      {"native_message_build_ns",
+       g_native_feed_stats.message_build_ns.load(std::memory_order_relaxed)},
+      {"native_receive_ns",
+       g_native_feed_stats.receive_ns.load(std::memory_order_relaxed)},
+      {"native_json_serialize_ns",
+       g_native_feed_stats.json_serialize_ns.load(std::memory_order_relaxed)},
+      {"native_jstring_ns",
+       g_native_feed_stats.jstring_ns.load(std::memory_order_relaxed)},
+      {"native_output_messages",
+       g_native_feed_stats.output_messages.load(std::memory_order_relaxed)},
+      {"native_output_values",
+       g_native_feed_stats.output_values.load(std::memory_order_relaxed)},
+  };
+}
+
+struct BatchStats {
+  std::uint64_t messages = 0;
+  std::uint64_t values = 0;
+};
+
+BatchStats count_batch_stats(const rtbot::ProgramMsgBatch& batch) {
+  BatchStats stats{};
+  for (const auto& [operator_id, operator_batch] : batch) {
+    (void)operator_id;
+    for (const auto& [port, messages] : operator_batch) {
+      (void)port;
+      for (const auto& message : messages) {
+        ++stats.messages;
+        if (auto* vec = dynamic_cast<rtbot::Message<rtbot::VectorNumberData>*>(
+                message.get())) {
+          if (vec->data.values) {
+            stats.values += static_cast<std::uint64_t>(vec->data.values->size());
+          }
+        } else if (dynamic_cast<rtbot::Message<rtbot::NumberData>*>(
+                       message.get()) != nullptr) {
+          ++stats.values;
+        }
+      }
+    }
+  }
+  return stats;
+}
+
+bool is_batch_empty(const rtbot::ProgramMsgBatch& batch) {
+  if (batch.empty()) return true;
+  for (const auto& [operator_id, operator_batch] : batch) {
+    (void)operator_id;
+    for (const auto& [port, messages] : operator_batch) {
+      (void)port;
+      if (!messages.empty()) return false;
+    }
+  }
+  return true;
+}
 
 // ---------------------------------------------------------------------------
 // JNI Helpers (pattern from rtbot/libs/wrappers/java/rtbot_jni.cpp)
@@ -297,22 +404,28 @@ std::string batch_to_json(const rtbot::ProgramMsgBatch& batch) {
         if (auto* vec =
                 dynamic_cast<rtbot::Message<rtbot::VectorNumberData>*>(
                     message.get())) {
-          out.push_back({static_cast<std::uint64_t>(vec->time),
-                         vec->data.values,
-                         operator_id,
-                         port});
+          OutputMsg msg{};
+          msg.timestamp = static_cast<std::uint64_t>(vec->time);
+          if (vec->data.values) {
+            msg.values = *vec->data.values;
+          } else {
+            msg.values.clear();
+          }
+          msg.operator_id = operator_id;
+          msg.port = port;
+          out.push_back(msg);
           continue;
         }
 
         if (auto* num =
                 dynamic_cast<rtbot::Message<rtbot::NumberData>*>(
                     message.get())) {
-          out.push_back({
-              static_cast<std::uint64_t>(num->time),
-              {num->data.value},
-              operator_id,
-              port,
-          });
+          OutputMsg msg{};
+          msg.timestamp = static_cast<std::uint64_t>(num->time);
+          msg.values = {num->data.value};
+          msg.operator_id = operator_id;
+          msg.port = port;
+          out.push_back(msg);
         }
       }
     }
@@ -441,6 +554,9 @@ Java_dev_rtbot_sql_RtBotSqlCompiler_feedPipeline(JNIEnv* env, jclass,
                                                   jdoubleArray values,
                                                   jstring port) {
   try {
+    const bool profile =
+        g_native_feed_stats_enabled.load(std::memory_order_relaxed);
+    const std::uint64_t t0 = profile ? now_ns() : 0;
     auto* program = reinterpret_cast<rtbot::Program*>(handle);
     if (!program) {
       throw_runtime_exception(env, "feedPipeline: null pipeline handle");
@@ -452,18 +568,289 @@ Java_dev_rtbot_sql_RtBotSqlCompiler_feedPipeline(JNIEnv* env, jclass,
     jdouble* elems = env->GetDoubleArrayElements(values, nullptr);
     std::vector<double> values_vec(elems, elems + len);
     env->ReleaseDoubleArrayElements(values, elems, JNI_ABORT);
+    const std::uint64_t t_after_values = profile ? now_ns() : 0;
 
     std::string port_string = jstring_to_std(env, port);
+    const std::uint64_t t_after_port = profile ? now_ns() : 0;
 
     auto msg = rtbot::create_message<rtbot::VectorNumberData>(
         static_cast<rtbot::timestamp_t>(timestamp),
         rtbot::VectorNumberData{values_vec});
+    const std::uint64_t t_after_msg = profile ? now_ns() : 0;
 
     auto batch = program->receive(std::move(msg), port_string);
-    return std_to_jstring(env, batch_to_json(batch));
+    const std::uint64_t t_after_receive = profile ? now_ns() : 0;
+    if (is_batch_empty(batch)) {
+      if (profile) {
+        const std::uint64_t t_end = now_ns();
+        g_native_feed_stats.calls.fetch_add(1, std::memory_order_relaxed);
+        g_native_feed_stats.input_values.fetch_add(
+            static_cast<std::uint64_t>(len), std::memory_order_relaxed);
+        g_native_feed_stats.total_ns.fetch_add(t_end - t0,
+                                               std::memory_order_relaxed);
+        g_native_feed_stats.values_copy_ns.fetch_add(
+            t_after_values - t0, std::memory_order_relaxed);
+        g_native_feed_stats.port_decode_ns.fetch_add(
+            t_after_port - t_after_values, std::memory_order_relaxed);
+        g_native_feed_stats.message_build_ns.fetch_add(
+            t_after_msg - t_after_port, std::memory_order_relaxed);
+        g_native_feed_stats.receive_ns.fetch_add(
+            t_after_receive - t_after_msg, std::memory_order_relaxed);
+      }
+      return nullptr;
+    }
+
+    std::string json_out = batch_to_json(batch);
+    const std::uint64_t t_after_json = profile ? now_ns() : 0;
+    jstring out = std_to_jstring(env, json_out);
+    if (profile) {
+      const std::uint64_t t_end = now_ns();
+      BatchStats batch_stats = count_batch_stats(batch);
+      g_native_feed_stats.calls.fetch_add(1, std::memory_order_relaxed);
+      g_native_feed_stats.input_values.fetch_add(
+          static_cast<std::uint64_t>(len), std::memory_order_relaxed);
+      g_native_feed_stats.total_ns.fetch_add(t_end - t0,
+                                             std::memory_order_relaxed);
+      g_native_feed_stats.values_copy_ns.fetch_add(
+          t_after_values - t0, std::memory_order_relaxed);
+      g_native_feed_stats.port_decode_ns.fetch_add(
+          t_after_port - t_after_values, std::memory_order_relaxed);
+      g_native_feed_stats.message_build_ns.fetch_add(
+          t_after_msg - t_after_port, std::memory_order_relaxed);
+      g_native_feed_stats.receive_ns.fetch_add(
+          t_after_receive - t_after_msg, std::memory_order_relaxed);
+      g_native_feed_stats.json_serialize_ns.fetch_add(
+          t_after_json - t_after_receive, std::memory_order_relaxed);
+      g_native_feed_stats.jstring_ns.fetch_add(
+          t_end - t_after_json, std::memory_order_relaxed);
+      g_native_feed_stats.output_messages.fetch_add(
+          batch_stats.messages, std::memory_order_relaxed);
+      g_native_feed_stats.output_values.fetch_add(
+          batch_stats.values, std::memory_order_relaxed);
+    }
+
+    return out;
   } catch (const std::exception& e) {
     throw_runtime_exception(
         env, std::string("feedPipeline: ") + e.what());
+    return nullptr;
+  }
+}
+
+JNIEXPORT jstring JNICALL
+Java_dev_rtbot_sql_RtBotSqlCompiler_feedPipeline3(JNIEnv* env, jclass,
+                                                   jlong handle,
+                                                   jlong timestamp,
+                                                   jdouble v0,
+                                                   jdouble v1,
+                                                   jdouble v2,
+                                                   jstring port) {
+  try {
+    const bool profile =
+        g_native_feed_stats_enabled.load(std::memory_order_relaxed);
+    const std::uint64_t t0 = profile ? now_ns() : 0;
+    auto* program = reinterpret_cast<rtbot::Program*>(handle);
+    if (!program) {
+      throw_runtime_exception(env, "feedPipeline3: null pipeline handle");
+      return nullptr;
+    }
+
+    std::vector<double> values_vec;
+    values_vec.reserve(3);
+    values_vec.push_back(static_cast<double>(v0));
+    values_vec.push_back(static_cast<double>(v1));
+    values_vec.push_back(static_cast<double>(v2));
+    const std::uint64_t t_after_values = profile ? now_ns() : 0;
+
+    std::string port_string = jstring_to_std(env, port);
+    const std::uint64_t t_after_port = profile ? now_ns() : 0;
+
+    auto msg = rtbot::create_message<rtbot::VectorNumberData>(
+        static_cast<rtbot::timestamp_t>(timestamp),
+        rtbot::VectorNumberData{values_vec});
+    const std::uint64_t t_after_msg = profile ? now_ns() : 0;
+
+    auto batch = program->receive(std::move(msg), port_string);
+    const std::uint64_t t_after_receive = profile ? now_ns() : 0;
+    if (is_batch_empty(batch)) {
+      if (profile) {
+        const std::uint64_t t_end = now_ns();
+        g_native_feed_stats.calls.fetch_add(1, std::memory_order_relaxed);
+        g_native_feed_stats.input_values.fetch_add(
+            3, std::memory_order_relaxed);
+        g_native_feed_stats.total_ns.fetch_add(t_end - t0,
+                                               std::memory_order_relaxed);
+        g_native_feed_stats.values_copy_ns.fetch_add(
+            t_after_values - t0, std::memory_order_relaxed);
+        g_native_feed_stats.port_decode_ns.fetch_add(
+            t_after_port - t_after_values, std::memory_order_relaxed);
+        g_native_feed_stats.message_build_ns.fetch_add(
+            t_after_msg - t_after_port, std::memory_order_relaxed);
+        g_native_feed_stats.receive_ns.fetch_add(
+            t_after_receive - t_after_msg, std::memory_order_relaxed);
+      }
+      return nullptr;
+    }
+
+    std::string json_out = batch_to_json(batch);
+    const std::uint64_t t_after_json = profile ? now_ns() : 0;
+    jstring out = std_to_jstring(env, json_out);
+    if (profile) {
+      const std::uint64_t t_end = now_ns();
+      BatchStats batch_stats = count_batch_stats(batch);
+      g_native_feed_stats.calls.fetch_add(1, std::memory_order_relaxed);
+      g_native_feed_stats.input_values.fetch_add(
+          3, std::memory_order_relaxed);
+      g_native_feed_stats.total_ns.fetch_add(t_end - t0,
+                                             std::memory_order_relaxed);
+      g_native_feed_stats.values_copy_ns.fetch_add(
+          t_after_values - t0, std::memory_order_relaxed);
+      g_native_feed_stats.port_decode_ns.fetch_add(
+          t_after_port - t_after_values, std::memory_order_relaxed);
+      g_native_feed_stats.message_build_ns.fetch_add(
+          t_after_msg - t_after_port, std::memory_order_relaxed);
+      g_native_feed_stats.receive_ns.fetch_add(
+          t_after_receive - t_after_msg, std::memory_order_relaxed);
+      g_native_feed_stats.json_serialize_ns.fetch_add(
+          t_after_json - t_after_receive, std::memory_order_relaxed);
+      g_native_feed_stats.jstring_ns.fetch_add(
+          t_end - t_after_json, std::memory_order_relaxed);
+      g_native_feed_stats.output_messages.fetch_add(
+          batch_stats.messages, std::memory_order_relaxed);
+      g_native_feed_stats.output_values.fetch_add(
+          batch_stats.values, std::memory_order_relaxed);
+    }
+
+    return out;
+  } catch (const std::exception& e) {
+    throw_runtime_exception(
+        env, std::string("feedPipeline3: ") + e.what());
+    return nullptr;
+  }
+}
+
+JNIEXPORT jstring JNICALL
+Java_dev_rtbot_sql_RtBotSqlCompiler_feedPipeline3I1(JNIEnv* env, jclass,
+                                                     jlong handle,
+                                                     jlong timestamp,
+                                                     jdouble v0,
+                                                     jdouble v1,
+                                                     jdouble v2) {
+  try {
+    const bool profile =
+        g_native_feed_stats_enabled.load(std::memory_order_relaxed);
+    const std::uint64_t t0 = profile ? now_ns() : 0;
+    auto* program = reinterpret_cast<rtbot::Program*>(handle);
+    if (!program) {
+      throw_runtime_exception(env, "feedPipeline3I1: null pipeline handle");
+      return nullptr;
+    }
+
+    std::vector<double> values_vec;
+    values_vec.reserve(3);
+    values_vec.push_back(static_cast<double>(v0));
+    values_vec.push_back(static_cast<double>(v1));
+    values_vec.push_back(static_cast<double>(v2));
+    const std::uint64_t t_after_values = profile ? now_ns() : 0;
+
+    const std::string port_string = "i1";
+    const std::uint64_t t_after_port = profile ? now_ns() : 0;
+
+    auto msg = rtbot::create_message<rtbot::VectorNumberData>(
+        static_cast<rtbot::timestamp_t>(timestamp),
+        rtbot::VectorNumberData{values_vec});
+    const std::uint64_t t_after_msg = profile ? now_ns() : 0;
+
+    auto batch = program->receive(std::move(msg), port_string);
+    const std::uint64_t t_after_receive = profile ? now_ns() : 0;
+    if (is_batch_empty(batch)) {
+      if (profile) {
+        const std::uint64_t t_end = now_ns();
+        g_native_feed_stats.calls.fetch_add(1, std::memory_order_relaxed);
+        g_native_feed_stats.input_values.fetch_add(
+            3, std::memory_order_relaxed);
+        g_native_feed_stats.total_ns.fetch_add(t_end - t0,
+                                               std::memory_order_relaxed);
+        g_native_feed_stats.values_copy_ns.fetch_add(
+            t_after_values - t0, std::memory_order_relaxed);
+        g_native_feed_stats.port_decode_ns.fetch_add(
+            t_after_port - t_after_values, std::memory_order_relaxed);
+        g_native_feed_stats.message_build_ns.fetch_add(
+            t_after_msg - t_after_port, std::memory_order_relaxed);
+        g_native_feed_stats.receive_ns.fetch_add(
+            t_after_receive - t_after_msg, std::memory_order_relaxed);
+      }
+      return nullptr;
+    }
+
+    std::string json_out = batch_to_json(batch);
+    const std::uint64_t t_after_json = profile ? now_ns() : 0;
+    jstring out = std_to_jstring(env, json_out);
+    if (profile) {
+      const std::uint64_t t_end = now_ns();
+      BatchStats batch_stats = count_batch_stats(batch);
+      g_native_feed_stats.calls.fetch_add(1, std::memory_order_relaxed);
+      g_native_feed_stats.input_values.fetch_add(
+          3, std::memory_order_relaxed);
+      g_native_feed_stats.total_ns.fetch_add(t_end - t0,
+                                             std::memory_order_relaxed);
+      g_native_feed_stats.values_copy_ns.fetch_add(
+          t_after_values - t0, std::memory_order_relaxed);
+      g_native_feed_stats.port_decode_ns.fetch_add(
+          t_after_port - t_after_values, std::memory_order_relaxed);
+      g_native_feed_stats.message_build_ns.fetch_add(
+          t_after_msg - t_after_port, std::memory_order_relaxed);
+      g_native_feed_stats.receive_ns.fetch_add(
+          t_after_receive - t_after_msg, std::memory_order_relaxed);
+      g_native_feed_stats.json_serialize_ns.fetch_add(
+          t_after_json - t_after_receive, std::memory_order_relaxed);
+      g_native_feed_stats.jstring_ns.fetch_add(
+          t_end - t_after_json, std::memory_order_relaxed);
+      g_native_feed_stats.output_messages.fetch_add(
+          batch_stats.messages, std::memory_order_relaxed);
+      g_native_feed_stats.output_values.fetch_add(
+          batch_stats.values, std::memory_order_relaxed);
+    }
+    return out;
+  } catch (const std::exception& e) {
+    throw_runtime_exception(
+        env, std::string("feedPipeline3I1: ") + e.what());
+    return nullptr;
+  }
+}
+
+JNIEXPORT void JNICALL
+Java_dev_rtbot_sql_RtBotSqlCompiler_resetNativeFeedStats(JNIEnv* env,
+                                                          jclass) {
+  try {
+    reset_native_feed_stats();
+  } catch (const std::exception& e) {
+    throw_runtime_exception(
+        env, std::string("resetNativeFeedStats: ") + e.what());
+  }
+}
+
+JNIEXPORT void JNICALL
+Java_dev_rtbot_sql_RtBotSqlCompiler_setNativeFeedStatsEnabled(JNIEnv* env,
+                                                               jclass,
+                                                               jboolean enabled) {
+  try {
+    g_native_feed_stats_enabled.store(enabled == JNI_TRUE,
+                                      std::memory_order_relaxed);
+  } catch (const std::exception& e) {
+    throw_runtime_exception(
+        env, std::string("setNativeFeedStatsEnabled: ") + e.what());
+  }
+}
+
+JNIEXPORT jstring JNICALL
+Java_dev_rtbot_sql_RtBotSqlCompiler_getNativeFeedStatsJson(JNIEnv* env,
+                                                            jclass) {
+  try {
+    return std_to_jstring(env, native_feed_stats_to_json().dump());
+  } catch (const std::exception& e) {
+    throw_runtime_exception(
+        env, std::string("getNativeFeedStatsJson: ") + e.what());
     return nullptr;
   }
 }

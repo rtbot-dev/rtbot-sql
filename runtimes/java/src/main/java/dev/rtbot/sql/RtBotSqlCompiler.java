@@ -93,6 +93,37 @@ public final class RtBotSqlCompiler {
     public static native String feedPipeline(long handle, long timestamp, double[] values, String port);
 
     /**
+     * Feed a single 3-value message into a pipeline (hot-path overload).
+     *
+     * <p>Avoids array marshalling overhead on the JVM/JNI boundary for the
+     * common 3-column ingest case (device_id, channel_id, amplitude).
+     */
+    public static native String feedPipeline3(long handle, long timestamp,
+                                              double v0, double v1, double v2,
+                                              String port);
+
+    /**
+     * Hot-path overload for 3-value messages on default input port "i1".
+     */
+    public static native String feedPipeline3I1(long handle, long timestamp,
+                                                double v0, double v1, double v2);
+
+    /**
+     * Reset cumulative native feed-path profiling counters.
+     */
+    public static native void resetNativeFeedStats();
+
+    /**
+     * Enable or disable native feed-path profiling counters.
+     */
+    public static native void setNativeFeedStatsEnabled(boolean enabled);
+
+    /**
+     * Return native feed-path profiling counters as JSON object.
+     */
+    public static native String getNativeFeedStatsJson();
+
+    /**
      * Destroy a native pipeline and free all associated resources.
      *
      * @param handle native pipeline handle

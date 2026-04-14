@@ -222,6 +222,49 @@ public class RtBotSqlRuntime {
         appendAndPropagate(streamName, timestamp, payload);
     }
 
+    /**
+     * Optimized insert path for common 3-column numeric streams.
+     *
+     * <p>Skips per-message list/boxing allocations when collect mode is off
+     * and there is no direct subscriber on the source stream.
+     */
+    public void insert3(String streamName, long timestamp,
+                        double v0, double v1, double v2) {
+        StreamSchema schema = catalog.lookupStream(streamName);
+        if (schema == null) {
+            throw new SqlError("Unknown stream: " + streamName);
+        }
+        if (schema.columns != null && !schema.columns.isEmpty()
+                && schema.columns.size() != 3) {
+            throw new SqlError("insert3 requires 3 columns for " + streamName
+                    + ", found " + schema.columns.size());
+        }
+
+        // Fallback when source stream needs direct materialization/callback.
+        if (collectMode || subscriptions.containsKey(streamName)) {
+            insert(streamName, timestamp, java.util.Arrays.asList(v0, v1, v2));
+            return;
+        }
+
+        Set<String> dependents = dependencies.get(streamName);
+        if (dependents == null) {
+            return;
+        }
+
+        for (String dependent : dependents) {
+            String pipelineId = viewPipelines.get(dependent);
+            if (pipelineId == null) continue;
+            Map<String, String> portMap =
+                    viewPortMaps.getOrDefault(dependent, Collections.emptyMap());
+            String port = portMap.getOrDefault(streamName, "i1");
+            List<OutputMessage> outputs = runner.feed3(
+                    pipelineId, timestamp, v0, v1, v2, port);
+            for (OutputMessage out : outputs) {
+                appendAndPropagate(dependent, out.timestamp, out.values);
+            }
+        }
+    }
+
     // =================================================================
     // Subscription API
     // =================================================================
@@ -305,6 +348,28 @@ public class RtBotSqlRuntime {
      */
     public boolean isCollectMode() {
         return collectMode;
+    }
+
+    /**
+     * Reset feed-path performance counters in both Java and native layers.
+     */
+    public void resetPerfStats() {
+        runner.setPerfStatsEnabled(true);
+        RtBotSqlCompiler.setNativeFeedStatsEnabled(true);
+        runner.resetPerfStats();
+        RtBotSqlCompiler.resetNativeFeedStats();
+    }
+
+    /**
+     * Snapshot feed-path performance counters for Java + native execution.
+     *
+     * @return map of cumulative counters in nanoseconds / counts
+     */
+    public Map<String, Long> getPerfStats() {
+        Map<String, Long> stats = new LinkedHashMap<>();
+        stats.putAll(runner.snapshotPerfStats());
+        stats.putAll(parseLongCountersJson(RtBotSqlCompiler.getNativeFeedStatsJson()));
+        return stats;
     }
 
     // =================================================================
@@ -690,7 +755,7 @@ public class RtBotSqlRuntime {
         // Propagate to all dependent views
         Set<String> dependents = dependencies.get(streamName);
         if (dependents != null) {
-            for (String dependent : new ArrayList<>(dependents)) {
+            for (String dependent : dependents) {
                 List<OutputMessage> outputs = feedDependentPipeline(
                         dependent, streamName, timestamp, values);
                 for (OutputMessage out : outputs) {
@@ -698,6 +763,27 @@ public class RtBotSqlRuntime {
                 }
             }
         }
+    }
+
+    private Map<String, Long> parseLongCountersJson(String jsonText) {
+        Map<String, Long> out = new LinkedHashMap<>();
+        if (jsonText == null || jsonText.trim().isEmpty()) {
+            return out;
+        }
+        com.google.gson.JsonObject root =
+                gson.fromJson(jsonText, com.google.gson.JsonObject.class);
+        if (root == null) {
+            return out;
+        }
+        for (Map.Entry<String, com.google.gson.JsonElement> e : root.entrySet()) {
+            com.google.gson.JsonElement value = e.getValue();
+            if (value != null
+                    && value.isJsonPrimitive()
+                    && value.getAsJsonPrimitive().isNumber()) {
+                out.put(e.getKey(), value.getAsLong());
+            }
+        }
+        return out;
     }
 
     /**

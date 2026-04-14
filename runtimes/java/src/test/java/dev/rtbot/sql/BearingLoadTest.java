@@ -6,6 +6,7 @@ import static org.junit.Assert.*;
 import java.lang.management.ManagementFactory;
 import java.lang.management.ThreadMXBean;
 import java.util.Arrays;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -103,13 +104,22 @@ public class BearingLoadTest {
             runtime.execute(SQL_KURTOSIS);
 
             // Subscribe to outputs to count received messages
+            boolean subscribeRaw = Boolean.parseBoolean(
+                System.getProperty("rtbot.benchmark.subscribeRaw", "false"));
+            boolean profile = Boolean.parseBoolean(
+                System.getProperty("rtbot.benchmark.profile", "false"));
             AtomicLong rmsCount = new AtomicLong(0);
             AtomicLong kurtosisCount = new AtomicLong(0);
             AtomicLong rawCount = new AtomicLong(0);
 
             runtime.subscribe("rms_trend", (name, ts2, vals) -> rmsCount.incrementAndGet());
             runtime.subscribe("kurtosis_trend", (name, ts2, vals) -> kurtosisCount.incrementAndGet());
-            runtime.subscribe("vibration_raw", (name, ts2, vals) -> rawCount.incrementAndGet());
+            if (subscribeRaw) {
+                runtime.subscribe("vibration_raw", (name, ts2, vals) -> rawCount.incrementAndGet());
+            }
+            if (profile) {
+                runtime.resetPerfStats();
+            }
 
             ThreadMXBean threadMX = ManagementFactory.getThreadMXBean();
             Runtime rt = Runtime.getRuntime();
@@ -149,13 +159,13 @@ public class BearingLoadTest {
 
                     // Data samples
                     for (int i = 0; i < amps.length; i++) {
-                        runtime.insert("vibration_raw", ts + i,
-                            Arrays.asList((double) bearingId, 1.0, amps[i]));
+                        runtime.insert3("vibration_raw", ts + i,
+                            (double) bearingId, 1.0, amps[i]);
                         totalMessages++;
                     }
                     // Sentinel (amplitude = 0 triggers GROUP BY emission)
-                    runtime.insert("vibration_raw", ts + SAMPLES_PER_BURST,
-                        Arrays.asList((double) bearingId, 1.0, 0.0));
+                    runtime.insert3("vibration_raw", ts + SAMPLES_PER_BURST,
+                        (double) bearingId, 1.0, 0.0);
                     totalMessages++;
 
                     // Advance timestamp same as Python: base_ts += samples_per_burst + 100
@@ -222,6 +232,57 @@ public class BearingLoadTest {
                               "kurtosis_trend subscriber", kurtosisCount.get(), expectedPerMv);
             System.out.println();
 
+            if (profile) {
+                Map<String, Long> perf = runtime.getPerfStats();
+                long runnerFeedCalls = perf.getOrDefault("runner_feed_calls", 0L);
+                long runnerMarshalNs = perf.getOrDefault("runner_marshal_ns", 0L);
+                long runnerNativeCallNs = perf.getOrDefault("runner_native_call_ns", 0L);
+                long runnerJsonParseNs = perf.getOrDefault("runner_json_parse_ns", 0L);
+                long nativeTotalNs = perf.getOrDefault("native_total_ns", 0L);
+                long nativeReceiveNs = perf.getOrDefault("native_receive_ns", 0L);
+                long nativeJsonNs = perf.getOrDefault("native_json_serialize_ns", 0L);
+                long nativeCopyNs = perf.getOrDefault("native_values_copy_ns", 0L);
+                long nativeJstringNs = perf.getOrDefault("native_jstring_ns", 0L);
+                long boundaryNs = Math.max(0L, runnerNativeCallNs - nativeTotalNs);
+
+                double totalWallNs = wallSeconds * 1e9;
+                System.out.println("Feed-path timing breakdown (cumulative):");
+                System.out.printf("  %-34s %8d%n", "runner feed() calls", runnerFeedCalls);
+                if (runnerFeedCalls > 0) {
+                    System.out.printf("  %-34s %8.1f ns/call%n", "runner marshal",
+                                      (double) runnerMarshalNs / runnerFeedCalls);
+                    System.out.printf("  %-34s %8.1f ns/call%n", "runner native call",
+                                      (double) runnerNativeCallNs / runnerFeedCalls);
+                    System.out.printf("  %-34s %8.1f ns/call%n", "runner JSON parse",
+                                      (double) runnerJsonParseNs / runnerFeedCalls);
+                    System.out.printf("  %-34s %8.1f ns/call%n", "estimated JNI boundary",
+                                      (double) boundaryNs / runnerFeedCalls);
+                }
+                System.out.printf("  %-34s %8.1f%%%n", "runner marshal share",
+                                  totalWallNs > 0 ? (runnerMarshalNs * 100.0 / totalWallNs) : 0.0);
+                System.out.printf("  %-34s %8.1f%%%n", "runner native-call share",
+                                  totalWallNs > 0 ? (runnerNativeCallNs * 100.0 / totalWallNs) : 0.0);
+                System.out.printf("  %-34s %8.1f%%%n", "runner parse share",
+                                  totalWallNs > 0 ? (runnerJsonParseNs * 100.0 / totalWallNs) : 0.0);
+                System.out.println();
+                System.out.println("Native feedPipeline timing (inside JNI):");
+                System.out.printf("  %-34s %8d%n", "native feed calls",
+                                  perf.getOrDefault("native_feed_calls", 0L));
+                if (runnerFeedCalls > 0) {
+                    System.out.printf("  %-34s %8.1f ns/call%n", "native total",
+                                      (double) nativeTotalNs / runnerFeedCalls);
+                    System.out.printf("  %-34s %8.1f ns/call%n", "native values copy",
+                                      (double) nativeCopyNs / runnerFeedCalls);
+                    System.out.printf("  %-34s %8.1f ns/call%n", "native receive",
+                                      (double) nativeReceiveNs / runnerFeedCalls);
+                    System.out.printf("  %-34s %8.1f ns/call%n", "native batch->json",
+                                      (double) nativeJsonNs / runnerFeedCalls);
+                    System.out.printf("  %-34s %8.1f ns/call%n", "native jstring",
+                                      (double) nativeJstringNs / runnerFeedCalls);
+                }
+                System.out.println();
+            }
+
             // -- IMS projection -------------------------------------------
             int imsBursts = 2156;
             int imsSamples = 20480;
@@ -236,8 +297,10 @@ public class BearingLoadTest {
 
             // -- Assertions -----------------------------------------------
             // Subscribers should have received all messages
-            assertEquals("Raw subscriber should receive all messages",
-                         totalMessages, rawCount.get());
+            if (subscribeRaw) {
+                assertEquals("Raw subscriber should receive all messages",
+                             totalMessages, rawCount.get());
+            }
             assertEquals("RMS subscriber should receive expected count",
                          expectedPerMv, (int) rmsCount.get());
             assertEquals("Kurtosis subscriber should receive expected count",
