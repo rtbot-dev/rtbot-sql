@@ -104,6 +104,9 @@ class AlignedStreamIrregularDemoTest(unittest.TestCase):
     cadence_s = float(os.environ.get("RTBOT_ALIGNED_DEMO_CADENCE_S", "3"))
     max_bins_raw = os.environ.get("RTBOT_ALIGNED_DEMO_MAX_BINS", "")
     max_bins = int(max_bins_raw) if max_bins_raw.strip() else None
+    # Comma-separated bin indices to skip (e.g., "1,3" skips bins 1 and 3).
+    gap_bins_raw = os.environ.get("RTBOT_ALIGNED_DEMO_GAP_BINS", "")
+    gap_bins = set(int(b) for b in gap_bins_raw.split(",") if b.strip())
 
     rt = rtbot_sql.RtBotSql()
     rt.execute(
@@ -127,7 +130,10 @@ class AlignedStreamIrregularDemoTest(unittest.TestCase):
     signal.signal(signal.SIGTERM, _stop)
 
     print(f"\n{_BOLD}Aligned stream irregular demo{_RESET}")
-    print(f"cadence={_fmt2(cadence_s)}s per logical bin; press Ctrl+C to stop\n")
+    print(f"cadence={_fmt2(cadence_s)}s per logical bin; press Ctrl+C to stop")
+    if gap_bins:
+      print(f"gap bins (no data): {sorted(gap_bins)}")
+    print()
     sys.stdout.flush()
 
     # Per-bin buffered data: bin_end -> info dict
@@ -145,6 +151,17 @@ class AlignedStreamIrregularDemoTest(unittest.TestCase):
         if out_bin_end in pending_bins:
           _print_bin_comparison(
               out_bin_end, row.values[0], row.values[1], row.values[2])
+        else:
+          print(
+              f"  {_YELLOW}SQL output at t={row.timestamp}us "
+              f"(bin_end={out_bin_end}) — no pending bin match{_RESET}"
+          )
+          print(
+              f"    {_DIM}values: temperature_k={_fmt2(row.values[0])}, "
+              f"pressure_pa={_fmt2(row.values[1])}, "
+              f"ratio={_fmt2(row.values[2])}{_RESET}"
+          )
+          sys.stdout.flush()
       last_output_count = len(messages)
 
     def _print_bin_comparison(bin_end, rx_temp_k, rx_pres_pa, rx_ratio):
@@ -197,6 +214,19 @@ class AlignedStreamIrregularDemoTest(unittest.TestCase):
       wall_start = time.time()
       bin_start = next_bin_index
       bin_end = next_bin_index + 1
+
+      if next_bin_index in gap_bins:
+        print(
+            f"  {_YELLOW}--- bin {bin_start} [{bin_start}s -> {bin_end}s] "
+            f"GAP (no data) ---{_RESET}"
+        )
+        sys.stdout.flush()
+        next_bin_index += 1
+        elapsed = time.time() - wall_start
+        remaining = cadence_s - elapsed
+        if remaining > 0:
+          time.sleep(remaining)
+        continue
 
       temp_points, pressure_points = _bin_points(next_bin_index)
 
