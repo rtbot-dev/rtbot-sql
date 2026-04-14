@@ -60,7 +60,7 @@ class E2eRuntimeTest : public ::testing::Test {
           auto* vec_msg = dynamic_cast<rtbot::Message<rtbot::VectorNumberData>*>(
               msgs[0].get());
           if (vec_msg) {
-            return vec_msg->data.values;
+            return *vec_msg->data.values;
           }
         }
       }
@@ -882,7 +882,7 @@ TEST_F(E2eRuntimeTest, SegmentGroupByBurstData) {
           auto* vec_msg =
               dynamic_cast<rtbot::Message<rtbot::VectorNumberData>*>(msg.get());
           if (vec_msg) {
-            all_outputs.push_back({vec_msg->time, vec_msg->data.values});
+            all_outputs.push_back({vec_msg->time, *vec_msg->data.values});
           }
         }
       }
@@ -1043,7 +1043,7 @@ TEST_F(E2eRuntimeTest, MixedGroupByBurstData) {
           auto* vec_msg =
               dynamic_cast<rtbot::Message<rtbot::VectorNumberData>*>(msg.get());
           if (vec_msg) {
-            all_outputs.push_back({vec_msg->time, vec_msg->data.values});
+            all_outputs.push_back({vec_msg->time, *vec_msg->data.values});
           }
         }
       }
@@ -1167,7 +1167,7 @@ TEST_F(E2eRuntimeTest, SegmentGroupByWithHaving) {
           auto* vec_msg =
               dynamic_cast<rtbot::Message<rtbot::VectorNumberData>*>(msg.get());
           if (vec_msg) {
-            all_outputs.push_back({vec_msg->time, vec_msg->data.values});
+            all_outputs.push_back({vec_msg->time, *vec_msg->data.values});
           }
         }
       }
@@ -1296,22 +1296,23 @@ TEST_F(E2eRuntimeTest, MultiStreamNonMatchingTimestampsProduceNoOutput) {
 
   // Graph shape check (tuple intent):
   //   stream_a: (t, [a]) + stream_b: (t, [b]) -> (t, [a, b, a+b])
-  // Time synchronization for projection comes from VectorCompose.
+  // Time synchronization for projection comes from FusedExpression (which
+  // inherits from VectorCompose). The addition is fused into bytecode.
   auto program_json = json::parse(r.program_json);
   bool has_join = false;
-  bool has_compose = false;
+  bool has_fused = false;
   int addition_count = 0;
   for (const auto& op : program_json["operators"]) {
     if (op["type"] == "Join") has_join = true;
-    if (op["type"] == "VectorCompose") has_compose = true;
+    if (op["type"] == "FusedExpression") has_fused = true;
     if (op["type"] == "Addition") addition_count++;
   }
-  EXPECT_TRUE(has_compose)
-      << "Cross-stream projection must compile to VectorCompose";
+  EXPECT_TRUE(has_fused)
+      << "Cross-stream projection must compile to FusedExpression";
   EXPECT_FALSE(has_join)
       << "No extra explicit Join operators should be synthesized";
-  EXPECT_EQ(addition_count, 1)
-      << "Only the SQL expression a.value + b.value should compile to Addition";
+  EXPECT_EQ(addition_count, 0)
+      << "Addition should be fused into FusedExpression bytecode";
 
   rtbot::Program program(r.program_json);
 
@@ -1631,7 +1632,7 @@ TEST_F(E2eRuntimeTest, T_ts_bin_GroupByFloorTsProducesCorrectBins) {
           auto* vec_msg =
               dynamic_cast<rtbot::Message<rtbot::VectorNumberData>*>(msg.get());
           if (vec_msg) {
-            all_outputs.push_back({vec_msg->time, vec_msg->data.values});
+            all_outputs.push_back({vec_msg->time, *vec_msg->data.values});
           }
         }
       }
@@ -1713,7 +1714,7 @@ TEST_F(E2eRuntimeTest, ResampleConstantStandalone) {
           auto* vec_msg =
               dynamic_cast<rtbot::Message<rtbot::VectorNumberData>*>(msg.get());
           if (vec_msg) {
-            all_outputs.push_back({vec_msg->time, vec_msg->data.values});
+            all_outputs.push_back({vec_msg->time, *vec_msg->data.values});
           }
         }
       }
@@ -1802,7 +1803,7 @@ TEST_F(E2eRuntimeTest, BinningThenResamplerChain) {
           auto* vec_msg =
               dynamic_cast<rtbot::Message<rtbot::VectorNumberData>*>(msg.get());
           if (vec_msg) {
-            rs_outputs.push_back({vec_msg->time, vec_msg->data.values});
+            rs_outputs.push_back({vec_msg->time, *vec_msg->data.values});
           }
         }
       }
@@ -1832,7 +1833,7 @@ TEST_F(E2eRuntimeTest, BinningThenResamplerChain) {
           if (vec_msg) {
             // Pipe binning output into resampler
             auto batch_rs = prog_rs.receive(
-                make_msg(vec_msg->time, vec_msg->data.values));
+                make_msg(vec_msg->time, *vec_msg->data.values));
             collect_rs(batch_rs);
           }
         }
@@ -1956,7 +1957,7 @@ TEST_F(E2eRuntimeTest, FullAlignedStreamTwoStreamCrossJoin) {
           auto* vec_msg =
               dynamic_cast<rtbot::Message<rtbot::VectorNumberData>*>(msg.get());
           if (vec_msg) {
-            combined_outputs.push_back({vec_msg->time, vec_msg->data.values});
+            combined_outputs.push_back({vec_msg->time, *vec_msg->data.values});
           }
         }
       }
@@ -1973,13 +1974,13 @@ TEST_F(E2eRuntimeTest, FullAlignedStreamTwoStreamCrossJoin) {
         for (const auto& msg : msgs) {
           auto* vm = dynamic_cast<rtbot::Message<rtbot::VectorNumberData>*>(msg.get());
           if (vm) {
-            auto batch_rs = prog_vib_rs.receive(make_msg(vm->time, vm->data.values));
+            auto batch_rs = prog_vib_rs.receive(make_msg(vm->time, *vm->data.values));
             for (const auto& [op2, ob2] : batch_rs) {
               for (const auto& [p2, ms2] : ob2) {
                 for (const auto& m2 : ms2) {
                   auto* vm2 = dynamic_cast<rtbot::Message<rtbot::VectorNumberData>*>(m2.get());
                   if (vm2) {
-                    rs_msgs.push_back({vm2->time, vm2->data.values});
+                    rs_msgs.push_back({vm2->time, *vm2->data.values});
                   }
                 }
               }
@@ -1999,13 +2000,13 @@ TEST_F(E2eRuntimeTest, FullAlignedStreamTwoStreamCrossJoin) {
         for (const auto& msg : msgs) {
           auto* vm = dynamic_cast<rtbot::Message<rtbot::VectorNumberData>*>(msg.get());
           if (vm) {
-            auto batch_rs = prog_temp_rs.receive(make_msg(vm->time, vm->data.values));
+            auto batch_rs = prog_temp_rs.receive(make_msg(vm->time, *vm->data.values));
             for (const auto& [op2, ob2] : batch_rs) {
               for (const auto& [p2, ms2] : ob2) {
                 for (const auto& m2 : ms2) {
                   auto* vm2 = dynamic_cast<rtbot::Message<rtbot::VectorNumberData>*>(m2.get());
                   if (vm2) {
-                    rs_msgs.push_back({vm2->time, vm2->data.values});
+                    rs_msgs.push_back({vm2->time, *vm2->data.values});
                   }
                 }
               }
@@ -2197,7 +2198,7 @@ TEST_F(E2eRuntimeTest, AlignedStreamPipelineWithTimeShiftCorrection) {
           auto* vec_msg =
               dynamic_cast<rtbot::Message<rtbot::VectorNumberData>*>(msg.get());
           if (vec_msg) {
-            combined_outputs.push_back({vec_msg->time, vec_msg->data.values});
+            combined_outputs.push_back({vec_msg->time, *vec_msg->data.values});
           }
         }
       }
@@ -2213,13 +2214,13 @@ TEST_F(E2eRuntimeTest, AlignedStreamPipelineWithTimeShiftCorrection) {
         for (const auto& msg : msgs) {
           auto* vm = dynamic_cast<rtbot::Message<rtbot::VectorNumberData>*>(msg.get());
           if (vm) {
-            auto batch_rs = prog_vib_rs.receive(make_msg(vm->time, vm->data.values));
+            auto batch_rs = prog_vib_rs.receive(make_msg(vm->time, *vm->data.values));
             for (const auto& [op2, ob2] : batch_rs) {
               for (const auto& [p2, ms2] : ob2) {
                 for (const auto& m2 : ms2) {
                   auto* vm2 = dynamic_cast<rtbot::Message<rtbot::VectorNumberData>*>(m2.get());
                   if (vm2) {
-                    rs_msgs.push_back({vm2->time, vm2->data.values});
+                    rs_msgs.push_back({vm2->time, *vm2->data.values});
                   }
                 }
               }
@@ -2239,13 +2240,13 @@ TEST_F(E2eRuntimeTest, AlignedStreamPipelineWithTimeShiftCorrection) {
         for (const auto& msg : msgs) {
           auto* vm = dynamic_cast<rtbot::Message<rtbot::VectorNumberData>*>(msg.get());
           if (vm) {
-            auto batch_rs = prog_temp_rs.receive(make_msg(vm->time, vm->data.values));
+            auto batch_rs = prog_temp_rs.receive(make_msg(vm->time, *vm->data.values));
             for (const auto& [op2, ob2] : batch_rs) {
               for (const auto& [p2, ms2] : ob2) {
                 for (const auto& m2 : ms2) {
                   auto* vm2 = dynamic_cast<rtbot::Message<rtbot::VectorNumberData>*>(m2.get());
                   if (vm2) {
-                    rs_msgs.push_back({vm2->time, vm2->data.values});
+                    rs_msgs.push_back({vm2->time, *vm2->data.values});
                   }
                 }
               }
@@ -2493,7 +2494,7 @@ TEST_F(E2eRuntimeTest, ExpandedAlignedStreamRuntime) {
       for (const auto& [port, msgs] : op_batch) {
         for (const auto& m : msgs) {
           if (auto* vec = dynamic_cast<rtbot::Message<rtbot::VectorNumberData>*>(m.get())) {
-            out.push_back({vec->time, vec->data.values});
+            out.push_back({vec->time, *vec->data.values});
           } else if (auto* num = dynamic_cast<rtbot::Message<rtbot::NumberData>*>(m.get())) {
             out.push_back({num->time, {num->data.value}});
           }
@@ -2512,7 +2513,7 @@ TEST_F(E2eRuntimeTest, ExpandedAlignedStreamRuntime) {
       for (auto& [port, msgs] : op_batch) {
         for (auto& m : msgs) {
           if (auto* vec = dynamic_cast<rtbot::Message<rtbot::VectorNumberData>*>(m.get())) {
-            auto rs_batch = feed_single(rs, vec->time, vec->data.values, "i1");
+            auto rs_batch = feed_single(rs, vec->time, *vec->data.values, "i1");
             auto outs = collect_outputs(rs_batch);
             rs_outputs.insert(rs_outputs.end(), outs.begin(), outs.end());
           } else if (auto* num = dynamic_cast<rtbot::Message<rtbot::NumberData>*>(m.get())) {
@@ -2596,6 +2597,167 @@ TEST_F(E2eRuntimeTest, ExpandedAlignedStreamRuntime) {
   EXPECT_EQ(combined_outputs[0].first, 1000u);
   EXPECT_DOUBLE_EQ(combined_outputs[0].second[0], 10.0);   // vibration
   EXPECT_DOUBLE_EQ(combined_outputs[0].second[1], 75.0);   // bearing_temp
+}
+
+// ===========================================================================
+// FusedExpression end-to-end tests
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// FE-e2e-1: Simple arithmetic projection through full pipeline
+// SELECT price * quantity AS trade_value FROM trades
+// ---------------------------------------------------------------------------
+
+TEST_F(E2eRuntimeTest, FusedExpressionArithmeticProjection) {
+  auto r = compile(
+      "CREATE MATERIALIZED VIEW tv AS "
+      "SELECT price * quantity AS trade_value FROM trades");
+
+  ASSERT_FALSE(r.has_errors());
+  EXPECT_EQ(r.field_map.at("trade_value"), 0);
+
+  // Verify graph uses FusedExpression (not separate Multiplication + VectorCompose)
+  auto program_json = json::parse(r.program_json);
+  bool has_fused = false;
+  bool has_multiplication = false;
+  for (const auto& op : program_json["operators"]) {
+    if (op["type"] == "FusedExpression") has_fused = true;
+    if (op["type"] == "Multiplication") has_multiplication = true;
+  }
+  EXPECT_TRUE(has_fused) << "Arithmetic projection must use FusedExpression";
+  EXPECT_FALSE(has_multiplication)
+      << "Multiplication should be fused into bytecode";
+
+  rtbot::Program program(r.program_json);
+
+  // trades schema: instrument_id(0), price(1), quantity(2), account_id(3)
+  auto batch = send(program, 1000, {1.0, 50.0, 10.0, 42.0});
+  auto out = extract_output(batch);
+  ASSERT_FALSE(out.empty());
+  EXPECT_DOUBLE_EQ(out[0], 500.0);  // 50 * 10
+
+  auto batch2 = send(program, 2000, {1.0, 100.5, 3.0, 42.0});
+  auto out2 = extract_output(batch2);
+  ASSERT_FALSE(out2.empty());
+  EXPECT_DOUBLE_EQ(out2[0], 301.5);  // 100.5 * 3
+}
+
+// ---------------------------------------------------------------------------
+// FE-e2e-2: Unary math function through full pipeline
+// SELECT ABS(price - 100) AS deviation FROM trades
+// ---------------------------------------------------------------------------
+
+TEST_F(E2eRuntimeTest, FusedExpressionUnaryMathFunction) {
+  auto r = compile(
+      "CREATE MATERIALIZED VIEW dev AS "
+      "SELECT ABS(price - 100) AS deviation FROM trades");
+
+  ASSERT_FALSE(r.has_errors());
+  EXPECT_EQ(r.field_map.at("deviation"), 0);
+
+  rtbot::Program program(r.program_json);
+
+  // price=80 → |80-100| = 20
+  auto batch1 = send(program, 1000, {1.0, 80.0, 10.0, 42.0});
+  auto out1 = extract_output(batch1);
+  ASSERT_FALSE(out1.empty());
+  EXPECT_DOUBLE_EQ(out1[0], 20.0);
+
+  // price=120 → |120-100| = 20
+  auto batch2 = send(program, 2000, {1.0, 120.0, 10.0, 42.0});
+  auto out2 = extract_output(batch2);
+  ASSERT_FALSE(out2.empty());
+  EXPECT_DOUBLE_EQ(out2[0], 20.0);
+}
+
+// ---------------------------------------------------------------------------
+// FE-e2e-3: Multi-expression projection
+// SELECT price, quantity, price * quantity AS notional,
+//        price - 100 AS delta FROM trades
+// ---------------------------------------------------------------------------
+
+TEST_F(E2eRuntimeTest, FusedExpressionMultiOutputProjection) {
+  auto r = compile(
+      "CREATE MATERIALIZED VIEW multi AS "
+      "SELECT price, quantity, price * quantity AS notional, "
+      "price - 100 AS delta FROM trades");
+
+  ASSERT_FALSE(r.has_errors());
+  int price_idx = r.field_map.at("price");
+  int qty_idx = r.field_map.at("quantity");
+  int notional_idx = r.field_map.at("notional");
+  int delta_idx = r.field_map.at("delta");
+
+  rtbot::Program program(r.program_json);
+
+  auto batch = send(program, 1000, {1.0, 250.0, 4.0, 42.0});
+  auto out = extract_output(batch);
+  ASSERT_FALSE(out.empty());
+  EXPECT_DOUBLE_EQ(out[price_idx], 250.0);
+  EXPECT_DOUBLE_EQ(out[qty_idx], 4.0);
+  EXPECT_DOUBLE_EQ(out[notional_idx], 1000.0);  // 250 * 4
+  EXPECT_DOUBLE_EQ(out[delta_idx], 150.0);       // 250 - 100
+}
+
+// ---------------------------------------------------------------------------
+// FE-e2e-4: Cross-stream fused expression
+// SELECT a.value + b.value AS total FROM stream_a a, stream_b b
+// ---------------------------------------------------------------------------
+
+TEST_F(E2eRuntimeTest, FusedExpressionCrossStream) {
+  StreamSchema stream_a{"stream_a", {{"value", 0}}};
+  StreamSchema stream_b{"stream_b", {{"value", 0}}};
+  catalog.streams["stream_a"] = stream_a;
+  catalog.streams["stream_b"] = stream_b;
+
+  auto r = compile(
+      "CREATE MATERIALIZED VIEW cross_total AS "
+      "SELECT a.value + b.value AS total "
+      "FROM stream_a a, stream_b b");
+
+  ASSERT_FALSE(r.has_errors());
+
+  // Verify FusedExpression in graph
+  auto program_json = json::parse(r.program_json);
+  bool has_fused = false;
+  for (const auto& op : program_json["operators"]) {
+    if (op["type"] == "FusedExpression") has_fused = true;
+  }
+  EXPECT_TRUE(has_fused);
+
+  rtbot::Program program(r.program_json);
+
+  // Both streams send at t=1000
+  auto b1 = program.receive(make_msg(1000, {10.0}), "i1");
+  auto b2 = program.receive(make_msg(1000, {20.0}), "i2");
+
+  size_t total_out = count_outputs(b1) + count_outputs(b2);
+  ASSERT_GT(total_out, 0u);
+
+  auto out = extract_output(b2);
+  if (out.empty()) out = extract_output(b1);
+  ASSERT_FALSE(out.empty());
+  EXPECT_DOUBLE_EQ(out[r.field_map.at("total")], 30.0);
+}
+
+// ---------------------------------------------------------------------------
+// FE-e2e-5: SQRT function in projection
+// SELECT SQRT(price) AS sqrt_price FROM trades
+// ---------------------------------------------------------------------------
+
+TEST_F(E2eRuntimeTest, FusedExpressionSqrtProjection) {
+  auto r = compile(
+      "CREATE MATERIALIZED VIEW sq AS "
+      "SELECT SQRT(price) AS sqrt_price FROM trades");
+
+  ASSERT_FALSE(r.has_errors());
+
+  rtbot::Program program(r.program_json);
+
+  auto batch = send(program, 1000, {1.0, 144.0, 10.0, 42.0});
+  auto out = extract_output(batch);
+  ASSERT_FALSE(out.empty());
+  EXPECT_DOUBLE_EQ(out[0], 12.0);  // sqrt(144)
 }
 
 }  // namespace

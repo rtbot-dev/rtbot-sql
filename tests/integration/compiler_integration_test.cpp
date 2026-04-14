@@ -452,7 +452,7 @@ TEST_F(CompilerIntegrationTest, MultiFromCrossStreamSelect) {
   bool has_two_port_input = false;
   bool has_subtraction = false;
   bool has_join = false;
-  bool has_compose = false;
+  bool has_fused = false;
   int addition_count = 0;
   for (const auto& op : program["operators"]) {
     if (op["type"] == "Input") {
@@ -467,17 +467,18 @@ TEST_F(CompilerIntegrationTest, MultiFromCrossStreamSelect) {
     if (op["type"] == "Join") {
       has_join = true;
     }
-    if (op["type"] == "VectorCompose") {
-      has_compose = true;
+    if (op["type"] == "FusedExpression") {
+      has_fused = true;
     }
     if (op["type"] == "Addition") {
       addition_count++;
     }
   }
   EXPECT_TRUE(has_two_port_input);
-  EXPECT_TRUE(has_subtraction);
-  EXPECT_TRUE(has_compose)
-      << "Cross-stream projection must include VectorCompose";
+  EXPECT_FALSE(has_subtraction)
+      << "Subtraction should be fused into FusedExpression bytecode";
+  EXPECT_TRUE(has_fused)
+      << "Cross-stream projection must compile to FusedExpression";
   EXPECT_FALSE(has_join)
       << "No extra explicit Join operators should be synthesized";
   EXPECT_EQ(addition_count, 0)
