@@ -48,8 +48,9 @@ const PrototypeDef* GraphBuilder::find_prototype(
 namespace {
 
 static const std::set<std::string> int_params = {
-    "index", "numPorts", "window", "window_size", "interval", "key_index",
-    "numInputPorts", "k", "score_index", "t0", "shift", "snapFirst"};
+    "index", "numPorts", "numOutputs", "window", "window_size", "interval",
+    "key_index", "numInputPorts", "k", "score_index", "t0", "shift",
+    "snapFirst"};
 
 json operator_to_json(const OperatorDef& op) {
   json j;
@@ -367,6 +368,7 @@ static PortSig output_sig(const OperatorDef& op) {
 
   // Operators that output VectorNumber
   if (t == "Input" || t == "Output" || t == "VectorCompose" ||
+      t == "FusedExpression" ||
       t == "VectorProject" || t == "KeyedPipeline" || t == "Pipeline")
     return {DataType::VECTOR_NUMBER};
 
@@ -454,8 +456,8 @@ static PortSig input_sig(const OperatorDef& op, const std::string& port) {
       t == "VectorProject" || t == "KeyedPipeline")
     return {DataType::VECTOR_NUMBER};
 
-  // VectorCompose accepts Number on each data port
-  if (t == "VectorCompose")
+  // VectorCompose / FusedExpression accept Number on each data port
+  if (t == "VectorCompose" || t == "FusedExpression")
     return {DataType::NUMBER};
 
   // Operators that accept Number on data ports
@@ -543,6 +545,10 @@ static void validate_graph(const std::vector<OperatorDef>& ops,
                           ") missing required parameter: indices");
     }
     else if (op.type == "VectorCompose") require_param(op, "numPorts");
+    else if (op.type == "FusedExpression") {
+      require_param(op, "numPorts");
+      require_param(op, "numOutputs");
+    }
     else if (op.type == "MovingAverage" || op.type == "MovingSum" ||
              op.type == "StandardDeviation" || op.type == "PeakDetector" ||
              op.type == "MovingKeyCount")
