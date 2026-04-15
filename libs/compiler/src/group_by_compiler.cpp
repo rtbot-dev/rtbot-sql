@@ -432,52 +432,146 @@ SelectResult compile_group_by(
     std::vector<Endpoint> inner_endpoints;
     std::vector<std::string> field_names;
 
-    if (composite) {
-      // For composite keys: extract ALL key columns explicitly in inner prototype
-      // (KeyedPipeline prepends the hash key at index 0, so prototype outputs
-      //  start at index 1 in the final output)
-      for (const auto& ki : keys) {
-        auto ve_id = inner_proto_builder.next_id("extract");
+    // --- Attempt fused aggregate path for inner prototype ---
+    // Replaces the per-aggregate operator chains + VectorCompose with a single
+    // FusedExpression bytecode interpreter.
+    bool inner_fused = false;
+    if (std::getenv("RTBOT_DISABLE_FUSION") == nullptr) {
+      std::map<std::pair<std::string, int>, int> column_to_input;
+      std::vector<double> constants;
+      std::vector<double> all_bytecode;
+      AggBytecodeContext agg_ctx;
+      bool all_fusable = true;
+      size_t num_outputs = 0;
+
+      // For composite keys: emit INPUT col_index, END per key column
+      // so the FusedExpression passes key values through to the output vector.
+      if (composite) {
+        for (const auto& ki : keys) {
+          auto resolved = scope.resolve(parser::ast::ColumnRef{"", ki.name});
+          auto* binding = std::get_if<analyzer::ColumnBinding>(&resolved);
+          if (!binding) { all_fusable = false; break; }
+          auto col_key = std::make_pair(binding->stream_name, binding->index);
+          if (column_to_input.find(col_key) == column_to_input.end()) {
+            column_to_input[col_key] = static_cast<int>(column_to_input.size());
+          }
+          int input_idx = column_to_input[col_key];
+          all_bytecode.push_back(0.0);   // fused_op::INPUT
+          all_bytecode.push_back(static_cast<double>(input_idx));
+          all_bytecode.push_back(20.0);  // fused_op::END
+          field_names.push_back(ki.name);
+          ++num_outputs;
+        }
+      } else {
+        field_names.push_back(keys[0].name);
+      }
+
+      // Compile aggregate expressions to bytecode
+      if (all_fusable) {
+        for (const auto& select_item : select_list) {
+          bool is_key = false;
+          for (const auto& gbe : group_by) {
+            if (is_group_by_key(select_item, gbe, scope)) { is_key = true; break; }
+          }
+          if (is_key) continue;
+
+          auto bc = compile_aggregate_expression_to_bytecode(
+              select_item.expr, scope, column_to_input, constants, agg_ctx);
+          if (!bc.success) { all_fusable = false; break; }
+          all_bytecode.insert(all_bytecode.end(), bc.bytecode.begin(), bc.bytecode.end());
+          field_names.push_back(
+              select_item.alias.value_or(default_alias(select_item.expr)));
+          ++num_outputs;
+        }
+      }
+
+      if (all_fusable && num_outputs > 0) {
+        inner_fused = true;
+
+        // Emit VectorExtract per input column
+        size_t num_inputs = column_to_input.size();
+        std::vector<Endpoint> extract_endpoints(num_inputs);
+        for (const auto& [col_key, input_idx] : column_to_input) {
+          const auto& [stream_name, col_index] = col_key;
+          auto ext_id = inner_proto_builder.next_id("ext");
+          inner_proto_builder.add_operator(ext_id, "VectorExtract",
+                                           {{"index", static_cast<double>(col_index)}});
+          inner_proto_builder.connect(inner_input_ep, {ext_id, "i1"});
+          extract_endpoints[input_idx] = {ext_id, "o1"};
+        }
+
+        // Emit FusedExpression
+        auto fused_id = inner_proto_builder.next_id("fused");
+        std::map<std::string, std::vector<double>> double_array_params = {
+            {"bytecode", all_bytecode}, {"constants", constants}};
+        if (!agg_ctx.state_init.empty()) {
+          double_array_params["stateInit"] = agg_ctx.state_init;
+        }
         inner_proto_builder.add_operator(
-            ve_id, "VectorExtract",
-            {{"index", static_cast<double>(ki.index)}});
-        inner_proto_builder.connect(inner_input_ep, {ve_id, "i1"});
-        inner_endpoints.push_back({ve_id, "o1"});
-        field_names.push_back(ki.name);
+            fused_id, "FusedExpression",
+            {{"numPorts", static_cast<double>(num_inputs)},
+             {"numOutputs", static_cast<double>(num_outputs)}},
+            {},  // no string params
+            double_array_params);
+
+        for (size_t i = 0; i < num_inputs; ++i) {
+          inner_proto_builder.connect(extract_endpoints[i],
+                                      {fused_id, "i" + std::to_string(i + 1)});
+        }
+
+        // FusedExpression outputs VectorNumber directly — connect to proto_out
+        inner_proto_builder.add_operator("proto_out", "Output");
+        inner_proto_builder.connect({fused_id, "o1"}, {"proto_out", "i1"});
+      } else {
+        // Fusion failed — reset field_names for the fallback path
+        field_names.clear();
       }
-    } else {
-      // Single key: KeyedPipeline prepends it at index 0
-      field_names.push_back(keys[0].name);
     }
 
-    for (const auto& select_item : select_list) {
-      // Skip if it's a GROUP BY persistent key
-      bool is_key = false;
-      for (const auto& gbe : group_by) {
-        if (is_group_by_key(select_item, gbe, scope)) { is_key = true; break; }
+    // --- Fallback: original per-operator path ---
+    if (!inner_fused) {
+      if (composite) {
+        for (const auto& ki : keys) {
+          auto ve_id = inner_proto_builder.next_id("extract");
+          inner_proto_builder.add_operator(
+              ve_id, "VectorExtract",
+              {{"index", static_cast<double>(ki.index)}});
+          inner_proto_builder.connect(inner_input_ep, {ve_id, "i1"});
+          inner_endpoints.push_back({ve_id, "o1"});
+          field_names.push_back(ki.name);
+        }
+      } else {
+        field_names.push_back(keys[0].name);
       }
-      if (is_key) continue;
 
-      auto result = compile_expression_cached(
-          select_item.expr, inner_input_ep, scope, inner_proto_builder, inner_cache);
-      auto ep = ensure_endpoint(std::move(result), inner_input_ep, inner_proto_builder);
-      inner_endpoints.push_back(ep);
-      field_names.push_back(
-          select_item.alias.value_or(default_alias(select_item.expr)));
+      for (const auto& select_item : select_list) {
+        bool is_key = false;
+        for (const auto& gbe : group_by) {
+          if (is_group_by_key(select_item, gbe, scope)) { is_key = true; break; }
+        }
+        if (is_key) continue;
+
+        auto result = compile_expression_cached(
+            select_item.expr, inner_input_ep, scope, inner_proto_builder, inner_cache);
+        auto ep = ensure_endpoint(std::move(result), inner_input_ep, inner_proto_builder);
+        inner_endpoints.push_back(ep);
+        field_names.push_back(
+            select_item.alias.value_or(default_alias(select_item.expr)));
+      }
+
+      // Compose inner prototype outputs
+      auto inner_compose_id = inner_proto_builder.next_id("compose");
+      inner_proto_builder.add_operator(
+          inner_compose_id, "VectorCompose",
+          {{"numPorts", static_cast<double>(inner_endpoints.size())}});
+      for (size_t i = 0; i < inner_endpoints.size(); ++i) {
+        inner_proto_builder.connect(inner_endpoints[i],
+                                    {inner_compose_id, "i" + std::to_string(i + 1)});
+      }
+
+      inner_proto_builder.add_operator("proto_out", "Output");
+      inner_proto_builder.connect({inner_compose_id, "o1"}, {"proto_out", "i1"});
     }
-
-    // Compose inner prototype outputs
-    auto inner_compose_id = inner_proto_builder.next_id("compose");
-    inner_proto_builder.add_operator(
-        inner_compose_id, "VectorCompose",
-        {{"numPorts", static_cast<double>(inner_endpoints.size())}});
-    for (size_t i = 0; i < inner_endpoints.size(); ++i) {
-      inner_proto_builder.connect(inner_endpoints[i],
-                                  {inner_compose_id, "i" + std::to_string(i + 1)});
-    }
-
-    inner_proto_builder.add_operator("proto_out", "Output");
-    inner_proto_builder.connect({inner_compose_id, "o1"}, {"proto_out", "i1"});
 
     auto inner_proto_id = builder.next_id("proto");
     PrototypeDef inner_proto_def;
@@ -851,6 +945,137 @@ SelectResult compile_group_by(
   std::vector<Endpoint> proto_endpoints;
   std::vector<std::string> field_names;
   field_names.push_back(key_name);  // key at index 0
+
+  // --- Attempt fused aggregate path ---
+  // Try to compile all non-key SELECT items into a single FusedExpression.
+  // If successful, this replaces the operator chain + VectorCompose with a
+  // single bytecode interpreter, eliminating ~40 virtual dispatches per message.
+  if (std::getenv("RTBOT_DISABLE_FUSION") == nullptr) {
+    std::map<std::pair<std::string, int>, int> column_to_input;
+    std::vector<double> constants;
+    std::vector<double> all_bytecode;
+    AggBytecodeContext agg_ctx;
+    bool all_fusable = true;
+    size_t num_agg_outputs = 0;
+    std::vector<std::string> fused_field_names;
+
+    for (const auto& item : select_list) {
+      if (is_group_by_key(item, group_by[0], scope)) continue;
+      auto bc = compile_aggregate_expression_to_bytecode(
+          item.expr, scope, column_to_input, constants, agg_ctx);
+      if (!bc.success) { all_fusable = false; break; }
+      all_bytecode.insert(all_bytecode.end(), bc.bytecode.begin(), bc.bytecode.end());
+      fused_field_names.push_back(
+          item.alias.value_or(default_alias(item.expr)));
+      ++num_agg_outputs;
+    }
+
+    if (all_fusable && num_agg_outputs > 0) {
+      // Emit VectorExtract per input column in the prototype
+      size_t num_inputs = column_to_input.size();
+      std::vector<Endpoint> extract_endpoints(num_inputs);
+      for (const auto& [col_key, input_idx] : column_to_input) {
+        const auto& [stream_name, col_index] = col_key;
+        auto ext_id = proto_builder.next_id("ext");
+        proto_builder.add_operator(ext_id, "VectorExtract",
+                                   {{"index", static_cast<double>(col_index)}});
+        proto_builder.connect(proto_input_ep, {ext_id, "i1"});
+        extract_endpoints[input_idx] = {ext_id, "o1"};
+      }
+
+      // Emit FusedExpression
+      auto fused_id = proto_builder.next_id("fused");
+      std::map<std::string, std::vector<double>> double_array_params = {
+          {"bytecode", all_bytecode}, {"constants", constants}};
+      if (!agg_ctx.state_init.empty()) {
+        double_array_params["stateInit"] = agg_ctx.state_init;
+      }
+      proto_builder.add_operator(
+          fused_id, "FusedExpression",
+          {{"numPorts", static_cast<double>(num_inputs)},
+           {"numOutputs", static_cast<double>(num_agg_outputs)}},
+          {},  // no string params
+          double_array_params);
+
+      for (size_t i = 0; i < num_inputs; ++i) {
+        proto_builder.connect(extract_endpoints[i],
+                              {fused_id, "i" + std::to_string(i + 1)});
+      }
+
+      // FusedExpression outputs VectorNumber directly — use as prototype output
+      Endpoint proto_output_ep = {fused_id, "o1"};
+
+      // Merge field names
+      for (auto& fn : fused_field_names) {
+        field_names.push_back(std::move(fn));
+      }
+
+      // --- HAVING (same logic as unfused path) ---
+      std::optional<VelocityPattern> velocity_pat;
+      if (having.has_value()) {
+        velocity_pat = detect_velocity_pattern(*having);
+        if (!velocity_pat.has_value()) {
+          auto bool_ep = compile_having_predicate(*having, proto_input_ep, scope,
+                                                  proto_builder, cache);
+          auto demux_id = proto_builder.next_id("demux");
+          proto_builder.add_operator(demux_id, "Demultiplexer", {{"numPorts", 1}},
+                                     {{"portType", "vector_number"}});
+          proto_builder.connect(bool_ep, {demux_id, "c1"});
+          proto_builder.connect(proto_output_ep, {demux_id, "i1"});
+          proto_output_ep = {demux_id, "o1"};
+        }
+      }
+
+      // Finalize prototype
+      proto_builder.add_operator("proto_out", "Output");
+      proto_builder.connect(proto_output_ep, {"proto_out", "i1"});
+
+      auto proto_id = builder.next_id("proto");
+      PrototypeDef proto_def;
+      proto_def.id = proto_id;
+      proto_def.entry_id = "proto_in";
+      proto_def.output_id = "proto_out";
+      proto_def.operators = proto_builder.operators();
+      proto_def.connections = proto_builder.connections();
+      builder.add_prototype(proto_def);
+
+      // Add KeyedPipeline (with optional velocity pre-filter)
+      Endpoint keyed_input = input_endpoint;
+      if (velocity_pat.has_value()) {
+        const auto& vp = *velocity_pat;
+        auto extract_id = builder.next_id("extract");
+        builder.add_operator(extract_id, "VectorExtract",
+                             {{"index", static_cast<double>(key_index)}});
+        builder.connect(input_endpoint, {extract_id, "i1"});
+        auto mkc_id = builder.next_id("mkc");
+        builder.add_operator(mkc_id, "MovingKeyCount",
+                             {{"window_size", static_cast<double>(vp.window_size)}});
+        builder.connect({extract_id, "o1"}, {mkc_id, "i1"});
+        auto cmp_id = builder.next_id("cmp");
+        builder.add_operator(cmp_id, vp.rtbot_type, {{"value", vp.threshold}});
+        builder.connect({mkc_id, "o1"}, {cmp_id, "i1"});
+        auto demux_id = builder.next_id("demux");
+        builder.add_operator(demux_id, "Demultiplexer", {{"numPorts", 1}},
+                             {{"portType", "vector_number"}});
+        builder.connect({cmp_id, "o1"}, {demux_id, "c1"});
+        builder.connect(input_endpoint, {demux_id, "i1"});
+        keyed_input = {demux_id, "o1"};
+      }
+
+      auto keyed_id = builder.next_id("keyed");
+      builder.add_operator(keyed_id, "KeyedPipeline",
+                           {{"key_index", static_cast<double>(key_index)}},
+                           {{"prototype", proto_id}});
+      builder.connect(keyed_input, {keyed_id, "i1"});
+
+      FieldMap field_map;
+      for (size_t i = 0; i < field_names.size(); ++i) {
+        field_map[field_names[i]] = static_cast<int>(i);
+      }
+      return {{keyed_id, "o1"}, field_map};
+    }
+  }
+  // --- End fused aggregate path (fallback below) ---
 
   for (const auto& item : select_list) {
     if (is_group_by_key(item, group_by[0], scope)) {
