@@ -701,59 +701,38 @@ TEST_F(SegmentGroupByTest, SegmentOnlyGroupBy) {
   }
   EXPECT_TRUE(has_pipeline) << "Expected Pipeline operator in outer graph";
 
-  // Outer graph should contain segment expression operators:
-  // VectorExtract (amplitude), Abs, CompareGT
-  bool has_abs = false, has_cmp_gt = false;
+  // Segment expression is compiled to bytecode — no Abs/CompareGT/BooleanToNumber
+  // operators in the outer graph. Pipeline carries segmentBytecode instead.
   for (const auto& op : builder.operators()) {
-    if (op.type == "Abs") has_abs = true;
-    if (op.type == "CompareGT") {
-      has_cmp_gt = true;
-      EXPECT_EQ(op.params.at("value"), 0.0);
+    EXPECT_NE(op.type, "Abs")
+        << "Abs should NOT be in outer graph (bytecode path)";
+    EXPECT_NE(op.type, "CompareGT")
+        << "CompareGT should NOT be in outer graph (bytecode path)";
+    EXPECT_NE(op.type, "BooleanToNumber")
+        << "BooleanToNumber should NOT be in outer graph (bytecode path)";
+  }
+
+  // Pipeline should have segmentBytecode and segmentConstants
+  for (const auto& op : builder.operators()) {
+    if (op.type == "Pipeline") {
+      EXPECT_TRUE(op.double_array_params.count("segmentBytecode"))
+          << "Pipeline should have segmentBytecode";
+      EXPECT_TRUE(op.double_array_params.count("segmentConstants"))
+          << "Pipeline should have segmentConstants";
+      EXPECT_FALSE(op.double_array_params.at("segmentBytecode").empty())
+          << "segmentBytecode should not be empty";
     }
   }
-  EXPECT_TRUE(has_abs) << "Expected Abs in outer graph for segment expression";
-  EXPECT_TRUE(has_cmp_gt)
-      << "Expected CompareGT in outer graph for segment expression";
 
-  // Outer graph should contain BooleanToNumber (converts predicate for Pipeline c1)
-  bool has_b2n = false;
-  std::string b2n_id;
-  for (const auto& op : builder.operators()) {
-    if (op.type == "BooleanToNumber") {
-      has_b2n = true;
-      b2n_id = op.id;
-    }
-  }
-  EXPECT_TRUE(has_b2n)
-      << "Expected BooleanToNumber in outer graph between predicate and Pipeline c1";
-
-  // Verify connection chain: CompareGT -> BooleanToNumber -> Pipeline.c1
-  if (has_b2n) {
-    bool cmp_to_b2n = false;
-    bool b2n_to_pipeline_c1 = false;
-    for (const auto& conn : builder.connections()) {
-      if (conn.to_id == b2n_id && conn.to_port == "i1") {
-        // The source should be the CompareGT operator
-        for (const auto& op : builder.operators()) {
-          if (op.id == conn.from_id && op.type == "CompareGT") {
-            cmp_to_b2n = true;
-          }
-        }
-      }
-      if (conn.from_id == b2n_id && conn.from_port == "o1" &&
-          conn.to_port == "c1") {
-        // The target should be the Pipeline operator
-        for (const auto& op : builder.operators()) {
-          if (op.id == conn.to_id && op.type == "Pipeline") {
-            b2n_to_pipeline_c1 = true;
-          }
+  // No c1 connections to Pipeline (bytecode replaces control port)
+  for (const auto& conn : builder.connections()) {
+    if (conn.to_port == "c1") {
+      for (const auto& op : builder.operators()) {
+        if (op.id == conn.to_id && op.type == "Pipeline") {
+          ADD_FAILURE() << "Pipeline should NOT have a c1 connection (bytecode path)";
         }
       }
     }
-    EXPECT_TRUE(cmp_to_b2n)
-        << "CompareGT output should connect to BooleanToNumber input";
-    EXPECT_TRUE(b2n_to_pipeline_c1)
-        << "BooleanToNumber output should connect to Pipeline c1";
   }
 
   // Prototype should contain aggregates: CumulativeSum, CountNumber
@@ -834,58 +813,41 @@ TEST_F(SegmentGroupByTest, MixedGroupBy) {
   ASSERT_NE(outer_proto, nullptr) << "One prototype should contain a Pipeline";
   ASSERT_NE(inner_proto, nullptr) << "One prototype should be the inner aggregate";
 
-  // Outer prototype should contain segment expression operators (Abs, CompareGT)
-  // and Pipeline operator
-  bool proto_has_abs = false, proto_has_cmp = false, proto_has_pipeline = false;
+  // Outer prototype: segment expression is compiled to bytecode.
+  // No Abs/CompareGT/BooleanToNumber operators — Pipeline has segmentBytecode.
+  bool proto_has_pipeline = false;
   for (const auto& op : outer_proto->operators) {
-    if (op.type == "Abs") proto_has_abs = true;
-    if (op.type == "CompareGT") {
-      proto_has_cmp = true;
-      EXPECT_EQ(op.params.at("value"), 0.0);
-    }
+    EXPECT_NE(op.type, "Abs")
+        << "Abs should NOT be in outer prototype (bytecode path)";
+    EXPECT_NE(op.type, "CompareGT")
+        << "CompareGT should NOT be in outer prototype (bytecode path)";
+    EXPECT_NE(op.type, "BooleanToNumber")
+        << "BooleanToNumber should NOT be in outer prototype (bytecode path)";
     if (op.type == "Pipeline") proto_has_pipeline = true;
   }
-  EXPECT_TRUE(proto_has_abs) << "Outer prototype should have Abs for segment expr";
-  EXPECT_TRUE(proto_has_cmp) << "Outer prototype should have CompareGT for segment expr";
   EXPECT_TRUE(proto_has_pipeline) << "Outer prototype should have Pipeline";
 
-  // Outer prototype should contain BooleanToNumber between predicate and Pipeline c1
-  bool proto_has_b2n = false;
-  std::string b2n_id;
+  // Pipeline in outer prototype should have segmentBytecode/segmentConstants
   for (const auto& op : outer_proto->operators) {
-    if (op.type == "BooleanToNumber") {
-      proto_has_b2n = true;
-      b2n_id = op.id;
+    if (op.type == "Pipeline") {
+      EXPECT_TRUE(op.double_array_params.count("segmentBytecode"))
+          << "Pipeline should have segmentBytecode";
+      EXPECT_TRUE(op.double_array_params.count("segmentConstants"))
+          << "Pipeline should have segmentConstants";
+      EXPECT_FALSE(op.double_array_params.at("segmentBytecode").empty())
+          << "segmentBytecode should not be empty";
     }
   }
-  EXPECT_TRUE(proto_has_b2n)
-      << "Outer prototype should have BooleanToNumber between predicate and Pipeline c1";
 
-  // Verify connection chain in outer prototype: CompareGT -> BooleanToNumber -> Pipeline.c1
-  if (proto_has_b2n) {
-    bool cmp_to_b2n = false;
-    bool b2n_to_pipeline_c1 = false;
-    for (const auto& conn : outer_proto->connections) {
-      if (conn.to_id == b2n_id && conn.to_port == "i1") {
-        for (const auto& op : outer_proto->operators) {
-          if (op.id == conn.from_id && op.type == "CompareGT") {
-            cmp_to_b2n = true;
-          }
-        }
-      }
-      if (conn.from_id == b2n_id && conn.from_port == "o1" &&
-          conn.to_port == "c1") {
-        for (const auto& op : outer_proto->operators) {
-          if (op.id == conn.to_id && op.type == "Pipeline") {
-            b2n_to_pipeline_c1 = true;
-          }
+  // No c1 connections to Pipeline in outer prototype (bytecode replaces control port)
+  for (const auto& conn : outer_proto->connections) {
+    if (conn.to_port == "c1") {
+      for (const auto& op : outer_proto->operators) {
+        if (op.id == conn.to_id && op.type == "Pipeline") {
+          ADD_FAILURE() << "Pipeline should NOT have a c1 connection (bytecode path)";
         }
       }
     }
-    EXPECT_TRUE(cmp_to_b2n)
-        << "CompareGT should connect to BooleanToNumber in outer prototype";
-    EXPECT_TRUE(b2n_to_pipeline_c1)
-        << "BooleanToNumber should connect to Pipeline c1 in outer prototype";
   }
 
   // Inner prototype: with fusion → FusedExpression; without → CumulativeSum + CountNumber + VectorCompose
@@ -978,27 +940,42 @@ TEST_F(SegmentGroupByTest, CompositeKeysWithSegmentExpression) {
   ASSERT_NE(outer_proto, nullptr) << "One prototype should contain a Pipeline";
   ASSERT_NE(inner_proto, nullptr) << "One prototype should be the inner aggregate";
 
-  // Outer prototype should contain segment expression operators and Pipeline
-  bool proto_has_abs = false, proto_has_cmp = false, proto_has_pipeline = false;
+  // Outer prototype: segment expression compiled to bytecode.
+  // No Abs/CompareGT/BooleanToNumber operators — Pipeline has segmentBytecode.
+  bool proto_has_pipeline = false;
   for (const auto& op : outer_proto->operators) {
-    if (op.type == "Abs") proto_has_abs = true;
-    if (op.type == "CompareGT") {
-      proto_has_cmp = true;
-      EXPECT_EQ(op.params.at("value"), 0.0);
-    }
+    EXPECT_NE(op.type, "Abs")
+        << "Abs should NOT be in outer prototype (bytecode path)";
+    EXPECT_NE(op.type, "CompareGT")
+        << "CompareGT should NOT be in outer prototype (bytecode path)";
+    EXPECT_NE(op.type, "BooleanToNumber")
+        << "BooleanToNumber should NOT be in outer prototype (bytecode path)";
     if (op.type == "Pipeline") proto_has_pipeline = true;
   }
-  EXPECT_TRUE(proto_has_abs) << "Outer prototype should have Abs for segment expr";
-  EXPECT_TRUE(proto_has_cmp) << "Outer prototype should have CompareGT for segment expr";
   EXPECT_TRUE(proto_has_pipeline) << "Outer prototype should have Pipeline";
 
-  // Outer prototype should contain BooleanToNumber between predicate and Pipeline c1
-  bool proto_has_b2n = false;
+  // Pipeline in outer prototype should have segmentBytecode/segmentConstants
   for (const auto& op : outer_proto->operators) {
-    if (op.type == "BooleanToNumber") proto_has_b2n = true;
+    if (op.type == "Pipeline") {
+      EXPECT_TRUE(op.double_array_params.count("segmentBytecode"))
+          << "Pipeline should have segmentBytecode";
+      EXPECT_TRUE(op.double_array_params.count("segmentConstants"))
+          << "Pipeline should have segmentConstants";
+      EXPECT_FALSE(op.double_array_params.at("segmentBytecode").empty())
+          << "segmentBytecode should not be empty";
+    }
   }
-  EXPECT_TRUE(proto_has_b2n)
-      << "Outer prototype should have BooleanToNumber for segment predicate conversion";
+
+  // No c1 connections to Pipeline in outer prototype (bytecode path)
+  for (const auto& conn : outer_proto->connections) {
+    if (conn.to_port == "c1") {
+      for (const auto& op : outer_proto->operators) {
+        if (op.id == conn.to_id && op.type == "Pipeline") {
+          ADD_FAILURE() << "Pipeline should NOT have a c1 connection (bytecode path)";
+        }
+      }
+    }
+  }
 
   // Inner prototype: with fusion → FusedExpression; without → key extracts + CumulativeSum + CountNumber + VectorCompose
   bool has_cumsum = false, has_count = false, has_compose = false, has_fused = false;

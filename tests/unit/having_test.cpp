@@ -312,9 +312,8 @@ TEST_F(HavingTest, HavingDeviationFromBaseline) {
 // GROUP BY ABS(price) > 0
 // HAVING SUM(quantity) > 100
 //
-// Expected operator graph:
-//   input → [ABS+CompareGT(0)] → bool_ep → BooleanToNumber → num_ep
-//   input → Pipeline.i1, num_ep → Pipeline.c1
+// Expected operator graph (bytecode path):
+//   input → Pipeline.i1  (Pipeline has segmentBytecode for ABS(price)>0)
 //   Pipeline.o1 → VectorExtract(0) → CompareGT(100) → Demux.c1
 //   Pipeline.o1 → Demux.i1
 //   Demux.o1 → returned endpoint
@@ -352,13 +351,36 @@ TEST_F(HavingTest, SegmentHavingPostPipelineFilter) {
   }
   EXPECT_TRUE(has_pipeline) << "Pipeline should be in outer graph";
 
-  // 2b. BooleanToNumber exists between predicate and Pipeline c1
-  bool has_b2n = false;
+  // 2b. Segment expression is compiled to bytecode — no BooleanToNumber in outer graph
   for (const auto& op : builder.operators()) {
-    if (op.type == "BooleanToNumber") has_b2n = true;
+    EXPECT_NE(op.type, "BooleanToNumber")
+        << "BooleanToNumber should NOT be in outer graph (bytecode path)";
+    EXPECT_NE(op.type, "Abs")
+        << "Abs should NOT be in outer graph (bytecode path)";
   }
-  EXPECT_TRUE(has_b2n)
-      << "BooleanToNumber should be in outer graph between predicate and Pipeline c1";
+
+  // 2c. Pipeline should have segmentBytecode and segmentConstants
+  for (const auto& op : builder.operators()) {
+    if (op.type == "Pipeline") {
+      EXPECT_TRUE(op.double_array_params.count("segmentBytecode"))
+          << "Pipeline should have segmentBytecode";
+      EXPECT_TRUE(op.double_array_params.count("segmentConstants"))
+          << "Pipeline should have segmentConstants";
+      EXPECT_FALSE(op.double_array_params.at("segmentBytecode").empty())
+          << "segmentBytecode should not be empty";
+    }
+  }
+
+  // 2d. No c1 connections to Pipeline (bytecode replaces control port)
+  for (const auto& conn : builder.connections()) {
+    if (conn.to_port == "c1") {
+      for (const auto& op : builder.operators()) {
+        if (op.id == conn.to_id && op.type == "Pipeline") {
+          ADD_FAILURE() << "Pipeline should NOT have a c1 connection (bytecode path)";
+        }
+      }
+    }
+  }
 
   // 3. Demultiplexer exists in the outer graph (post-filter)
   bool has_demux = false;
@@ -372,8 +394,7 @@ TEST_F(HavingTest, SegmentHavingPostPipelineFilter) {
   EXPECT_TRUE(has_demux) << "Demultiplexer should be in outer graph (post-Pipeline filter)";
 
   // 4. CompareGT(100) exists in the outer graph (for HAVING threshold)
-  //    Note: ABS(price) > 0 also creates a CompareGT(0), so check for at least
-  //    one with value 100.
+  //    Note: With bytecode path, ABS(price) > 0 no longer creates a CompareGT(0).
   bool has_having_cmp = false;
   for (const auto& op : builder.operators()) {
     if (op.type == "CompareGT" && op.params.count("value") &&
