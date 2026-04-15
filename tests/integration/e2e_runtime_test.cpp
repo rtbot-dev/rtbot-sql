@@ -3256,5 +3256,162 @@ TEST_F(E2eRuntimeTest, FusedAggregateSegmentMaxReset) {
   EXPECT_DOUBLE_EQ(all_outputs[2].values[cnt_idx], 2.0);
 }
 
+// ---------------------------------------------------------------------------
+// SF-e2e-1: Segment fusion e2e — boolean segment expression with SUM/COUNT
+//
+// Full pipeline test: SQL → compiler → bytecode → Pipeline operator →
+// segment boundaries → correct aggregated output.
+//
+// CREATE STREAM vibrations (device_id FLOAT, channel_id FLOAT, amplitude FLOAT)
+// CREATE MATERIALIZED VIEW moments AS
+// SELECT SUM(amplitude) AS total, COUNT(*) AS cnt
+// FROM vibrations
+// GROUP BY ABS(amplitude) > 0
+//
+// This validates the complete segment fusion path:
+//   1. Boolean expression ABS(amplitude) > 0 compiles to segment key bytecode
+//   2. Pipeline accumulates aggregates while key stays constant
+//   3. On key transition, accumulated segment is emitted with correct values
+//   4. Aggregates reset properly for the next segment
+//
+// Data pattern: three active messages → one silence → verify emission
+// ---------------------------------------------------------------------------
+
+TEST_F(E2eRuntimeTest, SegmentFusionBooleanExprSumCount) {
+  // Register vibrations stream with 3 columns matching the task SQL
+  StreamSchema vibrations{
+      "vibrations",
+      {{"device_id", 0}, {"channel_id", 1}, {"amplitude", 2}}};
+  catalog.streams["vibrations"] = vibrations;
+
+  auto r = compile(
+      "CREATE MATERIALIZED VIEW moments AS "
+      "SELECT SUM(amplitude) AS total, COUNT(*) AS cnt "
+      "FROM vibrations "
+      "GROUP BY ABS(amplitude) > 0");
+
+  ASSERT_FALSE(r.has_errors());
+
+  // Segment-only GROUP BY should produce SCALAR view with no key column
+  EXPECT_EQ(r.view_type, ViewType::SCALAR)
+      << "Segment-only GROUP BY should produce SCALAR view";
+  EXPECT_EQ(r.key_index, -1)
+      << "No persistent key — segment expression only";
+
+  // Verify the compiled graph contains Pipeline (segment-scoped aggregation)
+  auto program_json = json::parse(r.program_json);
+  EXPECT_TRUE(json_contains_operator_type(program_json, "Pipeline"))
+      << "Segment GROUP BY must compile to Pipeline for scoped aggregation";
+
+  int total_idx = r.field_map.at("total");
+  int cnt_idx = r.field_map.at("cnt");
+
+  rtbot::Program program(r.program_json);
+
+  // Collect all outputs for validation
+  struct OutputRow {
+    rtbot::timestamp_t time;
+    std::vector<double> values;
+  };
+  std::vector<OutputRow> all_outputs;
+
+  auto collect = [&](const rtbot::ProgramMsgBatch& batch) {
+    for (const auto& [op_id, op_batch] : batch) {
+      for (const auto& [port, msgs] : op_batch) {
+        for (const auto& msg : msgs) {
+          auto* vec_msg =
+              dynamic_cast<rtbot::Message<rtbot::VectorNumberData>*>(msg.get());
+          if (vec_msg) {
+            all_outputs.push_back({vec_msg->time, *vec_msg->data.values});
+          }
+        }
+      }
+    }
+  };
+
+  // ── Segment 1: active (amplitude > 0) ──
+  // vibrations columns: [device_id=0, channel_id=1, amplitude=2]
+  //
+  // t=1: amplitude=5.0 → ABS(5)>0 = 1.0 (active) → first msg, key=1.0
+  // t=2: amplitude=3.0 → ABS(3)>0 = 1.0           → same key, accumulate
+  // t=3: amplitude=7.0 → ABS(7)>0 = 1.0           → same key, accumulate
+
+  collect(send(program, 1, {1, 1, 5.0}));
+  EXPECT_EQ(all_outputs.size(), 0u)
+      << "First message starts segment — no output";
+
+  collect(send(program, 2, {1, 1, 3.0}));
+  EXPECT_EQ(all_outputs.size(), 0u)
+      << "Same segment key — accumulating, no output";
+
+  collect(send(program, 3, {1, 1, 7.0}));
+  EXPECT_EQ(all_outputs.size(), 0u)
+      << "Same segment key — accumulating, no output";
+
+  // ── Segment boundary: amplitude=0 triggers emission ──
+  // t=4: amplitude=0.0 → ABS(0)>0 = 0.0 (silence) → KEY CHANGE!
+  // Pipeline emits accumulated active segment: SUM(5+3+7)=15, COUNT=3
+
+  collect(send(program, 4, {1, 1, 0.0}));
+  ASSERT_EQ(all_outputs.size(), 1u)
+      << "Key transition at t=4 should emit exactly one segment result";
+
+  {
+    SCOPED_TRACE("Emission 1: active segment t=1..3");
+    const auto& out = all_outputs[0];
+    EXPECT_EQ(out.time, 4u)
+        << "Emission timestamp should be the boundary message time";
+    EXPECT_DOUBLE_EQ(out.values[total_idx], 15.0)
+        << "SUM(5 + 3 + 7) = 15";
+    EXPECT_DOUBLE_EQ(out.values[cnt_idx], 3.0)
+        << "COUNT = 3 messages in segment";
+  }
+
+  // ── Verify aggregate reset: second active segment ──
+  // After emission, Pipeline resets internal state. A new active segment
+  // must accumulate from scratch, not carry over from segment 1.
+  //
+  // t=5: amplitude=0.0 → still silence, accumulate
+  // t=6: amplitude=2.0 → ABS(2)>0 = 1.0 → KEY CHANGE! emit silence segment
+  // t=7: amplitude=8.0 → same active key, accumulate
+  // t=8: amplitude=0.0 → KEY CHANGE! emit active segment 2
+
+  collect(send(program, 5, {1, 1, 0.0}));
+  EXPECT_EQ(all_outputs.size(), 1u)
+      << "Same silence key — accumulating, no output";
+
+  collect(send(program, 6, {1, 1, 2.0}));
+  ASSERT_EQ(all_outputs.size(), 2u)
+      << "Key change at t=6 emits silence segment";
+
+  {
+    SCOPED_TRACE("Emission 2: silence segment t=4..5");
+    const auto& out = all_outputs[1];
+    EXPECT_EQ(out.time, 6u);
+    EXPECT_DOUBLE_EQ(out.values[total_idx], 0.0)
+        << "SUM(0 + 0) = 0 for silence segment";
+    EXPECT_DOUBLE_EQ(out.values[cnt_idx], 2.0)
+        << "COUNT = 2 messages in silence segment";
+  }
+
+  collect(send(program, 7, {1, 1, 8.0}));
+  EXPECT_EQ(all_outputs.size(), 2u)
+      << "Same active key — accumulating, no output";
+
+  collect(send(program, 8, {1, 1, 0.0}));
+  ASSERT_EQ(all_outputs.size(), 3u)
+      << "Key change at t=8 emits active segment 2";
+
+  {
+    SCOPED_TRACE("Emission 3: active segment 2 (t=6..7) — reset verification");
+    const auto& out = all_outputs[2];
+    EXPECT_EQ(out.time, 8u);
+    EXPECT_DOUBLE_EQ(out.values[total_idx], 10.0)
+        << "SUM(2 + 8) = 10 — aggregates reset after segment 1";
+    EXPECT_DOUBLE_EQ(out.values[cnt_idx], 2.0)
+        << "COUNT = 2 messages in active segment 2";
+  }
+}
+
 }  // namespace
 }  // namespace rtbot_sql::api
