@@ -372,55 +372,24 @@ SelectResult compile_group_by(
       }
     }
 
-    // --- For composite keys: build hash-augmented vector in outer graph ---
+    // --- For composite keys: compute key coefficients for KeyedPipeline ---
     Endpoint keyed_input = input_endpoint;
-    int keyed_key_index = keys[0].index;  // single-key default
+    std::vector<int> key_column_indices;
+    std::vector<double> key_coefficients;
 
     if (composite) {
-      if (num_input_cols <= 0) {
-        throw std::runtime_error(
-            "composite GROUP BY with segment expression requires stream column count "
-            "(internal error)");
-      }
-
       static const double PRIME = 1000003.0;
-
-      // Extract all columns from input vector
-      std::vector<std::string> extract_ids;
-      extract_ids.reserve(num_input_cols);
-      for (int c = 0; c < num_input_cols; ++c) {
-        auto eid = builder.next_id("extract");
-        builder.add_operator(eid, "VectorExtract",
-                             {{"index", static_cast<double>(c)}});
-        builder.connect(input_endpoint, {eid, "i1"});
-        extract_ids.push_back(eid);
+      // Precompute coefficients: PRIME^(N-1), PRIME^(N-2), ..., 1
+      double coeff = 1.0;
+      key_column_indices.reserve(keys.size());
+      key_coefficients.resize(keys.size());
+      for (int i = static_cast<int>(keys.size()) - 1; i >= 0; --i) {
+        key_column_indices.push_back(keys[i].index);
+        key_coefficients[i] = coeff;
+        coeff *= PRIME;
       }
-
-      // Compute hash = PRIME * key0 + key1 (+ ... for more keys via chaining)
-      std::string hash_ep_id = extract_ids[keys[0].index];
-      for (size_t ki = 1; ki < keys.size(); ++ki) {
-        auto lin_id = builder.next_id("linear");
-        builder.add_operator(lin_id, "Linear", {},
-                             {}, {{"coefficients", {PRIME, 1.0}}});
-        builder.connect({hash_ep_id, "o1"}, {lin_id, "i1"});
-        builder.connect({extract_ids[keys[ki].index], "o1"}, {lin_id, "i2"});
-        hash_ep_id = lin_id;
-      }
-
-      // Compose augmented vector: [original cols..., hash]
-      int compose_n = num_input_cols + 1;
-      auto compose_id = builder.next_id("augment");
-      builder.add_operator(compose_id, "VectorCompose",
-                           {{"numPorts", static_cast<double>(compose_n)}});
-      for (int c = 0; c < num_input_cols; ++c) {
-        builder.connect({extract_ids[c], "o1"},
-                        {compose_id, "i" + std::to_string(c + 1)});
-      }
-      builder.connect({hash_ep_id, "o1"},
-                      {compose_id, "i" + std::to_string(compose_n)});
-
-      keyed_input = {compose_id, "o1"};
-      keyed_key_index = num_input_cols;  // hash column at end of augmented vector
+      // Fix order: key_column_indices was filled backwards
+      std::reverse(key_column_indices.begin(), key_column_indices.end());
     }
 
     // --- Build inner prototype (aggregates for Pipeline) ---
@@ -632,32 +601,30 @@ SelectResult compile_group_by(
 
     // --- Add KeyedPipeline to outer graph ---
     auto keyed_id = builder.next_id("keyed");
-    builder.add_operator(keyed_id, "KeyedPipeline",
-                         {{"key_index", static_cast<double>(keyed_key_index)}},
-                         {{"prototype", outer_proto_id}});
+    if (composite) {
+      // Computed key mode: KeyedPipeline computes hash internally,
+      // output is prototype output directly (no key prepend, no VectorProject).
+      builder.add_operator(keyed_id, "KeyedPipeline",
+                           {},  // no scalar params
+                           {{"prototype", outer_proto_id}},
+                           {{"keyCoefficients", key_coefficients}},
+                           {{"keyColumnIndices", key_column_indices}});
+    } else {
+      builder.add_operator(keyed_id, "KeyedPipeline",
+                           {{"key_index", static_cast<double>(keys[0].index)}},
+                           {{"prototype", outer_proto_id}});
+    }
     builder.connect(keyed_input, {keyed_id, "i1"});
 
     // --- Build field map ---
     if (composite) {
-      // KeyedPipeline prepends an internal hash key at index 0, shifting
-      // prototype outputs by 1.  Add a VectorProject to strip the hash key
-      // so that downstream consumers (and the view's public field_map)
-      // see a clean, 0-based vector: [key0, key1, agg0, agg1, ...].
-      std::vector<int> proj_indices;
-      proj_indices.reserve(field_names.size());
-      for (size_t i = 0; i < field_names.size(); ++i) {
-        proj_indices.push_back(static_cast<int>(i + 1));  // skip hash at 0
-      }
-      auto proj_id = builder.next_id("proj");
-      builder.add_operator(proj_id, "VectorProject", {}, {}, {},
-                           {{"indices", proj_indices}});
-      builder.connect({keyed_id, "o1"}, {proj_id, "i1"});
-
+      // Computed key mode: no VectorProject needed, output is directly
+      // [key0, key1, ..., agg0, agg1, ...] from prototype
       FieldMap field_map;
       for (size_t i = 0; i < field_names.size(); ++i) {
         field_map[field_names[i]] = static_cast<int>(i);
       }
-      return {{proj_id, "o1"}, field_map, /*is_segment_only=*/false};
+      return {{keyed_id, "o1"}, field_map, /*is_segment_only=*/false};
     } else {
       // Single key: key at index 0 (prepended by KeyedPipeline), aggregates at 1, 2, ...
       FieldMap field_map;

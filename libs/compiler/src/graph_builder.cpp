@@ -571,7 +571,10 @@ static void validate_graph(const std::vector<OperatorDef>& ops,
     else if (op.type == "ConstantNumber")
       require_param(op, "value");
     else if (op.type == "KeyedPipeline") {
-      require_param(op, "key_index");
+      // Computed key mode uses int_array_params keyColumnIndices; classic mode uses key_index
+      if (!op.int_array_params.count("keyColumnIndices")) {
+        require_param(op, "key_index");
+      }
       require_string_param(op, "prototype");
     }
     else if (op.type == "Pipeline") {
