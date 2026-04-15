@@ -1,6 +1,7 @@
 #include "rtbot_sql/compiler/select_compiler.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -130,7 +131,8 @@ SelectResult compile_select_projection(
 
   // --- Attempt fused expression path ---
   // Try to compile all SELECT items into bytecode for a single FusedExpression.
-  {
+  // Disabled when RTBOT_DISABLE_FUSION=1 (for A/B comparison benchmarks).
+  if (std::getenv("RTBOT_DISABLE_FUSION") == nullptr) {
     std::map<std::pair<std::string, int>, int> column_to_input;
     std::vector<double> constants;
     std::vector<double> all_bytecode;
