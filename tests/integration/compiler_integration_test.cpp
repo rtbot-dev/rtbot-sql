@@ -940,11 +940,11 @@ TEST_F(CompilerIntegrationTest, CompositeKeysWithSegmentExpression) {
   EXPECT_TRUE(has_nested_pipeline)
       << "KeyedPipeline prototype should contain Pipeline";
 
-  // Field map: hash at 0 (prepended by KeyedPipeline), then key cols, then aggs
-  EXPECT_EQ(r.field_map.at("device_id"), 1);
-  EXPECT_EQ(r.field_map.at("channel_id"), 2);
-  EXPECT_EQ(r.field_map.at("total"), 3);
-  EXPECT_EQ(r.field_map.at("cnt"), 4);
+  // Field map: VectorProject strips hash key, so field indices are 0-based
+  EXPECT_EQ(r.field_map.at("device_id"), 0);
+  EXPECT_EQ(r.field_map.at("channel_id"), 1);
+  EXPECT_EQ(r.field_map.at("total"), 2);
+  EXPECT_EQ(r.field_map.at("cnt"), 3);
 }
 
 // --- Preset-style: RMS trend pattern ---
@@ -999,11 +999,11 @@ TEST_F(CompilerIntegrationTest, PresetRmsTrendPattern) {
   EXPECT_TRUE(has_inner_pipeline) << "should have nested Pipeline";
   EXPECT_TRUE(has_inner_ma) << "inner prototype should have MovingAverage";
 
-  // Field map
-  EXPECT_EQ(r.field_map.at("device_id"), 1);
-  EXPECT_EQ(r.field_map.at("channel_id"), 2);
-  EXPECT_EQ(r.field_map.at("rms_ma"), 3);
-  EXPECT_EQ(r.field_map.at("sample_count"), 4);
+  // Field map: VectorProject strips hash key, so field indices are 0-based
+  EXPECT_EQ(r.field_map.at("device_id"), 0);
+  EXPECT_EQ(r.field_map.at("channel_id"), 1);
+  EXPECT_EQ(r.field_map.at("rms_ma"), 2);
+  EXPECT_EQ(r.field_map.at("sample_count"), 3);
 }
 
 // --- CreateStreamSyntax: verify that the raw STREAM keyword is accepted ---
