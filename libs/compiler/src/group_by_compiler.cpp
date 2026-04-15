@@ -587,23 +587,36 @@ SelectResult compile_group_by(
     Endpoint outer_input_ep{"proto_in", "o1"};
     outer_proto_builder.add_operator("proto_in", "Input");
 
-    // Compile segment expression as a predicate inside the outer prototype
-    auto bool_ep =
-        compile_predicate(*segment_expr, outer_input_ep, scope, outer_proto_builder);
+    // Try bytecode path for segment expression first
+    auto seg_result = compile_segment_to_bytecode(*segment_expr, scope, "");
 
-    // Convert boolean predicate to numeric segment key (Pipeline c1 expects NumberData)
-    auto b2n_id = outer_proto_builder.next_id("b2n");
-    outer_proto_builder.add_operator(b2n_id, "BooleanToNumber");
-    outer_proto_builder.connect(bool_ep, {b2n_id, "i1"});
-    Endpoint num_ep{b2n_id, "o1"};
-
-    // Add Pipeline operator inside the outer prototype
     auto pipeline_id = outer_proto_builder.next_id("pipeline");
-    outer_proto_builder.add_operator(pipeline_id, "Pipeline",
-                                     /*params=*/{},
-                                     /*string_params=*/{{"prototype", inner_proto_id}});
-    outer_proto_builder.connect(outer_input_ep, {pipeline_id, "i1"});
-    outer_proto_builder.connect(num_ep, {pipeline_id, "c1"});
+    if (seg_result.success) {
+      // Bytecode path: emit Pipeline with segmentBytecode/segmentConstants
+      outer_proto_builder.add_operator(pipeline_id, "Pipeline",
+                                       /*params=*/{},
+                                       /*string_params=*/{{"prototype", inner_proto_id}},
+                                       /*double_array_params=*/{
+                                           {"segmentBytecode", seg_result.bytecode},
+                                           {"segmentConstants", seg_result.constants}});
+      outer_proto_builder.connect(outer_input_ep, {pipeline_id, "i1"});
+    } else {
+      // Fallback: operator chain (compile_predicate + BooleanToNumber)
+      auto bool_ep =
+          compile_predicate(*segment_expr, outer_input_ep, scope, outer_proto_builder);
+
+      // Convert boolean predicate to numeric segment key (Pipeline c1 expects NumberData)
+      auto b2n_id = outer_proto_builder.next_id("b2n");
+      outer_proto_builder.add_operator(b2n_id, "BooleanToNumber");
+      outer_proto_builder.connect(bool_ep, {b2n_id, "i1"});
+      Endpoint num_ep{b2n_id, "o1"};
+
+      outer_proto_builder.add_operator(pipeline_id, "Pipeline",
+                                       /*params=*/{},
+                                       /*string_params=*/{{"prototype", inner_proto_id}});
+      outer_proto_builder.connect(outer_input_ep, {pipeline_id, "i1"});
+      outer_proto_builder.connect(num_ep, {pipeline_id, "c1"});
+    }
 
     outer_proto_builder.add_operator("proto_out", "Output");
     outer_proto_builder.connect({pipeline_id, "o1"}, {"proto_out", "i1"});
@@ -662,28 +675,35 @@ SelectResult compile_group_by(
           "multiple segment expressions in GROUP BY not yet supported");
     }
 
-    // Compile the segment expression in the outer graph.
-    // Boolean expressions → compile_predicate() + BooleanToNumber
-    // Numeric expressions → compile_expression() directly (feeds Pipeline c1)
     const auto& seg_expr = group_by[0];
-    bool is_boolean =
-        std::get_if<std::unique_ptr<parser::ast::ComparisonExpr>>(&seg_expr) != nullptr
-     || std::get_if<std::unique_ptr<parser::ast::LogicalExpr>>(&seg_expr) != nullptr
-     || std::get_if<std::unique_ptr<parser::ast::NotExpr>>(&seg_expr) != nullptr
-     || std::get_if<std::unique_ptr<parser::ast::BetweenExpr>>(&seg_expr) != nullptr;
 
+    // Try bytecode path for segment expression first
+    auto seg_result = compile_segment_to_bytecode(seg_expr, scope, "");
+    bool use_bytecode = seg_result.success;
+
+    // Fallback: compile segment expression as operator chain
     Endpoint num_ep;
-    if (is_boolean) {
-      auto bool_ep =
-          compile_predicate(seg_expr, input_endpoint, scope, builder);
-      auto b2n_id = builder.next_id("b2n");
-      builder.add_operator(b2n_id, "BooleanToNumber");
-      builder.connect(bool_ep, {b2n_id, "i1"});
-      num_ep = {b2n_id, "o1"};
-    } else {
-      // Numeric segment expression (e.g., FLOOR(TS() / N)) — feeds Pipeline c1 directly
-      auto result = compile_expression(seg_expr, input_endpoint, scope, builder);
-      num_ep = ensure_endpoint(std::move(result), input_endpoint, builder);
+    if (!use_bytecode) {
+      // Boolean expressions → compile_predicate() + BooleanToNumber
+      // Numeric expressions → compile_expression() directly (feeds Pipeline c1)
+      bool is_boolean =
+          std::get_if<std::unique_ptr<parser::ast::ComparisonExpr>>(&seg_expr) != nullptr
+       || std::get_if<std::unique_ptr<parser::ast::LogicalExpr>>(&seg_expr) != nullptr
+       || std::get_if<std::unique_ptr<parser::ast::NotExpr>>(&seg_expr) != nullptr
+       || std::get_if<std::unique_ptr<parser::ast::BetweenExpr>>(&seg_expr) != nullptr;
+
+      if (is_boolean) {
+        auto bool_ep =
+            compile_predicate(seg_expr, input_endpoint, scope, builder);
+        auto b2n_id = builder.next_id("b2n");
+        builder.add_operator(b2n_id, "BooleanToNumber");
+        builder.connect(bool_ep, {b2n_id, "i1"});
+        num_ep = {b2n_id, "o1"};
+      } else {
+        // Numeric segment expression (e.g., FLOOR(TS() / N)) — feeds Pipeline c1 directly
+        auto result = compile_expression(seg_expr, input_endpoint, scope, builder);
+        num_ep = ensure_endpoint(std::move(result), input_endpoint, builder);
+      }
     }
 
     // Build prototype sub-graph for aggregates
@@ -728,13 +748,25 @@ SelectResult compile_group_by(
     proto_def.connections = proto_builder.connections();
     builder.add_prototype(proto_def);
 
-    // Add Pipeline to outer graph with control port
+    // Add Pipeline to outer graph
     auto pipeline_id = builder.next_id("pipeline");
-    builder.add_operator(pipeline_id, "Pipeline",
-                         /*params=*/{},
-                         /*string_params=*/{{"prototype", proto_id}});
-    builder.connect(input_endpoint, {pipeline_id, "i1"});
-    builder.connect(num_ep, {pipeline_id, "c1"});
+    if (use_bytecode) {
+      // Bytecode path: emit Pipeline with segmentBytecode/segmentConstants
+      builder.add_operator(pipeline_id, "Pipeline",
+                           /*params=*/{},
+                           /*string_params=*/{{"prototype", proto_id}},
+                           /*double_array_params=*/{
+                               {"segmentBytecode", seg_result.bytecode},
+                               {"segmentConstants", seg_result.constants}});
+      builder.connect(input_endpoint, {pipeline_id, "i1"});
+    } else {
+      // Fallback: operator chain with control port
+      builder.add_operator(pipeline_id, "Pipeline",
+                           /*params=*/{},
+                           /*string_params=*/{{"prototype", proto_id}});
+      builder.connect(input_endpoint, {pipeline_id, "i1"});
+      builder.connect(num_ep, {pipeline_id, "c1"});
+    }
 
     // --- HAVING (if present): post-Pipeline filter ---
     Endpoint pipeline_output{pipeline_id, "o1"};
