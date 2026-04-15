@@ -229,24 +229,38 @@ TEST_F(GroupByTest, CompositeGroupByTwoKeys) {
       compile_group_by(select_list, group_by, std::nullopt, input, scope,
                        builder, 4 /*num_input_cols*/);
 
-  // Outer graph must have: VectorExtract×4, Linear (hash), VectorCompose
-  // (augment), KeyedPipeline.
-  bool has_linear = false;
+  // Outer graph must have: KeyedPipeline with computed key (keyColumnIndices).
+  // No Linear, VectorCompose, or VectorProject needed.
   bool has_keyed = false;
-  bool has_augment_compose = false;
   for (const auto& op : builder.operators()) {
-    if (op.type == "Linear") has_linear = true;
-    if (op.type == "KeyedPipeline") has_keyed = true;
-    if (op.type == "VectorCompose") has_augment_compose = true;
+    EXPECT_NE(op.type, "Linear")
+        << "Linear should NOT be in outer graph (computed key mode)";
+    EXPECT_NE(op.type, "VectorCompose")
+        << "VectorCompose should NOT be in outer graph (computed key mode)";
+    EXPECT_NE(op.type, "VectorProject")
+        << "VectorProject should NOT be in outer graph (computed key mode)";
+    if (op.type == "KeyedPipeline") {
+      has_keyed = true;
+      // Computed key mode: no key_index, has keyColumnIndices (no keyCoefficients — computed internally)
+      EXPECT_EQ(op.params.count("key_index"), 0u)
+          << "Computed key mode should not have key_index";
+      ASSERT_TRUE(op.int_array_params.count("keyColumnIndices"))
+          << "KeyedPipeline should have keyColumnIndices";
+      EXPECT_EQ(op.double_array_params.count("keyCoefficients"), 0u)
+          << "keyCoefficients should not be in compiler output (computed internally)";
+      // instrument_id=0, account_id=3
+      const auto& indices = op.int_array_params.at("keyColumnIndices");
+      ASSERT_EQ(indices.size(), 2u);
+      EXPECT_EQ(indices[0], 0);  // instrument_id
+      EXPECT_EQ(indices[1], 3);  // account_id
+    }
   }
-  EXPECT_TRUE(has_linear) << "Expected Linear (hash) operator in outer graph";
   EXPECT_TRUE(has_keyed) << "Expected KeyedPipeline in outer graph";
-  EXPECT_TRUE(has_augment_compose) << "Expected VectorCompose in outer graph";
 
   // One prototype wrapping the per-key aggregation.
   ASSERT_EQ(builder.prototypes().size(), 1u);
 
-  // Field map: VectorProject strips hash key, so field indices are 0-based.
+  // Field map: computed key mode outputs directly (no VectorProject), 0-based.
   EXPECT_EQ(field_map.at("instrument_id"), 0);
   EXPECT_EQ(field_map.at("account_id"), 1);
   EXPECT_EQ(field_map.at("total"), 2);
@@ -902,23 +916,33 @@ TEST_F(SegmentGroupByTest, CompositeKeysWithSegmentExpression) {
   // Not segment-only (has persistent keys)
   EXPECT_FALSE(is_seg);
 
-  // Outer graph: should have hash computation (Linear), augmented vector
-  // (VectorCompose), and KeyedPipeline
-  bool has_linear = false;
+  // Outer graph: should have KeyedPipeline with computed key mode
+  // (keyColumnIndices).  No Linear, VectorCompose, or VectorProject.
   bool has_keyed = false;
-  bool has_augment_compose = false;
   for (const auto& op : builder.operators()) {
-    if (op.type == "Linear") has_linear = true;
+    EXPECT_NE(op.type, "Linear")
+        << "Linear should NOT be in outer graph (computed key mode)";
+    EXPECT_NE(op.type, "VectorCompose")
+        << "VectorCompose should NOT be in outer graph (computed key mode)";
+    EXPECT_NE(op.type, "VectorProject")
+        << "VectorProject should NOT be in outer graph (computed key mode)";
     if (op.type == "KeyedPipeline") {
       has_keyed = true;
-      // key_index should be num_input_cols (= 3, the hash column position)
-      EXPECT_EQ(op.params.at("key_index"), 3.0);
+      // Computed key mode: no key_index, has keyColumnIndices (no keyCoefficients — computed internally)
+      EXPECT_EQ(op.params.count("key_index"), 0u)
+          << "Computed key mode should not have key_index";
+      ASSERT_TRUE(op.int_array_params.count("keyColumnIndices"))
+          << "KeyedPipeline should have keyColumnIndices";
+      EXPECT_EQ(op.double_array_params.count("keyCoefficients"), 0u)
+          << "keyCoefficients should not be in compiler output (computed internally)";
+      // device_id=0, frequency=2
+      const auto& indices = op.int_array_params.at("keyColumnIndices");
+      ASSERT_EQ(indices.size(), 2u);
+      EXPECT_EQ(indices[0], 0);  // device_id
+      EXPECT_EQ(indices[1], 2);  // frequency
     }
-    if (op.type == "VectorCompose") has_augment_compose = true;
   }
-  EXPECT_TRUE(has_linear) << "Expected Linear (hash) operator in outer graph";
   EXPECT_TRUE(has_keyed) << "Expected KeyedPipeline in outer graph";
-  EXPECT_TRUE(has_augment_compose) << "Expected VectorCompose (augment) in outer graph";
 
   // Should have 2 prototypes: outer (segment + Pipeline) and inner (aggregates)
   EXPECT_EQ(builder.prototypes().size(), 2u);
@@ -1000,7 +1024,7 @@ TEST_F(SegmentGroupByTest, CompositeKeysWithSegmentExpression) {
   // Should extract columns for inputs (at least amplitude for aggregates)
   EXPECT_GE(extract_count, 1) << "Inner prototype should extract input columns";
 
-  // Field map: VectorProject strips hash key, so field indices are 0-based.
+  // Field map: computed key mode outputs directly (no VectorProject), 0-based.
   // prototype outputs: [device_id, frequency, total, cnt]
   EXPECT_EQ(field_map.at("device_id"), 0);
   EXPECT_EQ(field_map.at("frequency"), 1);

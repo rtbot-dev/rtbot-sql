@@ -412,14 +412,25 @@ TEST_F(CompilerIntegrationTest, CompositeGroupBy) {
   ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
   EXPECT_EQ(r.statement_type, StatementType::SELECT);
 
-  // Verify Linear hash and KeyedPipeline in graph
+  // Verify computed key KeyedPipeline in graph (no Linear, no VectorCompose)
   auto program = json::parse(r.program_json);
-  bool has_linear = false, has_keyed = false;
+  bool has_keyed = false;
   for (const auto& op : program["operators"]) {
-    if (op["type"] == "Linear") has_linear = true;
-    if (op["type"] == "KeyedPipeline") has_keyed = true;
+    EXPECT_NE(op["type"], "Linear")
+        << "Linear should NOT be in outer graph (computed key mode)";
+    EXPECT_NE(op["type"], "VectorCompose")
+        << "VectorCompose should NOT be in outer graph (computed key mode)";
+    if (op["type"] == "KeyedPipeline") {
+      has_keyed = true;
+      // Computed key mode: has keyColumnIndices, no key_index or keyCoefficients
+      EXPECT_FALSE(op.contains("key_index"))
+          << "Computed key mode should not have key_index";
+      EXPECT_TRUE(op.contains("keyColumnIndices"))
+          << "KeyedPipeline should have keyColumnIndices";
+      EXPECT_FALSE(op.contains("keyCoefficients"))
+          << "keyCoefficients should not be in JSON (computed internally by operator)";
+    }
   }
-  EXPECT_TRUE(has_linear) << "should have Linear for hash computation";
   EXPECT_TRUE(has_keyed) << "should have KeyedPipeline for routing";
 
   // Field map should include both key columns and the aggregate
@@ -916,17 +927,22 @@ TEST_F(CompilerIntegrationTest, CompositeKeysWithSegmentExpression) {
   EXPECT_EQ(r.view_type, ViewType::KEYED)
       << "Composite keys + segment should produce KEYED view";
 
-  // Verify KeyedPipeline with nested Pipeline in the program
+  // Verify KeyedPipeline with computed key and nested Pipeline in the program
   auto program = json::parse(r.program_json);
   bool has_keyed_pipeline = false;
   bool has_nested_pipeline = false;
-  bool has_linear = false;
   for (const auto& op : program["operators"]) {
-    if (op["type"] == "Linear") has_linear = true;
+    EXPECT_NE(op["type"], "Linear")
+        << "Linear should NOT be in outer graph (computed key mode)";
     if (op["type"] == "KeyedPipeline") {
       has_keyed_pipeline = true;
-      // key_index should be num_input_cols (= 3, the hash column)
-      EXPECT_EQ(op["key_index"], 3);
+      // Computed key mode: has keyColumnIndices, no key_index or keyCoefficients
+      EXPECT_FALSE(op.contains("key_index"))
+          << "Computed key mode should not have key_index";
+      EXPECT_TRUE(op.contains("keyColumnIndices"))
+          << "KeyedPipeline should have keyColumnIndices";
+      EXPECT_FALSE(op.contains("keyCoefficients"))
+          << "keyCoefficients should not be in JSON (computed internally by operator)";
       // Check that prototype contains a Pipeline
       if (op.contains("prototype") && op["prototype"].contains("operators")) {
         for (const auto& proto_op : op["prototype"]["operators"]) {
@@ -935,12 +951,11 @@ TEST_F(CompilerIntegrationTest, CompositeKeysWithSegmentExpression) {
       }
     }
   }
-  EXPECT_TRUE(has_linear) << "should have Linear for hash computation";
   EXPECT_TRUE(has_keyed_pipeline) << "should have KeyedPipeline";
   EXPECT_TRUE(has_nested_pipeline)
       << "KeyedPipeline prototype should contain Pipeline";
 
-  // Field map: VectorProject strips hash key, so field indices are 0-based
+  // Field map: computed key mode outputs directly (no VectorProject), 0-based
   EXPECT_EQ(r.field_map.at("device_id"), 0);
   EXPECT_EQ(r.field_map.at("channel_id"), 1);
   EXPECT_EQ(r.field_map.at("total"), 2);
