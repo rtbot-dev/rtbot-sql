@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -640,6 +641,135 @@ bool compile_expr_bytecode_recursive(
   return false;
 }
 
+// Recursive bytecode compilation for expressions that may contain aggregate
+// functions (SUM, COUNT, AVG, MAX, MIN). Non-aggregate sub-expressions
+// (ColumnRef, Constant, BinaryExpr, math functions) delegate to the pure
+// bytecode compiler. Returns false if expression is not fusable.
+bool compile_agg_expr_bytecode_recursive(
+    const parser::ast::Expr& expr,
+    const analyzer::Scope& scope,
+    std::map<std::pair<std::string, int>, int>& column_to_input,
+    std::vector<double>& constants,
+    std::vector<double>& bytecode,
+    AggBytecodeContext& agg_ctx) {
+  using namespace parser::ast;
+
+  // FuncCall — check for aggregate functions first, then delegate to pure path
+  if (auto* func_ptr = std::get_if<std::unique_ptr<FuncCall>>(&expr)) {
+    const auto& func = **func_ptr;
+    std::string upper_name = func.name;
+    std::transform(upper_name.begin(), upper_name.end(), upper_name.begin(),
+                   ::toupper);
+
+    // SUM(expr) → compile arg recursively, CUMSUM state_idx
+    if (upper_name == "SUM") {
+      if (func.args.size() != 1) return false;
+      if (!compile_agg_expr_bytecode_recursive(func.args[0], scope,
+              column_to_input, constants, bytecode, agg_ctx))
+        return false;
+      int si = static_cast<int>(agg_ctx.state_init.size());
+      agg_ctx.state_init.push_back(0.0);  // sum
+      agg_ctx.state_init.push_back(0.0);  // kahan compensation
+      bytecode.push_back(21);  // fused_op::CUMSUM
+      bytecode.push_back(static_cast<double>(si));
+      return true;
+    }
+
+    // COUNT(*) → COUNT opcode (first use) or STATE_LOAD (subsequent uses)
+    if (upper_name == "COUNT") {
+      if (!func.args.empty()) return false;  // only COUNT(*) supported
+      if (agg_ctx.shared_count_state_idx < 0) {
+        // First COUNT — allocate state slot
+        agg_ctx.shared_count_state_idx = static_cast<int>(agg_ctx.state_init.size());
+        agg_ctx.state_init.push_back(0.0);
+        agg_ctx.count_emitted = false;
+      }
+      if (!agg_ctx.count_emitted) {
+        bytecode.push_back(22);  // fused_op::COUNT
+        bytecode.push_back(static_cast<double>(agg_ctx.shared_count_state_idx));
+        agg_ctx.count_emitted = true;
+      } else {
+        bytecode.push_back(25);  // fused_op::STATE_LOAD
+        bytecode.push_back(static_cast<double>(agg_ctx.shared_count_state_idx));
+      }
+      return true;
+    }
+
+    // AVG(expr) → compile arg, CUMSUM, COUNT/STATE_LOAD, DIV
+    if (upper_name == "AVG") {
+      if (func.args.size() != 1) return false;
+      // CUMSUM(arg)
+      if (!compile_agg_expr_bytecode_recursive(func.args[0], scope,
+              column_to_input, constants, bytecode, agg_ctx))
+        return false;
+      int sum_si = static_cast<int>(agg_ctx.state_init.size());
+      agg_ctx.state_init.push_back(0.0);  // sum
+      agg_ctx.state_init.push_back(0.0);  // kahan compensation
+      bytecode.push_back(21);  // fused_op::CUMSUM
+      bytecode.push_back(static_cast<double>(sum_si));
+      // COUNT (shared across all AVGs and COUNT(*) in the query)
+      if (agg_ctx.shared_count_state_idx < 0) {
+        agg_ctx.shared_count_state_idx = static_cast<int>(agg_ctx.state_init.size());
+        agg_ctx.state_init.push_back(0.0);
+        agg_ctx.count_emitted = false;
+      }
+      if (!agg_ctx.count_emitted) {
+        bytecode.push_back(22);  // fused_op::COUNT
+        bytecode.push_back(static_cast<double>(agg_ctx.shared_count_state_idx));
+        agg_ctx.count_emitted = true;
+      } else {
+        bytecode.push_back(25);  // fused_op::STATE_LOAD
+        bytecode.push_back(static_cast<double>(agg_ctx.shared_count_state_idx));
+      }
+      // DIV
+      bytecode.push_back(5);  // fused_op::DIV
+      return true;
+    }
+
+    // MAX(expr) → compile arg, MAX_AGG state_idx
+    if (upper_name == "MAX") {
+      if (func.args.size() != 1) return false;
+      if (!compile_agg_expr_bytecode_recursive(func.args[0], scope,
+              column_to_input, constants, bytecode, agg_ctx))
+        return false;
+      int si = static_cast<int>(agg_ctx.state_init.size());
+      // Use -DBL_MAX instead of -infinity: JSON (RFC 8259) does not support
+      // Infinity/-Infinity, so nlohmann/json serializes them as null, causing
+      // deserialization failures.  -DBL_MAX is functionally equivalent for
+      // tracking a running maximum (any real input will exceed it).
+      agg_ctx.state_init.push_back(-std::numeric_limits<double>::max());
+      bytecode.push_back(23);  // fused_op::MAX_AGG
+      bytecode.push_back(static_cast<double>(si));
+      return true;
+    }
+
+    // MIN(expr) → compile arg, MIN_AGG state_idx
+    if (upper_name == "MIN") {
+      if (func.args.size() != 1) return false;
+      if (!compile_agg_expr_bytecode_recursive(func.args[0], scope,
+              column_to_input, constants, bytecode, agg_ctx))
+        return false;
+      int si = static_cast<int>(agg_ctx.state_init.size());
+      // Use DBL_MAX instead of +infinity: JSON does not support Infinity.
+      // DBL_MAX is functionally equivalent for tracking a running minimum.
+      agg_ctx.state_init.push_back(std::numeric_limits<double>::max());
+      bytecode.push_back(24);  // fused_op::MIN_AGG
+      bytecode.push_back(static_cast<double>(si));
+      return true;
+    }
+
+    // Non-aggregate functions (POWER, ABS, SQRT, etc.) — delegate to pure path.
+    // Windowed/DSP functions (MOVING_AVERAGE, etc.) will return false from the
+    // pure path since math_func_to_opcode returns -1 for them.
+  }
+
+  // For all non-FuncCall types and non-aggregate FuncCalls, delegate to
+  // the pure (non-aggregate) bytecode compiler which handles ColumnRef,
+  // Constant, BinaryExpr, and unary math functions.
+  return compile_expr_bytecode_recursive(expr, scope, column_to_input,
+                                          constants, bytecode, nullptr);
+}
+
 }  // anonymous namespace
 
 BytecodeResult compile_expression_to_bytecode(
@@ -652,6 +782,21 @@ BytecodeResult compile_expression_to_bytecode(
   result.success = compile_expr_bytecode_recursive(
       expr, scope, column_to_input, constants, result.bytecode,
       source_endpoints);
+  if (result.success) {
+    result.bytecode.push_back(20);  // fused_op::END
+  }
+  return result;
+}
+
+BytecodeResult compile_aggregate_expression_to_bytecode(
+    const parser::ast::Expr& expr,
+    const analyzer::Scope& scope,
+    std::map<std::pair<std::string, int>, int>& column_to_input,
+    std::vector<double>& constants,
+    AggBytecodeContext& agg_ctx) {
+  BytecodeResult result;
+  result.success = compile_agg_expr_bytecode_recursive(
+      expr, scope, column_to_input, constants, result.bytecode, agg_ctx);
   if (result.success) {
     result.bytecode.push_back(20);  // fused_op::END
   }

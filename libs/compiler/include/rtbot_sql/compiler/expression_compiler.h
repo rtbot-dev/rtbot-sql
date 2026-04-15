@@ -51,4 +51,25 @@ BytecodeResult compile_expression_to_bytecode(
     std::vector<double>& constants,
     const std::map<std::string, Endpoint>* source_endpoints = nullptr);
 
+// Context for compiling aggregate expressions to bytecode.
+// Shared across all expressions in a GROUP BY inner prototype to track
+// persistent state allocation and enable shared COUNT optimization.
+struct AggBytecodeContext {
+  std::vector<double> state_init;       // accumulated state init values
+  int shared_count_state_idx = -1;      // state index of shared COUNT slot (-1 = not yet allocated)
+  bool count_emitted = false;           // whether COUNT opcode has been emitted (vs STATE_LOAD)
+};
+
+// Compile an expression (possibly containing aggregates) into bytecode.
+// Used inside GROUP BY inner prototypes where SUM/COUNT/AVG/MAX/MIN are valid.
+// The agg_ctx tracks shared state (e.g., shared COUNT for multiple AVGs).
+// Returns success=false if expression contains non-fusable nodes (windowed
+// functions, CASE, TIMESHIFT, etc.), allowing fallback to operator-chain path.
+BytecodeResult compile_aggregate_expression_to_bytecode(
+    const parser::ast::Expr& expr,
+    const analyzer::Scope& scope,
+    std::map<std::pair<std::string, int>, int>& column_to_input,
+    std::vector<double>& constants,
+    AggBytecodeContext& agg_ctx);
+
 }  // namespace rtbot_sql::compiler
