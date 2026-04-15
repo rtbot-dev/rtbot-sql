@@ -1119,5 +1119,172 @@ TEST_F(AggBytecodeTest, PureExpressionPassthrough) {
   EXPECT_TRUE(agg_ctx.state_init.empty());  // no state needed for pure expressions
 }
 
+// =========================================================================
+// Segment bytecode compilation
+// =========================================================================
+
+// Helper to build ComparisonExpr
+Expr comparison(const std::string& op, Expr left, Expr right) {
+  auto e = std::make_unique<ComparisonExpr>();
+  e->op = op;
+  e->left = std::move(left);
+  e->right = std::move(right);
+  return e;
+}
+
+// Helper to build LogicalExpr
+Expr logical(const std::string& op, Expr left, Expr right) {
+  auto e = std::make_unique<LogicalExpr>();
+  e->op = op;
+  e->left = std::move(left);
+  e->right = std::move(right);
+  return e;
+}
+
+// Helper to build NotExpr
+Expr not_expr(Expr operand) {
+  auto e = std::make_unique<NotExpr>();
+  e->operand = std::move(operand);
+  return e;
+}
+
+// Helper to build BetweenExpr
+Expr between(Expr expr, Expr low, Expr high) {
+  auto e = std::make_unique<BetweenExpr>();
+  e->expr = std::move(expr);
+  e->low = std::move(low);
+  e->high = std::move(high);
+  return e;
+}
+
+TEST(SegmentBytecode, BooleanComparisonGT) {
+  // ABS(amplitude) > 0  where amplitude is column 2
+  // Expected bytecode: INPUT 2, ABS, CONST 0, GT, END
+  analyzer::Scope scope;
+  StreamSchema schema{"s", {{"device_id", 0}, {"channel_id", 1}, {"amplitude", 2}}};
+  scope.register_stream("s", schema);
+
+  auto expr = comparison(">", func("ABS", col("amplitude")), num(0.0));
+
+  auto result = compile_segment_to_bytecode(expr, scope, "s");
+  ASSERT_TRUE(result.success);
+  EXPECT_EQ(result.bytecode, std::vector<double>({0, 2, 7, 1, 0, 26, 20}));
+  EXPECT_EQ(result.constants, std::vector<double>({0.0}));
+}
+
+TEST(SegmentBytecode, BooleanComparisonLTE) {
+  analyzer::Scope scope;
+  StreamSchema schema{"s", {{"amplitude", 0}}};
+  scope.register_stream("s", schema);
+
+  auto expr = comparison("<=", col("amplitude"), num(100.0));
+
+  auto result = compile_segment_to_bytecode(expr, scope, "s");
+  ASSERT_TRUE(result.success);
+  EXPECT_EQ(result.bytecode, std::vector<double>({0, 0, 1, 0, 29, 20}));
+  EXPECT_EQ(result.constants, std::vector<double>({100.0}));
+}
+
+TEST(SegmentBytecode, LogicalAND) {
+  analyzer::Scope scope;
+  StreamSchema schema{"s", {{"amplitude", 0}}};
+  scope.register_stream("s", schema);
+
+  auto expr = logical("AND",
+      comparison(">", func("ABS", col("amplitude")), num(0.0)),
+      comparison("<", col("amplitude"), num(100.0)));
+
+  auto result = compile_segment_to_bytecode(expr, scope, "s");
+  ASSERT_TRUE(result.success);
+  EXPECT_EQ(result.bytecode,
+            std::vector<double>({0, 0, 7, 1, 0, 26, 0, 0, 1, 1, 28, 32, 20}));
+}
+
+TEST(SegmentBytecode, LogicalOR) {
+  analyzer::Scope scope;
+  StreamSchema schema{"s", {{"amplitude", 0}}};
+  scope.register_stream("s", schema);
+
+  auto expr = logical("OR",
+      comparison(">", col("amplitude"), num(100.0)),
+      comparison("<", col("amplitude"), num(-100.0)));
+
+  auto result = compile_segment_to_bytecode(expr, scope, "s");
+  ASSERT_TRUE(result.success);
+  EXPECT_EQ(result.bytecode,
+            std::vector<double>({0, 0, 1, 0, 26, 0, 0, 1, 1, 28, 33, 20}));
+}
+
+TEST(SegmentBytecode, NotComparison) {
+  analyzer::Scope scope;
+  StreamSchema schema{"s", {{"amplitude", 0}}};
+  scope.register_stream("s", schema);
+
+  auto expr = not_expr(comparison(">", col("amplitude"), num(5.0)));
+
+  auto result = compile_segment_to_bytecode(expr, scope, "s");
+  ASSERT_TRUE(result.success);
+  EXPECT_EQ(result.bytecode, std::vector<double>({0, 0, 1, 0, 26, 34, 20}));
+}
+
+TEST(SegmentBytecode, BetweenExpr) {
+  analyzer::Scope scope;
+  StreamSchema schema{"s", {{"amplitude", 0}}};
+  scope.register_stream("s", schema);
+
+  auto expr = between(col("amplitude"), num(10.0), num(100.0));
+
+  auto result = compile_segment_to_bytecode(expr, scope, "s");
+  ASSERT_TRUE(result.success);
+  EXPECT_EQ(result.bytecode,
+            std::vector<double>({0, 0, 1, 0, 27, 0, 0, 1, 1, 29, 32, 20}));
+  EXPECT_EQ(result.constants, std::vector<double>({10.0, 100.0}));
+}
+
+TEST(SegmentBytecode, NumericExpression) {
+  analyzer::Scope scope;
+  StreamSchema schema{"s", {{"amplitude", 0}}};
+  scope.register_stream("s", schema);
+
+  auto expr = func("FLOOR", binary("/", col("amplitude"), num(10.0)));
+
+  auto result = compile_segment_to_bytecode(expr, scope, "s");
+  ASSERT_TRUE(result.success);
+  EXPECT_EQ(result.bytecode, std::vector<double>({0, 0, 1, 0, 5, 16, 20}));
+}
+
+TEST(SegmentBytecode, NonFusableReturnsFalse) {
+  analyzer::Scope scope;
+  StreamSchema schema{"s", {{"amplitude", 0}}};
+  scope.register_stream("s", schema);
+
+  auto expr = comparison(">", func("TS", col("amplitude")), num(0.0));
+
+  auto result = compile_segment_to_bytecode(expr, scope, "s");
+  EXPECT_FALSE(result.success);
+}
+
+TEST(SegmentBytecode, AllComparisonOps) {
+  analyzer::Scope scope;
+  StreamSchema schema{"s", {{"x", 0}}};
+  scope.register_stream("s", schema);
+
+  auto test_op = [&](const std::string& op, double expected_opcode) {
+    auto expr = comparison(op, col("x"), num(1.0));
+    auto result = compile_segment_to_bytecode(expr, scope, "s");
+    ASSERT_TRUE(result.success) << "Failed for op: " << op;
+    ASSERT_GE(result.bytecode.size(), 4u);
+    EXPECT_EQ(result.bytecode[result.bytecode.size() - 2], expected_opcode)
+        << "Wrong opcode for op: " << op;
+  };
+
+  test_op(">", 26);   // GT
+  test_op(">=", 27);  // GTE
+  test_op("<", 28);   // LT
+  test_op("<=", 29);  // LTE
+  test_op("=", 30);   // EQ
+  test_op("!=", 31);  // NEQ
+}
+
 }  // namespace
 }  // namespace rtbot_sql::compiler

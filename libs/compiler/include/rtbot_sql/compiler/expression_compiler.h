@@ -72,4 +72,15 @@ BytecodeResult compile_aggregate_expression_to_bytecode(
     std::vector<double>& constants,
     AggBytecodeContext& agg_ctx);
 
+struct SegmentBytecodeResult {
+  std::vector<double> bytecode;
+  std::vector<double> constants;
+  bool success;
+};
+
+SegmentBytecodeResult compile_segment_to_bytecode(
+    const parser::ast::Expr& expr,
+    const analyzer::Scope& scope,
+    const std::string& stream_name);
+
 }  // namespace rtbot_sql::compiler

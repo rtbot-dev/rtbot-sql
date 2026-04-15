@@ -770,6 +770,187 @@ bool compile_agg_expr_bytecode_recursive(
                                           constants, bytecode, nullptr);
 }
 
+// Map comparison operator string to FusedExpression bytecode opcode.
+double comparison_op_to_opcode(const std::string& op) {
+  if (op == ">") return 26;   // fused_op::GT
+  if (op == ">=") return 27;  // fused_op::GTE
+  if (op == "<") return 28;   // fused_op::LT
+  if (op == "<=") return 29;  // fused_op::LTE
+  if (op == "=") return 30;   // fused_op::EQ
+  if (op == "!=") return 31;  // fused_op::NEQ
+  return -1;
+}
+
+// Recursive bytecode compilation for segment expressions.
+// Similar to compile_expr_bytecode_recursive but:
+// - INPUT arguments use binding.index directly (vector column index) instead of
+//   a column_to_input map
+// - Handles ComparisonExpr, LogicalExpr, NotExpr, BetweenExpr
+// Returns false if expression is not fusable.
+bool compile_segment_expr_recursive(
+    const parser::ast::Expr& expr,
+    const analyzer::Scope& scope,
+    const std::string& stream_name,
+    std::vector<double>& constants,
+    std::vector<double>& bytecode) {
+  using namespace parser::ast;
+
+  // ColumnRef → INPUT opcode with direct column index
+  if (auto* col = std::get_if<ColumnRef>(&expr)) {
+    auto result = scope.resolve(*col);
+    if (auto* err = std::get_if<std::string>(&result)) {
+      return false;  // unresolved column
+    }
+    auto& binding = std::get<analyzer::ColumnBinding>(result);
+    bytecode.push_back(0);  // fused_op::INPUT
+    bytecode.push_back(static_cast<double>(binding.index));
+    return true;
+  }
+
+  // Constant → CONST opcode
+  if (auto* c = std::get_if<Constant>(&expr)) {
+    int const_index = static_cast<int>(constants.size());
+    constants.push_back(c->value);
+    bytecode.push_back(1);  // fused_op::CONST
+    bytecode.push_back(static_cast<double>(const_index));
+    return true;
+  }
+
+  // BinaryExpr → recurse left, recurse right, emit binary opcode
+  if (auto* bin_ptr = std::get_if<std::unique_ptr<BinaryExpr>>(&expr)) {
+    const auto& bin = **bin_ptr;
+    double opcode = binary_op_to_opcode(bin.op);
+    if (opcode < 0) return false;
+    if (!compile_segment_expr_recursive(bin.left, scope, stream_name,
+                                         constants, bytecode))
+      return false;
+    if (!compile_segment_expr_recursive(bin.right, scope, stream_name,
+                                         constants, bytecode))
+      return false;
+    bytecode.push_back(opcode);
+    return true;
+  }
+
+  // FuncCall → math function opcodes (no aggregates, TS, TIMESHIFT, etc.)
+  if (auto* func_ptr = std::get_if<std::unique_ptr<FuncCall>>(&expr)) {
+    const auto& func = **func_ptr;
+    std::string upper_name = func.name;
+    std::transform(upper_name.begin(), upper_name.end(), upper_name.begin(),
+                   ::toupper);
+
+    // POWER(expr, exponent) → recurse base, recurse exponent, emit POW
+    if (upper_name == "POWER") {
+      if (func.args.size() != 2) return false;
+      if (!compile_segment_expr_recursive(func.args[0], scope, stream_name,
+                                           constants, bytecode))
+        return false;
+      if (!compile_segment_expr_recursive(func.args[1], scope, stream_name,
+                                           constants, bytecode))
+        return false;
+      bytecode.push_back(6);  // fused_op::POW
+      return true;
+    }
+
+    // SQRT(expr) → recurse arg, emit SQRT
+    if (upper_name == "SQRT") {
+      if (func.args.size() != 1) return false;
+      if (!compile_segment_expr_recursive(func.args[0], scope, stream_name,
+                                           constants, bytecode))
+        return false;
+      bytecode.push_back(8);  // fused_op::SQRT
+      return true;
+    }
+
+    // Unary math functions
+    double opcode = math_func_to_opcode(func.name);
+    if (opcode < 0) {
+      // Not a fusable function (aggregate, windowed, DSP, TS, TIMESHIFT, etc.)
+      return false;
+    }
+    if (func.args.size() != 1) return false;
+    if (!compile_segment_expr_recursive(func.args[0], scope, stream_name,
+                                         constants, bytecode))
+      return false;
+    bytecode.push_back(opcode);
+    return true;
+  }
+
+  // ComparisonExpr → recurse left, right, emit comparison opcode
+  if (auto* cmp_ptr = std::get_if<std::unique_ptr<ComparisonExpr>>(&expr)) {
+    const auto& cmp = **cmp_ptr;
+    double opcode = comparison_op_to_opcode(cmp.op);
+    if (opcode < 0) return false;
+    if (!compile_segment_expr_recursive(cmp.left, scope, stream_name,
+                                         constants, bytecode))
+      return false;
+    if (!compile_segment_expr_recursive(cmp.right, scope, stream_name,
+                                         constants, bytecode))
+      return false;
+    bytecode.push_back(opcode);
+    return true;
+  }
+
+  // LogicalExpr → recurse left, right, emit AND=32 or OR=33
+  if (auto* log_ptr = std::get_if<std::unique_ptr<LogicalExpr>>(&expr)) {
+    const auto& log = **log_ptr;
+    if (!compile_segment_expr_recursive(log.left, scope, stream_name,
+                                         constants, bytecode))
+      return false;
+    if (!compile_segment_expr_recursive(log.right, scope, stream_name,
+                                         constants, bytecode))
+      return false;
+    std::string upper_op = log.op;
+    std::transform(upper_op.begin(), upper_op.end(), upper_op.begin(),
+                   ::toupper);
+    if (upper_op == "AND") {
+      bytecode.push_back(32);  // fused_op::AND
+    } else if (upper_op == "OR") {
+      bytecode.push_back(33);  // fused_op::OR
+    } else {
+      return false;
+    }
+    return true;
+  }
+
+  // NotExpr → recurse operand, emit NOT=34
+  if (auto* not_ptr = std::get_if<std::unique_ptr<NotExpr>>(&expr)) {
+    const auto& not_e = **not_ptr;
+    if (!compile_segment_expr_recursive(not_e.operand, scope, stream_name,
+                                         constants, bytecode))
+      return false;
+    bytecode.push_back(34);  // fused_op::NOT
+    return true;
+  }
+
+  // BetweenExpr → desugar to expr >= low AND expr <= high
+  // Compile: expr, low, GTE, expr, high, LTE, AND
+  if (auto* bet_ptr = std::get_if<std::unique_ptr<BetweenExpr>>(&expr)) {
+    const auto& bet = **bet_ptr;
+    // expr >= low
+    if (!compile_segment_expr_recursive(bet.expr, scope, stream_name,
+                                         constants, bytecode))
+      return false;
+    if (!compile_segment_expr_recursive(bet.low, scope, stream_name,
+                                         constants, bytecode))
+      return false;
+    bytecode.push_back(27);  // fused_op::GTE
+    // expr <= high
+    if (!compile_segment_expr_recursive(bet.expr, scope, stream_name,
+                                         constants, bytecode))
+      return false;
+    if (!compile_segment_expr_recursive(bet.high, scope, stream_name,
+                                         constants, bytecode))
+      return false;
+    bytecode.push_back(29);  // fused_op::LTE
+    // AND
+    bytecode.push_back(32);  // fused_op::AND
+    return true;
+  }
+
+  // Anything else (CaseExpr, StringConstant, ArrayLiteral) is not fusable.
+  return false;
+}
+
 }  // anonymous namespace
 
 BytecodeResult compile_expression_to_bytecode(
@@ -797,6 +978,19 @@ BytecodeResult compile_aggregate_expression_to_bytecode(
   BytecodeResult result;
   result.success = compile_agg_expr_bytecode_recursive(
       expr, scope, column_to_input, constants, result.bytecode, agg_ctx);
+  if (result.success) {
+    result.bytecode.push_back(20);  // fused_op::END
+  }
+  return result;
+}
+
+SegmentBytecodeResult compile_segment_to_bytecode(
+    const parser::ast::Expr& expr,
+    const analyzer::Scope& scope,
+    const std::string& stream_name) {
+  SegmentBytecodeResult result;
+  result.success = compile_segment_expr_recursive(
+      expr, scope, stream_name, result.constants, result.bytecode);
   if (result.success) {
     result.bytecode.push_back(20);  // fused_op::END
   }
