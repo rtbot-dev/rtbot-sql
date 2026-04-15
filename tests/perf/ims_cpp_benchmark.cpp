@@ -14,6 +14,8 @@
 #include <utility>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
 #include "rtbot/Message.h"
 #include "rtbot/Program.h"
 
@@ -26,6 +28,33 @@ using rtbot_sql::StatementType;
 using rtbot_sql::StreamSchema;
 using rtbot_sql::ViewMeta;
 using rtbot_sql::api::compile_sql;
+
+using json = nlohmann::json;
+
+// Recursively count operators in a program JSON, including nested prototypes.
+// Returns a map of operator_type -> count.
+std::map<std::string, int> count_operators_recursive(const json& operators_array) {
+  std::map<std::string, int> counts;
+  for (const auto& op : operators_array) {
+    std::string op_type = op.value("type", "unknown");
+    counts[op_type]++;
+    // Recurse into KeyedPipeline prototypes
+    if (op.contains("prototype") && op["prototype"].contains("operators")) {
+      auto nested = count_operators_recursive(op["prototype"]["operators"]);
+      for (const auto& [type, count] : nested) {
+        counts[type] += count;
+      }
+    }
+    // Recurse into Pipeline sub-graphs
+    if (op_type == "Pipeline" && op.contains("operators")) {
+      auto nested = count_operators_recursive(op["operators"]);
+      for (const auto& [type, count] : nested) {
+        counts[type] += count;
+      }
+    }
+  }
+  return counts;
+}
 
 constexpr const char* kStreamSql = R"sql(
 CREATE TABLE vibration_raw (
@@ -133,6 +162,7 @@ struct Config {
   int progress_every = 10;
   bool pure_cpp = false;
   bool batch = false;
+  bool count_operators = false;
   std::vector<std::string> presets = {
       "01_rms",
       "02_kurtosis",
@@ -203,6 +233,8 @@ void print_help(const char* argv0) {
       << "                          (upper bound for this hardware; ignores --presets)\n"
       << "  --batch                 Feed the base program one burst per receive_batch\n"
       << "                          call (batched propagation; amortizes scheduling)\n"
+      << "  --count-operators       Compile each preset and print operator counts\n"
+      << "                          (set RTBOT_DISABLE_FUSION=1 to compare without)\n"
       << "  --list-presets          Print available preset IDs and exit\n"
       << "  --help                  Show this message\n\n"
       << "Example:\n"
@@ -291,6 +323,11 @@ Config parse_args(int argc, char** argv) {
 
     if (arg == "--batch") {
       cfg.batch = true;
+      continue;
+    }
+
+    if (arg == "--count-operators") {
+      cfg.count_operators = true;
       continue;
     }
 
@@ -553,6 +590,69 @@ int run_pure_cpp(const Config& cfg) {
   return 0;
 }
 
+int run_count_operators(const Config& cfg) {
+  const bool fusion_disabled = std::getenv("RTBOT_DISABLE_FUSION") != nullptr;
+
+  std::cout << "\n================================================================\n";
+  std::cout << "Operator count analysis"
+            << (fusion_disabled ? " (FusedExpression DISABLED)" : " (FusedExpression ENABLED)")
+            << "\n";
+  std::cout << "================================================================\n";
+
+  CatalogSnapshot catalog;
+
+  const auto stream = compile_or_die(kStreamSql, catalog, "vibration_raw stream");
+  register_stream(catalog, stream);
+
+  const auto base_view =
+      compile_or_die(kBaseViewSql, catalog, "vibration_moments view");
+  register_view(catalog, base_view, EntityType::VIEW);
+
+  // Count operators in the base view
+  {
+    auto j = json::parse(base_view.program_json);
+    auto counts = count_operators_recursive(j["operators"]);
+    int total = 0;
+    for (const auto& [_, c] : counts) total += c;
+    std::cout << "\nvibration_moments (base view): " << total << " operators\n";
+    for (const auto& [type, count] : counts) {
+      std::cout << "  " << std::setw(24) << std::left << type << " " << count << "\n";
+    }
+  }
+
+  int grand_total = 0;
+
+  for (const auto& preset_id : cfg.presets) {
+    const auto* preset = find_preset(preset_id);
+    if (!preset) {
+      std::cerr << "Unknown preset: " << preset_id << "\n";
+      continue;
+    }
+
+    const auto compiled = compile_or_die(
+        preset->sql, catalog, "preset " + preset->id);
+    register_view(catalog, compiled, EntityType::MATERIALIZED_VIEW);
+
+    auto j = json::parse(compiled.program_json);
+    auto counts = count_operators_recursive(j["operators"]);
+    int total = 0;
+    for (const auto& [_, c] : counts) total += c;
+
+    std::cout << "\n" << preset->id << " (" << preset->view_name << "): "
+              << total << " operators\n";
+    for (const auto& [type, count] : counts) {
+      std::cout << "  " << std::setw(24) << std::left << type << " " << count << "\n";
+    }
+
+    grand_total += total;
+  }
+
+  std::cout << "\n================================================================\n";
+  std::cout << "Total operators across presets: " << grand_total << "\n";
+  std::cout << "================================================================\n";
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -561,6 +661,10 @@ int main(int argc, char** argv) {
 
     if (cfg.pure_cpp) {
       return run_pure_cpp(cfg);
+    }
+
+    if (cfg.count_operators) {
+      return run_count_operators(cfg);
     }
 
     CatalogSnapshot catalog;

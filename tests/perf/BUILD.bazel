@@ -3,6 +3,7 @@ cc_binary(
     srcs = ["ims_cpp_benchmark.cpp"],
     deps = [
         "//libs/api:api_compiler",
+        "@json-cpp//:lib",
         "@rtbot//libs/api:rtbot-api",
     ],
 )
