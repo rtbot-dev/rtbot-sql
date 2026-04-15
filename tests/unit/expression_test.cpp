@@ -2,6 +2,8 @@
 
 #include <gtest/gtest.h>
 
+#include <limits>
+
 namespace rtbot_sql::compiler {
 namespace {
 
@@ -838,6 +840,283 @@ TEST_F(BytecodeTest, SharedStateAcrossExpressions) {
   for (size_t i = 0; i < expected_r2.size(); i++) {
     EXPECT_EQ(r2.bytecode[i], expected_r2[i]) << "at index " << i;
   }
+}
+
+// --- Aggregate bytecode compilation tests ---
+
+// Helper: create a zero-arg FuncCall (for COUNT(*))
+Expr func0(const std::string& name) {
+  auto f = std::make_unique<FuncCall>();
+  f->name = name;
+  return f;
+}
+
+class AggBytecodeTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    StreamSchema schema{
+        "data",
+        {{"id", 0}, {"amplitude", 1}, {"frequency", 2}},
+    };
+    scope.register_stream("data", schema, "d");
+  }
+
+  analyzer::Scope scope;
+  std::map<std::pair<std::string, int>, int> column_to_input;
+  std::vector<double> constants;
+  AggBytecodeContext agg_ctx;
+};
+
+// SUM(amplitude) → INPUT 0, CUMSUM 0, END
+// state_init: [0.0, 0.0] (sum + kahan)
+TEST_F(AggBytecodeTest, SumProducesCumsumBytecode) {
+  auto result = compile_aggregate_expression_to_bytecode(
+      func("SUM", col("amplitude")), scope, column_to_input, constants, agg_ctx);
+  ASSERT_TRUE(result.success);
+  std::vector<double> expected = {0, 0, 21, 0, 20};
+  ASSERT_EQ(result.bytecode.size(), expected.size());
+  for (size_t i = 0; i < expected.size(); i++) {
+    EXPECT_EQ(result.bytecode[i], expected[i]) << "at index " << i;
+  }
+  // State: [sum=0, kahan=0]
+  ASSERT_EQ(agg_ctx.state_init.size(), 2u);
+  EXPECT_EQ(agg_ctx.state_init[0], 0.0);
+  EXPECT_EQ(agg_ctx.state_init[1], 0.0);
+  // One input port (amplitude)
+  EXPECT_EQ(column_to_input.size(), 1u);
+}
+
+// COUNT(*) → COUNT 0, END
+// state_init: [0.0]
+TEST_F(AggBytecodeTest, CountProducesCountBytecode) {
+  auto result = compile_aggregate_expression_to_bytecode(
+      func0("COUNT"), scope, column_to_input, constants, agg_ctx);
+  ASSERT_TRUE(result.success);
+  std::vector<double> expected = {22, 0, 20};
+  ASSERT_EQ(result.bytecode.size(), expected.size());
+  for (size_t i = 0; i < expected.size(); i++) {
+    EXPECT_EQ(result.bytecode[i], expected[i]) << "at index " << i;
+  }
+  ASSERT_EQ(agg_ctx.state_init.size(), 1u);
+  EXPECT_EQ(agg_ctx.state_init[0], 0.0);
+  EXPECT_EQ(agg_ctx.shared_count_state_idx, 0);
+  EXPECT_TRUE(agg_ctx.count_emitted);
+  // No input ports needed for COUNT(*)
+  EXPECT_EQ(column_to_input.size(), 0u);
+}
+
+// AVG(amplitude) → INPUT 0, CUMSUM 0, COUNT 2, DIV, END
+// state_init: [0, 0, 0] (sum, kahan, count)
+TEST_F(AggBytecodeTest, AvgProducesCumsumCountDivBytecode) {
+  auto result = compile_aggregate_expression_to_bytecode(
+      func("AVG", col("amplitude")), scope, column_to_input, constants, agg_ctx);
+  ASSERT_TRUE(result.success);
+  // INPUT 0, CUMSUM 0, COUNT 2, DIV, END
+  std::vector<double> expected = {0, 0, 21, 0, 22, 2, 5, 20};
+  ASSERT_EQ(result.bytecode.size(), expected.size());
+  for (size_t i = 0; i < expected.size(); i++) {
+    EXPECT_EQ(result.bytecode[i], expected[i]) << "at index " << i;
+  }
+  // State: [sum=0, kahan=0, count=0]
+  ASSERT_EQ(agg_ctx.state_init.size(), 3u);
+  EXPECT_EQ(agg_ctx.state_init[0], 0.0);
+  EXPECT_EQ(agg_ctx.state_init[1], 0.0);
+  EXPECT_EQ(agg_ctx.state_init[2], 0.0);
+  EXPECT_EQ(agg_ctx.shared_count_state_idx, 2);
+  EXPECT_TRUE(agg_ctx.count_emitted);
+}
+
+// MAX(amplitude) → INPUT 0, MAX_AGG 0, END
+// state_init: [-DBL_MAX] (not -inf: JSON cannot represent infinity)
+TEST_F(AggBytecodeTest, MaxProducesMaxAggBytecode) {
+  auto result = compile_aggregate_expression_to_bytecode(
+      func("MAX", col("amplitude")), scope, column_to_input, constants, agg_ctx);
+  ASSERT_TRUE(result.success);
+  std::vector<double> expected = {0, 0, 23, 0, 20};
+  ASSERT_EQ(result.bytecode.size(), expected.size());
+  for (size_t i = 0; i < expected.size(); i++) {
+    EXPECT_EQ(result.bytecode[i], expected[i]) << "at index " << i;
+  }
+  ASSERT_EQ(agg_ctx.state_init.size(), 1u);
+  EXPECT_EQ(agg_ctx.state_init[0], -std::numeric_limits<double>::max());
+}
+
+// MIN(amplitude) → INPUT 0, MIN_AGG 0, END
+// state_init: [+DBL_MAX] (not +inf: JSON cannot represent infinity)
+TEST_F(AggBytecodeTest, MinProducesMinAggBytecode) {
+  auto result = compile_aggregate_expression_to_bytecode(
+      func("MIN", col("amplitude")), scope, column_to_input, constants, agg_ctx);
+  ASSERT_TRUE(result.success);
+  std::vector<double> expected = {0, 0, 24, 0, 20};
+  ASSERT_EQ(result.bytecode.size(), expected.size());
+  for (size_t i = 0; i < expected.size(); i++) {
+    EXPECT_EQ(result.bytecode[i], expected[i]) << "at index " << i;
+  }
+  ASSERT_EQ(agg_ctx.state_init.size(), 1u);
+  EXPECT_EQ(agg_ctx.state_init[0], std::numeric_limits<double>::max());
+}
+
+// MAX(ABS(amplitude)) → INPUT 0, ABS, MAX_AGG 0, END
+// Aggregate wrapping a pure math function
+TEST_F(AggBytecodeTest, MaxOfAbsProducesNestedBytecode) {
+  auto result = compile_aggregate_expression_to_bytecode(
+      func("MAX", func("ABS", col("amplitude"))),
+      scope, column_to_input, constants, agg_ctx);
+  ASSERT_TRUE(result.success);
+  std::vector<double> expected = {0, 0, 7, 23, 0, 20};
+  ASSERT_EQ(result.bytecode.size(), expected.size());
+  for (size_t i = 0; i < expected.size(); i++) {
+    EXPECT_EQ(result.bytecode[i], expected[i]) << "at index " << i;
+  }
+  ASSERT_EQ(agg_ctx.state_init.size(), 1u);
+  EXPECT_EQ(agg_ctx.state_init[0], -std::numeric_limits<double>::max());
+}
+
+// AVG(POWER(amplitude, 2)) → INPUT 0, CONST 0, POW, CUMSUM 0, COUNT 2, DIV, END
+TEST_F(AggBytecodeTest, AvgOfPowerProducesBytecode) {
+  auto result = compile_aggregate_expression_to_bytecode(
+      func("AVG", func2("POWER", col("amplitude"), num(2.0))),
+      scope, column_to_input, constants, agg_ctx);
+  ASSERT_TRUE(result.success);
+  // INPUT 0, CONST 0(=2.0), POW, CUMSUM 0, COUNT 2, DIV, END
+  std::vector<double> expected = {0, 0, 1, 0, 6, 21, 0, 22, 2, 5, 20};
+  ASSERT_EQ(result.bytecode.size(), expected.size());
+  for (size_t i = 0; i < expected.size(); i++) {
+    EXPECT_EQ(result.bytecode[i], expected[i]) << "at index " << i;
+  }
+  ASSERT_EQ(constants.size(), 1u);
+  EXPECT_EQ(constants[0], 2.0);
+  // State: [sum=0, kahan=0, count=0]
+  ASSERT_EQ(agg_ctx.state_init.size(), 3u);
+}
+
+// Shared COUNT: Two AVGs share the same COUNT state slot.
+// First AVG emits COUNT opcode, second AVG emits STATE_LOAD.
+TEST_F(AggBytecodeTest, SharedCountAcrossTwoAvgs) {
+  // First: AVG(amplitude) → INPUT 0, CUMSUM 0, COUNT 2, DIV, END
+  auto r1 = compile_aggregate_expression_to_bytecode(
+      func("AVG", col("amplitude")), scope, column_to_input, constants, agg_ctx);
+  ASSERT_TRUE(r1.success);
+  std::vector<double> expected1 = {0, 0, 21, 0, 22, 2, 5, 20};
+  ASSERT_EQ(r1.bytecode.size(), expected1.size());
+  for (size_t i = 0; i < expected1.size(); i++) {
+    EXPECT_EQ(r1.bytecode[i], expected1[i]) << "r1 at index " << i;
+  }
+
+  // Second: AVG(frequency) → INPUT 1, CUMSUM 3, STATE_LOAD 2, DIV, END
+  // (frequency is input 1, new CUMSUM at state[3..4], reuses COUNT at state[2])
+  auto r2 = compile_aggregate_expression_to_bytecode(
+      func("AVG", col("frequency")), scope, column_to_input, constants, agg_ctx);
+  ASSERT_TRUE(r2.success);
+  std::vector<double> expected2 = {0, 1, 21, 3, 25, 2, 5, 20};
+  ASSERT_EQ(r2.bytecode.size(), expected2.size());
+  for (size_t i = 0; i < expected2.size(); i++) {
+    EXPECT_EQ(r2.bytecode[i], expected2[i]) << "r2 at index " << i;
+  }
+
+  // State layout: [sum_amp(0), kahan_amp(1), count(2), sum_freq(3), kahan_freq(4)]
+  ASSERT_EQ(agg_ctx.state_init.size(), 5u);
+  EXPECT_EQ(agg_ctx.state_init[0], 0.0);  // sum_amp
+  EXPECT_EQ(agg_ctx.state_init[1], 0.0);  // kahan_amp
+  EXPECT_EQ(agg_ctx.state_init[2], 0.0);  // count (shared)
+  EXPECT_EQ(agg_ctx.state_init[3], 0.0);  // sum_freq
+  EXPECT_EQ(agg_ctx.state_init[4], 0.0);  // kahan_freq
+  EXPECT_EQ(column_to_input.size(), 2u);   // amplitude + frequency
+}
+
+// Shared COUNT: AVG then COUNT(*) reuses the same slot with STATE_LOAD
+TEST_F(AggBytecodeTest, SharedCountAvgThenExplicitCount) {
+  // First: AVG(amplitude) → allocates COUNT at some state index
+  auto r1 = compile_aggregate_expression_to_bytecode(
+      func("AVG", col("amplitude")), scope, column_to_input, constants, agg_ctx);
+  ASSERT_TRUE(r1.success);
+  int count_idx = agg_ctx.shared_count_state_idx;
+  EXPECT_GE(count_idx, 0);
+  EXPECT_TRUE(agg_ctx.count_emitted);
+
+  // Second: COUNT(*) → should emit STATE_LOAD (not COUNT) since count already emitted
+  auto r2 = compile_aggregate_expression_to_bytecode(
+      func0("COUNT"), scope, column_to_input, constants, agg_ctx);
+  ASSERT_TRUE(r2.success);
+  // STATE_LOAD count_idx, END
+  std::vector<double> expected2 = {25, static_cast<double>(count_idx), 20};
+  ASSERT_EQ(r2.bytecode.size(), expected2.size());
+  for (size_t i = 0; i < expected2.size(); i++) {
+    EXPECT_EQ(r2.bytecode[i], expected2[i]) << "r2 at index " << i;
+  }
+}
+
+// Full vibration_moments-like pattern: AVG(x), AVG(POWER(x,2)), MAX(ABS(x)), COUNT(*)
+TEST_F(AggBytecodeTest, FullVibrationMomentsPattern) {
+  // Expression 1: AVG(amplitude) → INPUT 0, CUMSUM 0, COUNT 2, DIV, END
+  auto r1 = compile_aggregate_expression_to_bytecode(
+      func("AVG", col("amplitude")), scope, column_to_input, constants, agg_ctx);
+  ASSERT_TRUE(r1.success);
+
+  // Expression 2: AVG(POWER(amplitude, 2)) → INPUT 0, CONST 0, POW, CUMSUM 3, STATE_LOAD 2, DIV, END
+  auto r2 = compile_aggregate_expression_to_bytecode(
+      func("AVG", func2("POWER", col("amplitude"), num(2.0))),
+      scope, column_to_input, constants, agg_ctx);
+  ASSERT_TRUE(r2.success);
+  // Verify STATE_LOAD (not COUNT) for second AVG
+  bool found_state_load = false;
+  for (size_t i = 0; i + 1 < r2.bytecode.size(); i++) {
+    if (r2.bytecode[i] == 25) {  // STATE_LOAD
+      found_state_load = true;
+      EXPECT_EQ(r2.bytecode[i + 1], static_cast<double>(agg_ctx.shared_count_state_idx));
+    }
+  }
+  EXPECT_TRUE(found_state_load) << "Expected STATE_LOAD in second AVG";
+
+  // Expression 3: MAX(ABS(amplitude)) → INPUT 0, ABS, MAX_AGG idx, END
+  auto r3 = compile_aggregate_expression_to_bytecode(
+      func("MAX", func("ABS", col("amplitude"))),
+      scope, column_to_input, constants, agg_ctx);
+  ASSERT_TRUE(r3.success);
+
+  // Expression 4: COUNT(*) → STATE_LOAD count_idx, END
+  auto r4 = compile_aggregate_expression_to_bytecode(
+      func0("COUNT"), scope, column_to_input, constants, agg_ctx);
+  ASSERT_TRUE(r4.success);
+  EXPECT_EQ(r4.bytecode[0], 25);  // STATE_LOAD (not COUNT)
+
+  // Only 1 input column (amplitude) despite being referenced multiple times
+  EXPECT_EQ(column_to_input.size(), 1u);
+  // Only COUNT slot allocated once (shared)
+  EXPECT_EQ(agg_ctx.shared_count_state_idx, 2);
+}
+
+// Non-fusable: windowed function inside aggregate
+TEST_F(AggBytecodeTest, WindowedFunctionNotFusable) {
+  // MOVING_AVERAGE(amplitude, 10) — not a fusable aggregate
+  auto result = compile_aggregate_expression_to_bytecode(
+      func2("MOVING_AVERAGE", col("amplitude"), num(10.0)),
+      scope, column_to_input, constants, agg_ctx);
+  EXPECT_FALSE(result.success);
+}
+
+// Non-fusable: COUNT(amplitude) — COUNT with args not supported
+TEST_F(AggBytecodeTest, CountWithArgsNotFusable) {
+  auto result = compile_aggregate_expression_to_bytecode(
+      func("COUNT", col("amplitude")),
+      scope, column_to_input, constants, agg_ctx);
+  EXPECT_FALSE(result.success);
+}
+
+// Pure expressions still work through the aggregate compiler
+TEST_F(AggBytecodeTest, PureExpressionPassthrough) {
+  // amplitude * 2 + frequency → should compile through the delegate to pure path
+  auto result = compile_aggregate_expression_to_bytecode(
+      binary("+", binary("*", col("amplitude"), num(2.0)), col("frequency")),
+      scope, column_to_input, constants, agg_ctx);
+  ASSERT_TRUE(result.success);
+  // INPUT 0(amp), CONST 0(2.0), MUL, INPUT 1(freq), ADD, END
+  std::vector<double> expected = {0, 0, 1, 0, 4, 0, 1, 2, 20};
+  ASSERT_EQ(result.bytecode.size(), expected.size());
+  for (size_t i = 0; i < expected.size(); i++) {
+    EXPECT_EQ(result.bytecode[i], expected[i]) << "at index " << i;
+  }
+  EXPECT_TRUE(agg_ctx.state_init.empty());  // no state needed for pure expressions
 }
 
 }  // namespace
