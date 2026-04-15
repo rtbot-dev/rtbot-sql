@@ -2808,6 +2808,16 @@ int json_count_operator_type(const json& node,
   return count;
 }
 
+bool json_contains_fused_aggregate_operator(const json& node) {
+  return json_contains_operator_type(node, "FusedExpression") ||
+         json_contains_operator_type(node, "FusedExpressionVector");
+}
+
+int json_count_fused_aggregate_operators(const json& node) {
+  return json_count_operator_type(node, "FusedExpression") +
+         json_count_operator_type(node, "FusedExpressionVector");
+}
+
 // ---------------------------------------------------------------------------
 // FA-e2e-1: GROUP BY with MAX and MIN aggregates
 //
@@ -2824,8 +2834,8 @@ TEST_F(E2eRuntimeTest, FusedAggregateMaxMin) {
 
   // Verify FusedExpression in the compiled graph (may be nested in prototype)
   auto program_json = json::parse(r.program_json);
-  EXPECT_TRUE(json_contains_operator_type(program_json, "FusedExpression"))
-      << "GROUP BY with MAX/MIN should compile to FusedExpression";
+  EXPECT_TRUE(json_contains_fused_aggregate_operator(program_json))
+      << "GROUP BY with MAX/MIN should compile to fused aggregate bytecode";
 
   int max_idx = r.field_map.at("max_price");
   int min_idx = r.field_map.at("min_price");
@@ -2903,8 +2913,8 @@ TEST_F(E2eRuntimeTest, FusedAggregateAvgNestedPower) {
 
   // Verify FusedExpression in graph (may be nested in prototype)
   auto program_json = json::parse(r.program_json);
-  EXPECT_TRUE(json_contains_operator_type(program_json, "FusedExpression"))
-      << "AVG(POWER(x,2)) should compile to FusedExpression with stateful opcodes";
+  EXPECT_TRUE(json_contains_fused_aggregate_operator(program_json))
+      << "AVG(POWER(x,2)) should compile to fused aggregate bytecode";
 
   int avg_sq_idx = r.field_map.at("avg_price_sq");
 
@@ -2960,8 +2970,8 @@ TEST_F(E2eRuntimeTest, FusedAggregateMixedAggregates) {
 
   // Verify FusedExpression (may be nested in prototype)
   auto program_json = json::parse(r.program_json);
-  EXPECT_TRUE(json_contains_operator_type(program_json, "FusedExpression"))
-      << "Mixed aggregates should compile to FusedExpression";
+  EXPECT_TRUE(json_contains_fused_aggregate_operator(program_json))
+      << "Mixed aggregates should compile to fused aggregate bytecode";
 
   int total_qty_idx = r.field_map.at("total_qty");
   int avg_price_idx = r.field_map.at("avg_price");
@@ -3052,8 +3062,8 @@ TEST_F(E2eRuntimeTest, FusedAggregateVibrationMoments) {
 
   // Verify FusedExpression in graph (may be nested in prototype)
   auto program_json = json::parse(r.program_json);
-  EXPECT_GE(json_count_operator_type(program_json, "FusedExpression"), 1)
-      << "Vibration moments query must use FusedExpression";
+  EXPECT_GE(json_count_fused_aggregate_operators(program_json), 1)
+      << "Vibration moments query must use fused aggregate bytecode";
 
   int dev_idx = r.field_map.at("device_id");
   int ch_idx = r.field_map.at("channel_id");
@@ -3197,8 +3207,8 @@ TEST_F(E2eRuntimeTest, FusedAggregateSegmentMaxReset) {
 
   // Verify fused path is used
   auto program_json = json::parse(r.program_json);
-  EXPECT_TRUE(json_contains_operator_type(program_json, "FusedExpression"))
-      << "Mixed GROUP BY with aggregates should use FusedExpression";
+  EXPECT_TRUE(json_contains_fused_aggregate_operator(program_json))
+      << "Mixed GROUP BY with aggregates should use fused aggregate bytecode";
 
   int peak_idx = r.field_map.at("peak");
   int cnt_idx = r.field_map.at("cnt");

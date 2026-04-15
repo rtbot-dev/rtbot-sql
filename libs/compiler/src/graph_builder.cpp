@@ -368,7 +368,7 @@ static PortSig output_sig(const OperatorDef& op) {
 
   // Operators that output VectorNumber
   if (t == "Input" || t == "Output" || t == "VectorCompose" ||
-      t == "FusedExpression" ||
+      t == "FusedExpression" || t == "FusedExpressionVector" ||
       t == "VectorProject" || t == "KeyedPipeline" || t == "Pipeline")
     return {DataType::VECTOR_NUMBER};
 
@@ -455,6 +455,8 @@ static PortSig input_sig(const OperatorDef& op, const std::string& port) {
   if (t == "Input" || t == "Output" || t == "VectorExtract" ||
       t == "VectorProject" || t == "KeyedPipeline")
     return {DataType::VECTOR_NUMBER};
+
+  if (t == "FusedExpressionVector") return {DataType::VECTOR_NUMBER};
 
   // VectorCompose / FusedExpression accept Number on each data port
   if (t == "VectorCompose" || t == "FusedExpression")
@@ -547,6 +549,9 @@ static void validate_graph(const std::vector<OperatorDef>& ops,
     else if (op.type == "VectorCompose") require_param(op, "numPorts");
     else if (op.type == "FusedExpression") {
       require_param(op, "numPorts");
+      require_param(op, "numOutputs");
+    }
+    else if (op.type == "FusedExpressionVector") {
       require_param(op, "numOutputs");
     }
     else if (op.type == "MovingAverage" || op.type == "MovingSum" ||

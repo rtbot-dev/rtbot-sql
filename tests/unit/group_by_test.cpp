@@ -78,31 +78,40 @@ TEST_F(GroupByTest, BasicGroupByWithSum) {
   EXPECT_EQ(proto.output_id, "proto_out");
 
   // With fusion enabled the prototype contains:
-  //   Input, VectorExtract, FusedExpression (with CUMSUM opcode), Output
+  //   Input, FusedExpressionVector (with CUMSUM opcode), Output
   // Without fusion (RTBOT_DISABLE_FUSION=1) the prototype contains:
   //   Input, VectorExtract, CumulativeSum, VectorCompose, Output
   bool has_input = false, has_ext = false, has_output = false;
-  bool has_fused = false, has_cumsum = false, has_compose = false;
+  bool has_fused_vector = false, has_fused_scalar = false;
+  bool has_cumsum = false, has_compose = false;
   for (const auto& op : proto.operators) {
     if (op.type == "Input") has_input = true;
     if (op.type == "VectorExtract") {
       has_ext = true;
       EXPECT_EQ(op.params.at("index"), 2.0);  // quantity
     }
-    if (op.type == "FusedExpression") {
-      has_fused = true;
-      EXPECT_EQ(op.params.at("numPorts"), 1.0);
+    if (op.type == "FusedExpressionVector") {
+      has_fused_vector = true;
       EXPECT_EQ(op.params.at("numOutputs"), 1.0);
     }
+    if (op.type == "FusedExpression") has_fused_scalar = true;
     if (op.type == "CumulativeSum") has_cumsum = true;
     if (op.type == "Output") has_output = true;
     if (op.type == "VectorCompose") has_compose = true;
   }
   EXPECT_TRUE(has_input);
-  EXPECT_TRUE(has_ext);
   EXPECT_TRUE(has_output);
   // Either fused path or unfused path, but not both
-  EXPECT_TRUE(has_fused || (has_cumsum && has_compose));
+  EXPECT_TRUE(has_fused_vector || (has_cumsum && has_compose));
+  EXPECT_FALSE(has_fused_scalar)
+      << "Single-key fused path should use FusedExpressionVector";
+  if (has_fused_vector) {
+    EXPECT_FALSE(has_ext)
+        << "FusedExpressionVector path should not emit VectorExtract";
+  } else {
+    EXPECT_TRUE(has_ext)
+        << "Fallback path should include VectorExtract";
+  }
 
   // Field map
   EXPECT_EQ(field_map.at("instrument_id"), 0);
@@ -137,20 +146,23 @@ TEST_F(GroupByTest, MultiAggregateGroupBy) {
   ASSERT_EQ(builder.prototypes().size(), 1u);
   const auto& proto = builder.prototypes()[0];
 
-  // With fusion: FusedExpression with 3 outputs (SUM, COUNT, AVG)
+  // With fusion: FusedExpressionVector with 3 outputs (SUM, COUNT, AVG)
   // Without fusion: VectorCompose with 3 ports
-  bool has_compose = false, has_fused = false;
+  bool has_compose = false, has_fused_vector = false, has_fused_scalar = false;
   for (const auto& op : proto.operators) {
     if (op.type == "VectorCompose") {
       has_compose = true;
       EXPECT_EQ(op.params.at("numPorts"), 3.0);
     }
-    if (op.type == "FusedExpression") {
-      has_fused = true;
+    if (op.type == "FusedExpressionVector") {
+      has_fused_vector = true;
       EXPECT_EQ(op.params.at("numOutputs"), 3.0);
     }
+    if (op.type == "FusedExpression") has_fused_scalar = true;
   }
-  EXPECT_TRUE(has_compose || has_fused);
+  EXPECT_TRUE(has_compose || has_fused_vector);
+  EXPECT_FALSE(has_fused_scalar)
+      << "Single-key fused path should use FusedExpressionVector";
 
   // Field map: 4 entries
   EXPECT_EQ(field_map.size(), 4u);
@@ -864,22 +876,32 @@ TEST_F(SegmentGroupByTest, MixedGroupBy) {
     }
   }
 
-  // Inner prototype: with fusion → FusedExpression; without → CumulativeSum + CountNumber + VectorCompose
-  bool has_cumsum = false, has_count = false, has_compose = false, has_fused = false;
+  // Inner prototype: with fusion → FusedExpressionVector; without → CumulativeSum + CountNumber + VectorCompose
+  bool has_cumsum = false, has_count = false, has_compose = false;
+  bool has_fused_vector = false, has_fused_scalar = false;
+  int extract_count = 0;
   for (const auto& op : inner_proto->operators) {
     if (op.type == "CumulativeSum") has_cumsum = true;
     if (op.type == "CountNumber") has_count = true;
+    if (op.type == "VectorExtract") extract_count++;
     if (op.type == "VectorCompose") {
       has_compose = true;
       EXPECT_EQ(op.params.at("numPorts"), 2.0);  // total + cnt
     }
-    if (op.type == "FusedExpression") {
-      has_fused = true;
+    if (op.type == "FusedExpressionVector") {
+      has_fused_vector = true;
       EXPECT_EQ(op.params.at("numOutputs"), 2.0);  // total + cnt
     }
+    if (op.type == "FusedExpression") has_fused_scalar = true;
   }
-  EXPECT_TRUE(has_fused || (has_cumsum && has_count && has_compose))
-      << "Inner prototype should have FusedExpression or CumulativeSum+CountNumber+VectorCompose";
+  EXPECT_TRUE(has_fused_vector || (has_cumsum && has_count && has_compose))
+      << "Inner prototype should have FusedExpressionVector or CumulativeSum+CountNumber+VectorCompose";
+  EXPECT_FALSE(has_fused_scalar)
+      << "Inner prototype should use FusedExpressionVector for vector input fusion";
+  if (has_fused_vector) {
+    EXPECT_EQ(extract_count, 0)
+        << "FusedExpressionVector path should not emit VectorExtract operators";
+  }
 
   // Field map: device_id=0, total=1, cnt=2
   EXPECT_EQ(field_map.at("device_id"), 0);
@@ -1001,8 +1023,9 @@ TEST_F(SegmentGroupByTest, CompositeKeysWithSegmentExpression) {
     }
   }
 
-  // Inner prototype: with fusion → FusedExpression; without → key extracts + CumulativeSum + CountNumber + VectorCompose
-  bool has_cumsum = false, has_count = false, has_compose = false, has_fused = false;
+  // Inner prototype: with fusion → FusedExpressionVector; without → key extracts + CumulativeSum + CountNumber + VectorCompose
+  bool has_cumsum = false, has_count = false, has_compose = false;
+  bool has_fused_vector = false, has_fused_scalar = false;
   int extract_count = 0;
   for (const auto& op : inner_proto->operators) {
     if (op.type == "CumulativeSum") has_cumsum = true;
@@ -1013,16 +1036,24 @@ TEST_F(SegmentGroupByTest, CompositeKeysWithSegmentExpression) {
       // 2 key columns + 2 aggregates = 4 ports
       EXPECT_EQ(op.params.at("numPorts"), 4.0);
     }
-    if (op.type == "FusedExpression") {
-      has_fused = true;
+    if (op.type == "FusedExpressionVector") {
+      has_fused_vector = true;
       // 2 key columns + 2 aggregates = 4 outputs
       EXPECT_EQ(op.params.at("numOutputs"), 4.0);
     }
+    if (op.type == "FusedExpression") has_fused_scalar = true;
   }
-  EXPECT_TRUE(has_fused || (has_cumsum && has_count && has_compose))
-      << "Inner prototype should have FusedExpression or CumulativeSum+CountNumber+VectorCompose";
-  // Should extract columns for inputs (at least amplitude for aggregates)
-  EXPECT_GE(extract_count, 1) << "Inner prototype should extract input columns";
+  EXPECT_TRUE(has_fused_vector || (has_cumsum && has_count && has_compose))
+      << "Inner prototype should have FusedExpressionVector or CumulativeSum+CountNumber+VectorCompose";
+  EXPECT_FALSE(has_fused_scalar)
+      << "Inner prototype should use FusedExpressionVector for vector input fusion";
+  if (has_fused_vector) {
+    EXPECT_EQ(extract_count, 0)
+        << "FusedExpressionVector path should not emit VectorExtract operators";
+  } else {
+    EXPECT_GE(extract_count, 1)
+        << "Fallback path should extract input columns";
+  }
 
   // Field map: computed key mode outputs directly (no VectorProject), 0-based.
   // prototype outputs: [device_id, frequency, total, cnt]

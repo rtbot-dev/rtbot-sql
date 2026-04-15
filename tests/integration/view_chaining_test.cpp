@@ -72,7 +72,7 @@ TEST_F(ViewChainingTest, StreamToGroupByToGroupBy) {
   ASSERT_EQ(r1.source_streams.size(), 1u);
   EXPECT_EQ(r1.source_streams[0], "trades");
 
-  // v1 program: KeyedPipeline with either FusedExpression (fused path)
+  // v1 program: KeyedPipeline with either FusedExpressionVector (fused path)
   // or CumulativeSum + CountNumber + VectorCompose (unfused path)
   {
     auto program = json::parse(r1.program_json);
@@ -87,10 +87,10 @@ TEST_F(ViewChainingTest, StreamToGroupByToGroupBy) {
           if (proto_op["type"] == "CumulativeSum") has_cum_sum = true;
           if (proto_op["type"] == "CountNumber") has_count = true;
           if (proto_op["type"] == "VectorCompose") has_compose = true;
-          if (proto_op["type"] == "FusedExpression") has_fused = true;
+          if (proto_op["type"] == "FusedExpressionVector") has_fused = true;
         }
         EXPECT_TRUE(has_fused || (has_cum_sum && has_count && has_compose))
-            << "Expected FusedExpression or CumulativeSum+CountNumber+VectorCompose in v1 prototype";
+            << "Expected FusedExpressionVector or CumulativeSum+CountNumber+VectorCompose in v1 prototype";
       }
     }
     EXPECT_TRUE(has_keyed) << "Expected KeyedPipeline in v1 program";
@@ -405,10 +405,10 @@ TEST_F(ViewChainingTest, TableToMaterializedView) {
       for (const auto& proto_op : op["prototype"]["operators"]) {
         if (proto_op["type"] == "CumulativeSum") has_cum_sum = true;
         if (proto_op["type"] == "CountNumber") has_count = true;
-        if (proto_op["type"] == "FusedExpression") has_fused = true;
+        if (proto_op["type"] == "FusedExpressionVector") has_fused = true;
       }
       EXPECT_TRUE(has_fused || (has_cum_sum && has_count))
-          << "Expected FusedExpression or CumulativeSum+CountNumber in prototype";
+          << "Expected FusedExpressionVector or CumulativeSum+CountNumber in prototype";
     }
   }
   EXPECT_TRUE(has_keyed);

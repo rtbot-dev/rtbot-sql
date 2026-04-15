@@ -415,6 +415,9 @@ TEST_F(CompilerIntegrationTest, CompositeGroupBy) {
   // Verify computed key KeyedPipeline in graph (no Linear, no VectorCompose)
   auto program = json::parse(r.program_json);
   bool has_keyed = false;
+  bool has_fused_vector = false;
+  bool has_fused_scalar = false;
+  int extract_count = 0;
   for (const auto& op : program["operators"]) {
     EXPECT_NE(op["type"], "Linear")
         << "Linear should NOT be in outer graph (computed key mode)";
@@ -429,9 +432,23 @@ TEST_F(CompilerIntegrationTest, CompositeGroupBy) {
           << "KeyedPipeline should have keyColumnIndices";
       EXPECT_FALSE(op.contains("keyCoefficients"))
           << "keyCoefficients should not be in JSON (computed internally by operator)";
+
+      if (op.contains("prototype") && op["prototype"].contains("operators")) {
+        for (const auto& proto_op : op["prototype"]["operators"]) {
+          if (proto_op["type"] == "FusedExpressionVector") has_fused_vector = true;
+          if (proto_op["type"] == "FusedExpression") has_fused_scalar = true;
+          if (proto_op["type"] == "VectorExtract") extract_count++;
+        }
+      }
     }
   }
   EXPECT_TRUE(has_keyed) << "should have KeyedPipeline for routing";
+  EXPECT_TRUE(has_fused_vector)
+      << "Composite GROUP BY should use FusedExpressionVector in prototype";
+  EXPECT_FALSE(has_fused_scalar)
+      << "Composite GROUP BY should not use scalar FusedExpression in prototype";
+  EXPECT_EQ(extract_count, 0)
+      << "Composite GROUP BY fused path should not emit VectorExtract operators";
 
   // Field map should include both key columns and the aggregate
   EXPECT_NE(r.field_map.find("instrument_id"), r.field_map.end());
