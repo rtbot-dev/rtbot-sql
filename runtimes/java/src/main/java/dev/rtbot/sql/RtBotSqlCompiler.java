@@ -109,6 +109,20 @@ public final class RtBotSqlCompiler {
                                                 double v0, double v1, double v2);
 
     /**
+     * Feed a batch of 3-value messages on default input port "i1".
+     *
+     * <p>All arrays must have identical length. The native side feeds the
+     * full batch in one call via Program::receive_batch, then returns all
+     * produced output messages as JSON.
+     */
+    public static native String feedPipeline3BatchI1(
+            long handle,
+            long[] timestamps,
+            double[] v0,
+            double[] v1,
+            double[] v2);
+
+    /**
      * Reset cumulative native feed-path profiling counters.
      */
     public static native void resetNativeFeedStats();

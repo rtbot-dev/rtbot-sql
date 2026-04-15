@@ -108,6 +108,8 @@ public class BearingLoadTest {
                 System.getProperty("rtbot.benchmark.subscribeRaw", "false"));
             boolean profile = Boolean.parseBoolean(
                 System.getProperty("rtbot.benchmark.profile", "false"));
+            boolean batch = Boolean.parseBoolean(
+                System.getProperty("rtbot.benchmark.batch", "false"));
             AtomicLong rmsCount = new AtomicLong(0);
             AtomicLong kurtosisCount = new AtomicLong(0);
             AtomicLong rawCount = new AtomicLong(0);
@@ -144,6 +146,7 @@ public class BearingLoadTest {
             System.out.printf("Pipeline: vibration_raw -> vibration_moments (VIEW)%n");
             System.out.printf("          -> rms_trend + kurtosis_trend (MAT VIEWs)%n");
             System.out.println("Mode: SUBSCRIPTION (nothing stored, output to subscribers only)");
+            System.out.printf("Feed mode: %s%n", batch ? "BATCH insert3Batch" : "ROW insert3");
             System.out.println("----------------------------------------------------------------");
             System.out.printf("  %6s  %10s  %12s  %10s%n",
                               "Burst", "Msgs", "Msgs/sec", "Heap MB");
@@ -156,17 +159,36 @@ public class BearingLoadTest {
             for (int burstIdx = 0; burstIdx < NUM_BURSTS; burstIdx++) {
                 for (int bearingId = 1; bearingId <= NUM_BEARINGS; bearingId++) {
                     double[] amps = generateBurstAmplitudes(SAMPLES_PER_BURST);
-
-                    // Data samples
-                    for (int i = 0; i < amps.length; i++) {
-                        runtime.insert3("vibration_raw", ts + i,
-                            (double) bearingId, 1.0, amps[i]);
+                    if (batch) {
+                        int batchSize = SAMPLES_PER_BURST + 1;
+                        long[] tsBatch = new long[batchSize];
+                        double[] v0Batch = new double[batchSize];
+                        double[] v1Batch = new double[batchSize];
+                        double[] v2Batch = new double[batchSize];
+                        for (int i = 0; i < SAMPLES_PER_BURST; i++) {
+                            tsBatch[i] = ts + i;
+                            v0Batch[i] = (double) bearingId;
+                            v1Batch[i] = 1.0;
+                            v2Batch[i] = amps[i];
+                        }
+                        tsBatch[SAMPLES_PER_BURST] = ts + SAMPLES_PER_BURST;
+                        v0Batch[SAMPLES_PER_BURST] = (double) bearingId;
+                        v1Batch[SAMPLES_PER_BURST] = 1.0;
+                        v2Batch[SAMPLES_PER_BURST] = 0.0;
+                        runtime.insert3Batch("vibration_raw", tsBatch, v0Batch, v1Batch, v2Batch);
+                        totalMessages += batchSize;
+                    } else {
+                        // Data samples
+                        for (int i = 0; i < amps.length; i++) {
+                            runtime.insert3("vibration_raw", ts + i,
+                                (double) bearingId, 1.0, amps[i]);
+                            totalMessages++;
+                        }
+                        // Sentinel (amplitude = 0 triggers GROUP BY emission)
+                        runtime.insert3("vibration_raw", ts + SAMPLES_PER_BURST,
+                            (double) bearingId, 1.0, 0.0);
                         totalMessages++;
                     }
-                    // Sentinel (amplitude = 0 triggers GROUP BY emission)
-                    runtime.insert3("vibration_raw", ts + SAMPLES_PER_BURST,
-                        (double) bearingId, 1.0, 0.0);
-                    totalMessages++;
 
                     // Advance timestamp same as Python: base_ts += samples_per_burst + 100
                     ts += SAMPLES_PER_BURST + 100;

@@ -819,6 +819,117 @@ Java_dev_rtbot_sql_RtBotSqlCompiler_feedPipeline3I1(JNIEnv* env, jclass,
   }
 }
 
+JNIEXPORT jstring JNICALL
+Java_dev_rtbot_sql_RtBotSqlCompiler_feedPipeline3BatchI1(JNIEnv* env, jclass,
+                                                          jlong handle,
+                                                          jlongArray timestamps,
+                                                          jdoubleArray v0,
+                                                          jdoubleArray v1,
+                                                          jdoubleArray v2) {
+  try {
+    const bool profile =
+        g_native_feed_stats_enabled.load(std::memory_order_relaxed);
+    const std::uint64_t t0 = profile ? now_ns() : 0;
+
+    auto* program = reinterpret_cast<rtbot::Program*>(handle);
+    if (!program) {
+      throw_runtime_exception(env, "feedPipeline3BatchI1: null pipeline handle");
+      return nullptr;
+    }
+    if (!timestamps || !v0 || !v1 || !v2) {
+      throw_runtime_exception(env, "feedPipeline3BatchI1: null input array");
+      return nullptr;
+    }
+
+    const jsize n = env->GetArrayLength(timestamps);
+    if (env->GetArrayLength(v0) != n
+        || env->GetArrayLength(v1) != n
+        || env->GetArrayLength(v2) != n) {
+      throw_runtime_exception(
+          env, "feedPipeline3BatchI1: array length mismatch");
+      return nullptr;
+    }
+
+    jlong* ts_elems = env->GetLongArrayElements(timestamps, nullptr);
+    jdouble* v0_elems = env->GetDoubleArrayElements(v0, nullptr);
+    jdouble* v1_elems = env->GetDoubleArrayElements(v1, nullptr);
+    jdouble* v2_elems = env->GetDoubleArrayElements(v2, nullptr);
+    const std::uint64_t t_after_values = profile ? now_ns() : 0;
+
+    std::map<std::string, std::vector<std::unique_ptr<rtbot::BaseMessage>>> buffer;
+    auto& port_messages = buffer["i1"];
+    port_messages.reserve(static_cast<std::size_t>(n));
+    for (jsize i = 0; i < n; ++i) {
+      std::vector<double> values_vec;
+      values_vec.reserve(3);
+      values_vec.push_back(static_cast<double>(v0_elems[i]));
+      values_vec.push_back(static_cast<double>(v1_elems[i]));
+      values_vec.push_back(static_cast<double>(v2_elems[i]));
+      port_messages.push_back(rtbot::create_message<rtbot::VectorNumberData>(
+          static_cast<rtbot::timestamp_t>(ts_elems[i]),
+          rtbot::VectorNumberData{std::move(values_vec)}));
+    }
+    const std::uint64_t t_after_msg = profile ? now_ns() : 0;
+
+    env->ReleaseLongArrayElements(timestamps, ts_elems, JNI_ABORT);
+    env->ReleaseDoubleArrayElements(v0, v0_elems, JNI_ABORT);
+    env->ReleaseDoubleArrayElements(v1, v1_elems, JNI_ABORT);
+    env->ReleaseDoubleArrayElements(v2, v2_elems, JNI_ABORT);
+
+    auto batch = program->receive_batch(buffer);
+    const std::uint64_t t_after_receive = profile ? now_ns() : 0;
+    if (is_batch_empty(batch)) {
+      if (profile) {
+        const std::uint64_t t_end = now_ns();
+        g_native_feed_stats.calls.fetch_add(1, std::memory_order_relaxed);
+        g_native_feed_stats.input_values.fetch_add(
+            static_cast<std::uint64_t>(n) * 3ULL, std::memory_order_relaxed);
+        g_native_feed_stats.total_ns.fetch_add(
+            t_end - t0, std::memory_order_relaxed);
+        g_native_feed_stats.values_copy_ns.fetch_add(
+            t_after_values - t0, std::memory_order_relaxed);
+        g_native_feed_stats.message_build_ns.fetch_add(
+            t_after_msg - t_after_values, std::memory_order_relaxed);
+        g_native_feed_stats.receive_ns.fetch_add(
+            t_after_receive - t_after_msg, std::memory_order_relaxed);
+      }
+      return nullptr;
+    }
+
+    std::string json_out = batch_to_json(batch);
+    const std::uint64_t t_after_json = profile ? now_ns() : 0;
+    jstring out = std_to_jstring(env, json_out);
+    if (profile) {
+      const std::uint64_t t_end = now_ns();
+      BatchStats batch_stats = count_batch_stats(batch);
+      g_native_feed_stats.calls.fetch_add(1, std::memory_order_relaxed);
+      g_native_feed_stats.input_values.fetch_add(
+          static_cast<std::uint64_t>(n) * 3ULL, std::memory_order_relaxed);
+      g_native_feed_stats.total_ns.fetch_add(
+          t_end - t0, std::memory_order_relaxed);
+      g_native_feed_stats.values_copy_ns.fetch_add(
+          t_after_values - t0, std::memory_order_relaxed);
+      g_native_feed_stats.message_build_ns.fetch_add(
+          t_after_msg - t_after_values, std::memory_order_relaxed);
+      g_native_feed_stats.receive_ns.fetch_add(
+          t_after_receive - t_after_msg, std::memory_order_relaxed);
+      g_native_feed_stats.json_serialize_ns.fetch_add(
+          t_after_json - t_after_receive, std::memory_order_relaxed);
+      g_native_feed_stats.jstring_ns.fetch_add(
+          t_end - t_after_json, std::memory_order_relaxed);
+      g_native_feed_stats.output_messages.fetch_add(
+          batch_stats.messages, std::memory_order_relaxed);
+      g_native_feed_stats.output_values.fetch_add(
+          batch_stats.values, std::memory_order_relaxed);
+    }
+    return out;
+  } catch (const std::exception& e) {
+    throw_runtime_exception(
+        env, std::string("feedPipeline3BatchI1: ") + e.what());
+    return nullptr;
+  }
+}
+
 JNIEXPORT void JNICALL
 Java_dev_rtbot_sql_RtBotSqlCompiler_resetNativeFeedStats(JNIEnv* env,
                                                           jclass) {

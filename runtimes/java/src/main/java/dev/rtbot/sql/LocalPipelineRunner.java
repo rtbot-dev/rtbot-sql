@@ -160,6 +160,57 @@ public class LocalPipelineRunner implements PipelineRunner {
         return outputs;
     }
 
+    /**
+     * Batched hot path for 3-value messages on default input port "i1".
+     *
+     * <p>Feeds all rows in one JNI/native call to amortize boundary overhead.
+     */
+    public List<OutputMessage> feedBatch3I1(
+            String pipelineId,
+            long[] timestamps,
+            double[] v0,
+            double[] v1,
+            double[] v2) {
+        Long handle = pipelines.get(pipelineId);
+        if (handle == null) {
+            throw new IllegalArgumentException("Unknown pipeline: " + pipelineId);
+        }
+        if (timestamps == null || v0 == null || v1 == null || v2 == null) {
+            throw new IllegalArgumentException("feedBatch3I1 arrays must not be null");
+        }
+        int n = timestamps.length;
+        if (v0.length != n || v1.length != n || v2.length != n) {
+            throw new IllegalArgumentException(
+                    "feedBatch3I1 array length mismatch: ts=" + n
+                            + ", v0=" + v0.length
+                            + ", v1=" + v1.length
+                            + ", v2=" + v2.length);
+        }
+
+        if (!perfStatsEnabled) {
+            String json = RtBotSqlCompiler.feedPipeline3BatchI1(
+                    handle, timestamps, v0, v1, v2);
+            return parseOutputMessages(json);
+        }
+
+        long t0 = System.nanoTime();
+        String json = RtBotSqlCompiler.feedPipeline3BatchI1(
+                handle, timestamps, v0, v1, v2);
+        long t1 = System.nanoTime();
+        List<OutputMessage> outputs = parseOutputMessages(json);
+        long t2 = System.nanoTime();
+
+        feedCalls++;
+        inputValues += (long) n * 3L;
+        nativeNs += (t1 - t0);
+        parseNs += (t2 - t1);
+        outputMessages += outputs.size();
+        for (OutputMessage out : outputs) {
+            outputValues += out.values != null ? out.values.size() : 0;
+        }
+        return outputs;
+    }
+
     @Override
     public List<OutputMessage> runOnce(String programJson, List<InputMessage> inputs) {
         long handle = RtBotSqlCompiler.createPipeline(programJson);

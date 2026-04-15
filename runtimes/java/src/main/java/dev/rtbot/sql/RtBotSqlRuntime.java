@@ -265,6 +265,82 @@ public class RtBotSqlRuntime {
         }
     }
 
+    /**
+     * Batched insert path for common 3-column numeric streams.
+     *
+     * <p>Feeds a whole batch of rows in one native call for single-source
+     * dependents on port {@code i1}. Falls back to row-by-row routing when
+     * collect mode is enabled, the source has direct subscribers, or a
+     * dependent requires a non-default input port.
+     */
+    public void insert3Batch(String streamName,
+                             long[] timestamps,
+                             double[] v0,
+                             double[] v1,
+                             double[] v2) {
+        StreamSchema schema = catalog.lookupStream(streamName);
+        if (schema == null) {
+            throw new SqlError("Unknown stream: " + streamName);
+        }
+        if (schema.columns != null && !schema.columns.isEmpty()
+                && schema.columns.size() != 3) {
+            throw new SqlError("insert3Batch requires 3 columns for " + streamName
+                    + ", found " + schema.columns.size());
+        }
+        if (timestamps == null || v0 == null || v1 == null || v2 == null) {
+            throw new SqlError("insert3Batch arrays must not be null");
+        }
+        int n = timestamps.length;
+        if (v0.length != n || v1.length != n || v2.length != n) {
+            throw new SqlError("insert3Batch array length mismatch for " + streamName
+                    + ": ts=" + n
+                    + ", v0=" + v0.length
+                    + ", v1=" + v1.length
+                    + ", v2=" + v2.length);
+        }
+        if (n == 0) {
+            return;
+        }
+
+        // Fallback when source stream needs direct materialization/callback.
+        if (collectMode || subscriptions.containsKey(streamName)) {
+            for (int i = 0; i < n; i++) {
+                insert(streamName, timestamps[i], java.util.Arrays.asList(v0[i], v1[i], v2[i]));
+            }
+            return;
+        }
+
+        Set<String> dependents = dependencies.get(streamName);
+        if (dependents == null) {
+            return;
+        }
+
+        for (String dependent : dependents) {
+            String pipelineId = viewPipelines.get(dependent);
+            if (pipelineId == null) continue;
+            Map<String, String> portMap =
+                    viewPortMaps.getOrDefault(dependent, Collections.emptyMap());
+            String port = portMap.getOrDefault(streamName, "i1");
+
+            if ("i1".equals(port)) {
+                List<OutputMessage> outputs = runner.feedBatch3I1(
+                        pipelineId, timestamps, v0, v1, v2);
+                for (OutputMessage out : outputs) {
+                    appendAndPropagate(dependent, out.timestamp, out.values);
+                }
+            } else {
+                // Multi-source/non-default-port case: preserve current semantics.
+                for (int i = 0; i < n; i++) {
+                    List<OutputMessage> outputs = runner.feed3(
+                            pipelineId, timestamps[i], v0[i], v1[i], v2[i], port);
+                    for (OutputMessage out : outputs) {
+                        appendAndPropagate(dependent, out.timestamp, out.values);
+                    }
+                }
+            }
+        }
+    }
+
     // =================================================================
     // Subscription API
     // =================================================================
