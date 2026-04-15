@@ -72,7 +72,8 @@ TEST_F(ViewChainingTest, StreamToGroupByToGroupBy) {
   ASSERT_EQ(r1.source_streams.size(), 1u);
   EXPECT_EQ(r1.source_streams[0], "trades");
 
-  // v1 program: KeyedPipeline with CumulativeSum, CountNumber, VectorCompose
+  // v1 program: KeyedPipeline with either FusedExpression (fused path)
+  // or CumulativeSum + CountNumber + VectorCompose (unfused path)
   {
     auto program = json::parse(r1.program_json);
     bool has_keyed = false;
@@ -81,14 +82,15 @@ TEST_F(ViewChainingTest, StreamToGroupByToGroupBy) {
         has_keyed = true;
         ASSERT_TRUE(op.contains("prototype"));
         bool has_cum_sum = false, has_count = false, has_compose = false;
+        bool has_fused = false;
         for (const auto& proto_op : op["prototype"]["operators"]) {
           if (proto_op["type"] == "CumulativeSum") has_cum_sum = true;
           if (proto_op["type"] == "CountNumber") has_count = true;
           if (proto_op["type"] == "VectorCompose") has_compose = true;
+          if (proto_op["type"] == "FusedExpression") has_fused = true;
         }
-        EXPECT_TRUE(has_cum_sum) << "Expected CumulativeSum in v1 prototype";
-        EXPECT_TRUE(has_count) << "Expected CountNumber in v1 prototype";
-        EXPECT_TRUE(has_compose) << "Expected VectorCompose in v1 prototype";
+        EXPECT_TRUE(has_fused || (has_cum_sum && has_count && has_compose))
+            << "Expected FusedExpression or CumulativeSum+CountNumber+VectorCompose in v1 prototype";
       }
     }
     EXPECT_TRUE(has_keyed) << "Expected KeyedPipeline in v1 program";
@@ -399,13 +401,14 @@ TEST_F(ViewChainingTest, TableToMaterializedView) {
     if (op["type"] == "KeyedPipeline") {
       has_keyed = true;
       ASSERT_TRUE(op.contains("prototype"));
-      bool has_cum_sum = false, has_count = false;
+      bool has_cum_sum = false, has_count = false, has_fused = false;
       for (const auto& proto_op : op["prototype"]["operators"]) {
         if (proto_op["type"] == "CumulativeSum") has_cum_sum = true;
         if (proto_op["type"] == "CountNumber") has_count = true;
+        if (proto_op["type"] == "FusedExpression") has_fused = true;
       }
-      EXPECT_TRUE(has_cum_sum);
-      EXPECT_TRUE(has_count);
+      EXPECT_TRUE(has_fused || (has_cum_sum && has_count))
+          << "Expected FusedExpression or CumulativeSum+CountNumber in prototype";
     }
   }
   EXPECT_TRUE(has_keyed);

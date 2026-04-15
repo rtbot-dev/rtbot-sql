@@ -2760,5 +2760,501 @@ TEST_F(E2eRuntimeTest, FusedExpressionSqrtProjection) {
   EXPECT_DOUBLE_EQ(out[0], 12.0);  // sqrt(144)
 }
 
+// ===========================================================================
+// Fused Aggregate Expression end-to-end tests
+//
+// These tests verify that GROUP BY queries with aggregate functions compile
+// to FusedExpression operators (with stateful opcodes) and produce correct
+// runtime results. They cover MAX, MIN, nested expressions, and the full
+// vibration_moments pattern.
+// ===========================================================================
+
+// Recursively search for an operator type through nested prototypes.
+// GROUP BY queries place FusedExpression inside KeyedPipeline.prototype
+// and possibly deeper inside Pipeline (which stores inner operators
+// directly as an "operators" array on the Pipeline operator JSON).
+bool json_contains_operator_type(const json& node,
+                                 const std::string& type_name) {
+  if (!node.contains("operators")) return false;
+  for (const auto& op : node["operators"]) {
+    if (op.contains("type") && op["type"] == type_name) return true;
+    // KeyedPipeline: nested under "prototype"
+    if (op.contains("prototype")) {
+      if (json_contains_operator_type(op["prototype"], type_name)) return true;
+    }
+    // Pipeline: inner operators stored directly on the operator object
+    if (op.contains("operators")) {
+      if (json_contains_operator_type(op, type_name)) return true;
+    }
+  }
+  return false;
+}
+
+int json_count_operator_type(const json& node,
+                             const std::string& type_name) {
+  int count = 0;
+  if (!node.contains("operators")) return 0;
+  for (const auto& op : node["operators"]) {
+    if (op.contains("type") && op["type"] == type_name) ++count;
+    // KeyedPipeline: nested under "prototype"
+    if (op.contains("prototype")) {
+      count += json_count_operator_type(op["prototype"], type_name);
+    }
+    // Pipeline: inner operators stored directly on the operator object
+    if (op.contains("operators")) {
+      count += json_count_operator_type(op, type_name);
+    }
+  }
+  return count;
+}
+
+// ---------------------------------------------------------------------------
+// FA-e2e-1: GROUP BY with MAX and MIN aggregates
+//
+// SELECT instrument_id, MAX(price) AS max_price, MIN(price) AS min_price
+// FROM trades GROUP BY instrument_id
+// ---------------------------------------------------------------------------
+
+TEST_F(E2eRuntimeTest, FusedAggregateMaxMin) {
+  auto r = compile(
+      "SELECT instrument_id, MAX(price) AS max_price, MIN(price) AS min_price "
+      "FROM trades GROUP BY instrument_id");
+
+  ASSERT_FALSE(r.has_errors());
+
+  // Verify FusedExpression in the compiled graph (may be nested in prototype)
+  auto program_json = json::parse(r.program_json);
+  EXPECT_TRUE(json_contains_operator_type(program_json, "FusedExpression"))
+      << "GROUP BY with MAX/MIN should compile to FusedExpression";
+
+  int max_idx = r.field_map.at("max_price");
+  int min_idx = r.field_map.at("min_price");
+
+  rtbot::Program program(r.program_json);
+
+  // Feed prices [50, 200, 30, 150] for instrument_id=1
+  // Running MAX: [50, 200, 200, 200]
+  // Running MIN: [50, 50, 30, 30]
+  {
+    auto batch = send(program, 1, {1, 50, 10, 0});
+    auto out = extract_output(batch);
+    ASSERT_FALSE(out.empty());
+    EXPECT_DOUBLE_EQ(out[0], 1);              // instrument_id
+    EXPECT_DOUBLE_EQ(out[max_idx], 50.0);
+    EXPECT_DOUBLE_EQ(out[min_idx], 50.0);
+  }
+  {
+    auto batch = send(program, 2, {1, 200, 10, 0});
+    auto out = extract_output(batch);
+    ASSERT_FALSE(out.empty());
+    EXPECT_DOUBLE_EQ(out[max_idx], 200.0);
+    EXPECT_DOUBLE_EQ(out[min_idx], 50.0);
+  }
+  {
+    auto batch = send(program, 3, {1, 30, 10, 0});
+    auto out = extract_output(batch);
+    ASSERT_FALSE(out.empty());
+    EXPECT_DOUBLE_EQ(out[max_idx], 200.0);
+    EXPECT_DOUBLE_EQ(out[min_idx], 30.0);
+  }
+  {
+    auto batch = send(program, 4, {1, 150, 10, 0});
+    auto out = extract_output(batch);
+    ASSERT_FALSE(out.empty());
+    EXPECT_DOUBLE_EQ(out[max_idx], 200.0);
+    EXPECT_DOUBLE_EQ(out[min_idx], 30.0);
+  }
+
+  // Key isolation: instrument_id=2 should have independent tracking
+  {
+    auto batch = send(program, 5, {2, 100, 10, 0});
+    auto out = extract_output(batch);
+    ASSERT_FALSE(out.empty());
+    EXPECT_DOUBLE_EQ(out[0], 2);
+    EXPECT_DOUBLE_EQ(out[max_idx], 100.0);
+    EXPECT_DOUBLE_EQ(out[min_idx], 100.0);
+  }
+  {
+    auto batch = send(program, 6, {2, 75, 10, 0});
+    auto out = extract_output(batch);
+    ASSERT_FALSE(out.empty());
+    EXPECT_DOUBLE_EQ(out[max_idx], 100.0);
+    EXPECT_DOUBLE_EQ(out[min_idx], 75.0);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// FA-e2e-2: GROUP BY with AVG of nested expression (POWER)
+//
+// SELECT instrument_id,
+//        AVG(POWER(price, 2)) AS avg_price_sq
+// FROM trades GROUP BY instrument_id
+//
+// This tests nested function composition in fused aggregate bytecode:
+// POWER(price, 2) feeds into CUMSUM/COUNT/DIV for AVG.
+// ---------------------------------------------------------------------------
+
+TEST_F(E2eRuntimeTest, FusedAggregateAvgNestedPower) {
+  auto r = compile(
+      "SELECT instrument_id, AVG(POWER(price, 2)) AS avg_price_sq "
+      "FROM trades GROUP BY instrument_id");
+
+  ASSERT_FALSE(r.has_errors());
+
+  // Verify FusedExpression in graph (may be nested in prototype)
+  auto program_json = json::parse(r.program_json);
+  EXPECT_TRUE(json_contains_operator_type(program_json, "FusedExpression"))
+      << "AVG(POWER(x,2)) should compile to FusedExpression with stateful opcodes";
+
+  int avg_sq_idx = r.field_map.at("avg_price_sq");
+
+  rtbot::Program program(r.program_json);
+
+  // Feed prices [10, 20, 30] for instrument_id=1
+  // POWER(price, 2): [100, 400, 900]
+  // Cumulative avg of squared: [100, 250, 466.666...]
+  {
+    auto batch = send(program, 1, {1, 10, 100, 0});
+    auto out = extract_output(batch);
+    ASSERT_FALSE(out.empty());
+    EXPECT_DOUBLE_EQ(out[0], 1);
+    EXPECT_DOUBLE_EQ(out[avg_sq_idx], 100.0);  // avg(100) = 100
+  }
+  {
+    auto batch = send(program, 2, {1, 20, 100, 0});
+    auto out = extract_output(batch);
+    ASSERT_FALSE(out.empty());
+    EXPECT_DOUBLE_EQ(out[avg_sq_idx], 250.0);  // avg(100, 400) = 250
+  }
+  {
+    auto batch = send(program, 3, {1, 30, 100, 0});
+    auto out = extract_output(batch);
+    ASSERT_FALSE(out.empty());
+    EXPECT_NEAR(out[avg_sq_idx], 1400.0 / 3.0, 1e-9);  // avg(100, 400, 900)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// FA-e2e-3: GROUP BY with mixed aggregates and nested expressions
+//
+// SELECT instrument_id,
+//        SUM(quantity) AS total_qty,
+//        AVG(price) AS avg_price,
+//        MAX(ABS(price - 100)) AS max_deviation,
+//        COUNT(*) AS cnt
+// FROM trades GROUP BY instrument_id
+//
+// Tests multiple fused aggregates with shared COUNT and nested ABS expression.
+// ---------------------------------------------------------------------------
+
+TEST_F(E2eRuntimeTest, FusedAggregateMixedAggregates) {
+  auto r = compile(
+      "SELECT instrument_id, "
+      "SUM(quantity) AS total_qty, "
+      "AVG(price) AS avg_price, "
+      "MAX(ABS(price - 100)) AS max_deviation, "
+      "COUNT(*) AS cnt "
+      "FROM trades GROUP BY instrument_id");
+
+  ASSERT_FALSE(r.has_errors());
+
+  // Verify FusedExpression (may be nested in prototype)
+  auto program_json = json::parse(r.program_json);
+  EXPECT_TRUE(json_contains_operator_type(program_json, "FusedExpression"))
+      << "Mixed aggregates should compile to FusedExpression";
+
+  int total_qty_idx = r.field_map.at("total_qty");
+  int avg_price_idx = r.field_map.at("avg_price");
+  int max_dev_idx = r.field_map.at("max_deviation");
+  int cnt_idx = r.field_map.at("cnt");
+
+  rtbot::Program program(r.program_json);
+
+  // trades: [instrument_id, price, quantity, account_id]
+  // Feed: (id=1, price=80, qty=10), (id=1, price=120, qty=20), (id=1, price=50, qty=30)
+  //
+  // SUM(quantity): [10, 30, 60]
+  // AVG(price): [80, 100, 83.33]
+  // ABS(price-100): [20, 20, 50]
+  // MAX(ABS(price-100)): [20, 20, 50]
+  // COUNT: [1, 2, 3]
+
+  {
+    auto batch = send(program, 1, {1, 80, 10, 0});
+    auto out = extract_output(batch);
+    ASSERT_FALSE(out.empty());
+    EXPECT_DOUBLE_EQ(out[0], 1);
+    EXPECT_DOUBLE_EQ(out[total_qty_idx], 10.0);
+    EXPECT_DOUBLE_EQ(out[avg_price_idx], 80.0);
+    EXPECT_DOUBLE_EQ(out[max_dev_idx], 20.0);   // |80-100| = 20
+    EXPECT_DOUBLE_EQ(out[cnt_idx], 1.0);
+  }
+  {
+    auto batch = send(program, 2, {1, 120, 20, 0});
+    auto out = extract_output(batch);
+    ASSERT_FALSE(out.empty());
+    EXPECT_DOUBLE_EQ(out[total_qty_idx], 30.0);    // 10+20
+    EXPECT_DOUBLE_EQ(out[avg_price_idx], 100.0);   // avg(80,120)
+    EXPECT_DOUBLE_EQ(out[max_dev_idx], 20.0);      // max(20, 20)
+    EXPECT_DOUBLE_EQ(out[cnt_idx], 2.0);
+  }
+  {
+    auto batch = send(program, 3, {1, 50, 30, 0});
+    auto out = extract_output(batch);
+    ASSERT_FALSE(out.empty());
+    EXPECT_DOUBLE_EQ(out[total_qty_idx], 60.0);              // 10+20+30
+    EXPECT_NEAR(out[avg_price_idx], 250.0 / 3.0, 1e-9);     // avg(80,120,50)
+    EXPECT_DOUBLE_EQ(out[max_dev_idx], 50.0);                // max(20, 20, 50)
+    EXPECT_DOUBLE_EQ(out[cnt_idx], 3.0);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// FA-e2e-4: Vibration moments pattern — the key benchmark query
+//
+// SELECT device_id, channel_id,
+//        AVG(amplitude) AS mean_value,
+//        AVG(POWER(amplitude, 2)) AS ex2,
+//        AVG(POWER(amplitude, 3)) AS ex3,
+//        AVG(POWER(amplitude, 4)) AS ex4,
+//        MAX(ABS(amplitude)) AS peak_value,
+//        AVG(ABS(amplitude)) AS mean_abs,
+//        AVG(POWER(ABS(amplitude), 0.5)) AS mean_sqrt_abs,
+//        COUNT(*) AS sample_count
+// FROM vibration_raw
+// GROUP BY device_id, channel_id, ABS(amplitude) > 0
+//
+// This is the production query that motivated stateful FusedExpression.
+// Tests full compilation + runtime with 9 fused aggregate expressions.
+// ---------------------------------------------------------------------------
+
+TEST_F(E2eRuntimeTest, FusedAggregateVibrationMoments) {
+  // Register vibration_raw stream
+  StreamSchema vibration_raw{
+      "vibration_raw",
+      {{"device_id", 0}, {"channel_id", 1}, {"amplitude", 2}}};
+  catalog.streams["vibration_raw"] = vibration_raw;
+
+  auto r = compile(
+      "SELECT device_id, channel_id, "
+      "AVG(amplitude) AS mean_value, "
+      "AVG(POWER(amplitude, 2)) AS ex2, "
+      "AVG(POWER(amplitude, 3)) AS ex3, "
+      "AVG(POWER(amplitude, 4)) AS ex4, "
+      "MAX(ABS(amplitude)) AS peak_value, "
+      "AVG(ABS(amplitude)) AS mean_abs, "
+      "AVG(POWER(ABS(amplitude), 0.5)) AS mean_sqrt_abs, "
+      "COUNT(*) AS sample_count "
+      "FROM vibration_raw "
+      "GROUP BY device_id, channel_id, ABS(amplitude) > 0");
+
+  ASSERT_FALSE(r.has_errors());
+
+  // Verify FusedExpression in graph (may be nested in prototype)
+  auto program_json = json::parse(r.program_json);
+  EXPECT_GE(json_count_operator_type(program_json, "FusedExpression"), 1)
+      << "Vibration moments query must use FusedExpression";
+
+  int dev_idx = r.field_map.at("device_id");
+  int ch_idx = r.field_map.at("channel_id");
+  int mean_idx = r.field_map.at("mean_value");
+  int ex2_idx = r.field_map.at("ex2");
+  int ex3_idx = r.field_map.at("ex3");
+  int ex4_idx = r.field_map.at("ex4");
+  int peak_idx = r.field_map.at("peak_value");
+  int mean_abs_idx = r.field_map.at("mean_abs");
+  int sqrt_idx = r.field_map.at("mean_sqrt_abs");
+  int cnt_idx = r.field_map.at("sample_count");
+
+  rtbot::Program program(r.program_json);
+
+  // This is a segment GROUP BY — Pipeline emits at key transitions.
+  // Feed: device=1, channel=1, amplitudes [3, 4] (active), then 0 (silence)
+  //
+  // Segment: active (ABS(amp) > 0 = 1.0)
+  //   amp=3: all aggregates accumulate
+  //   amp=4: all aggregates accumulate
+  //
+  // Then amp=0: key changes to 0.0 → Pipeline emits the active segment result.
+  //
+  // Expected for segment [3, 4]:
+  //   mean_value = avg(3, 4) = 3.5
+  //   ex2 = avg(9, 16) = 12.5
+  //   ex3 = avg(27, 64) = 45.5
+  //   ex4 = avg(81, 256) = 168.5
+  //   peak_value = max(3, 4) = 4
+  //   mean_abs = avg(3, 4) = 3.5
+  //   mean_sqrt_abs = avg(sqrt(3), sqrt(4)) = avg(1.7320508..., 2.0)
+  //   sample_count = 2
+
+  // Collect all outputs
+  struct OutputRow {
+    rtbot::timestamp_t time;
+    std::vector<double> values;
+  };
+  std::vector<OutputRow> all_outputs;
+
+  auto collect = [&](const rtbot::ProgramMsgBatch& batch) {
+    for (const auto& [op_id, op_batch] : batch) {
+      for (const auto& [port, msgs] : op_batch) {
+        for (const auto& msg : msgs) {
+          auto* vec_msg =
+              dynamic_cast<rtbot::Message<rtbot::VectorNumberData>*>(msg.get());
+          if (vec_msg) {
+            all_outputs.push_back({vec_msg->time, *vec_msg->data.values});
+          }
+        }
+      }
+    }
+  };
+
+  // Active segment: amp=3, amp=4
+  collect(send(program, 1, {1, 1, 3.0}));
+  EXPECT_EQ(all_outputs.size(), 0u) << "No output during accumulation";
+
+  collect(send(program, 2, {1, 1, 4.0}));
+  EXPECT_EQ(all_outputs.size(), 0u) << "No output during accumulation";
+
+  // Segment boundary: amp=0 → key change from 1.0 to 0.0 → emit active segment
+  collect(send(program, 3, {1, 1, 0.0}));
+  ASSERT_EQ(all_outputs.size(), 1u)
+      << "Segment boundary should emit accumulated result";
+
+  const auto& out = all_outputs[0].values;
+
+  EXPECT_DOUBLE_EQ(out[dev_idx], 1);
+  EXPECT_DOUBLE_EQ(out[ch_idx], 1);
+  EXPECT_DOUBLE_EQ(out[mean_idx], 3.5);                       // avg(3, 4)
+  EXPECT_DOUBLE_EQ(out[ex2_idx], 12.5);                       // avg(9, 16)
+  EXPECT_DOUBLE_EQ(out[ex3_idx], 45.5);                       // avg(27, 64)
+  EXPECT_DOUBLE_EQ(out[ex4_idx], 168.5);                      // avg(81, 256)
+  EXPECT_DOUBLE_EQ(out[peak_idx], 4.0);                       // max(3, 4)
+  EXPECT_DOUBLE_EQ(out[mean_abs_idx], 3.5);                   // avg(3, 4)
+  EXPECT_NEAR(out[sqrt_idx], (std::sqrt(3.0) + 2.0) / 2.0,
+              1e-9);                                            // avg(sqrt(3), sqrt(4))
+  EXPECT_DOUBLE_EQ(out[cnt_idx], 2.0);
+}
+
+// ---------------------------------------------------------------------------
+// FA-e2e-5: Simple GROUP BY with MIN (no segment, single key)
+//
+// SELECT instrument_id, MIN(price) AS min_price
+// FROM trades GROUP BY instrument_id
+//
+// Tests running minimum — every message produces output.
+// ---------------------------------------------------------------------------
+
+TEST_F(E2eRuntimeTest, FusedAggregateMinRunning) {
+  auto r = compile(
+      "SELECT instrument_id, MIN(price) AS min_price "
+      "FROM trades GROUP BY instrument_id");
+
+  ASSERT_FALSE(r.has_errors());
+
+  int min_idx = r.field_map.at("min_price");
+
+  rtbot::Program program(r.program_json);
+
+  // Feed prices [100, 80, 90, 60, 70] for instrument_id=1
+  // Running MIN: [100, 80, 80, 60, 60]
+  std::vector<double> prices = {100, 80, 90, 60, 70};
+  std::vector<double> expected_min = {100, 80, 80, 60, 60};
+
+  for (size_t i = 0; i < prices.size(); ++i) {
+    auto batch = send(program, static_cast<rtbot::timestamp_t>(i + 1),
+                      {1, prices[i], 10, 0});
+    auto out = extract_output(batch);
+    ASSERT_FALSE(out.empty()) << "Should produce output for message " << i;
+    EXPECT_DOUBLE_EQ(out[0], 1) << "instrument_id";
+    EXPECT_DOUBLE_EQ(out[min_idx], expected_min[i])
+        << "MIN mismatch at message " << i;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// FA-e2e-6: Mixed GROUP BY with fused MAX aggregate and segment reset
+//
+// SELECT device_id, MAX(amplitude) AS peak, COUNT(*) AS cnt
+// FROM vibration
+// GROUP BY device_id, ABS(amplitude) > 0
+//
+// Tests stateful aggregate reset across segment boundaries.
+// Uses mixed GROUP BY (persistent key + segment) to go through the fused path
+// where FusedExpression.reset() properly resets aggregate state.
+// ---------------------------------------------------------------------------
+
+TEST_F(E2eRuntimeTest, FusedAggregateSegmentMaxReset) {
+  StreamSchema vibration{
+      "vibration", {{"device_id", 0}, {"amplitude", 1}, {"frequency", 2}}};
+  catalog.streams["vibration"] = vibration;
+
+  auto r = compile(
+      "SELECT device_id, MAX(amplitude) AS peak, COUNT(*) AS cnt "
+      "FROM vibration "
+      "GROUP BY device_id, ABS(amplitude) > 0");
+
+  ASSERT_FALSE(r.has_errors());
+
+  // Verify fused path is used
+  auto program_json = json::parse(r.program_json);
+  EXPECT_TRUE(json_contains_operator_type(program_json, "FusedExpression"))
+      << "Mixed GROUP BY with aggregates should use FusedExpression";
+
+  int peak_idx = r.field_map.at("peak");
+  int cnt_idx = r.field_map.at("cnt");
+
+  rtbot::Program program(r.program_json);
+
+  struct OutputRow {
+    rtbot::timestamp_t time;
+    std::vector<double> values;
+  };
+  std::vector<OutputRow> all_outputs;
+
+  auto collect = [&](const rtbot::ProgramMsgBatch& batch) {
+    for (const auto& [op_id, op_batch] : batch) {
+      for (const auto& [port, msgs] : op_batch) {
+        for (const auto& msg : msgs) {
+          auto* vec_msg =
+              dynamic_cast<rtbot::Message<rtbot::VectorNumberData>*>(msg.get());
+          if (vec_msg) {
+            all_outputs.push_back({vec_msg->time, *vec_msg->data.values});
+          }
+        }
+      }
+    }
+  };
+
+  // Active segment 1: amplitudes [5, 8, 3] → MAX=8, COUNT=3
+  collect(send(program, 1, {1, 5.0, 100}));
+  collect(send(program, 2, {1, 8.0, 100}));
+  collect(send(program, 3, {1, 3.0, 100}));
+
+  // Silence → emit active segment 1
+  collect(send(program, 4, {1, 0.0, 100}));
+  ASSERT_EQ(all_outputs.size(), 1u);
+  EXPECT_DOUBLE_EQ(all_outputs[0].values[peak_idx], 8.0);
+  EXPECT_DOUBLE_EQ(all_outputs[0].values[cnt_idx], 3.0);
+
+  // Active segment 2: amplitudes [2, 7] → MAX=7, COUNT=2
+  // Key change: 0→1 emits silence segment first
+  collect(send(program, 5, {1, 2.0, 100}));
+  ASSERT_EQ(all_outputs.size(), 2u)
+      << "Key change from silence to active emits silence segment";
+  // Silence segment: MAX(0)=0, COUNT=1
+  EXPECT_DOUBLE_EQ(all_outputs[1].values[peak_idx], 0.0);
+  EXPECT_DOUBLE_EQ(all_outputs[1].values[cnt_idx], 1.0);
+
+  collect(send(program, 6, {1, 7.0, 100}));
+
+  // Silence again → emit active segment 2
+  // FusedExpression.reset() resets aggregate state, so MAX starts fresh
+  collect(send(program, 7, {1, 0.0, 100}));
+  ASSERT_EQ(all_outputs.size(), 3u);
+  // Active segment 2: MAX(2, 7)=7, COUNT=2
+  EXPECT_DOUBLE_EQ(all_outputs[2].values[peak_idx], 7.0);
+  EXPECT_DOUBLE_EQ(all_outputs[2].values[cnt_idx], 2.0);
+}
+
 }  // namespace
 }  // namespace rtbot_sql::api
