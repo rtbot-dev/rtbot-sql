@@ -28,9 +28,12 @@ public class BearingLoadTest {
 
     // -- Configuration (matches Python memory_profile_test.py) -------------
 
-    private static final int NUM_BEARINGS = 4;
-    private static final int SAMPLES_PER_BURST = 512;
-    private static final int NUM_BURSTS = 300;
+    private static final int NUM_BEARINGS =
+        Integer.getInteger("rtbot.benchmark.bearings", 4);
+    private static final int SAMPLES_PER_BURST =
+        Integer.getInteger("rtbot.benchmark.samplesPerBurst", 512);
+    private static final int NUM_BURSTS =
+        Integer.getInteger("rtbot.benchmark.bursts", 300);
     private static final int SAMPLE_INTERVAL = 10;
 
     // -- SQL Definitions (matching Python test exactly) --------------------
@@ -146,7 +149,7 @@ public class BearingLoadTest {
             System.out.printf("Pipeline: vibration_raw -> vibration_moments (VIEW)%n");
             System.out.printf("          -> rms_trend + kurtosis_trend (MAT VIEWs)%n");
             System.out.println("Mode: SUBSCRIPTION (nothing stored, output to subscribers only)");
-            System.out.printf("Feed mode: %s%n", batch ? "BATCH insert3Batch" : "ROW insert3");
+            System.out.printf("Feed mode: %s%n", batch ? "BATCH insertBatch" : "ROW insert3");
             System.out.println("----------------------------------------------------------------");
             System.out.printf("  %6s  %10s  %12s  %10s%n",
                               "Burst", "Msgs", "Msgs/sec", "Heap MB");
@@ -175,7 +178,8 @@ public class BearingLoadTest {
                         v0Batch[SAMPLES_PER_BURST] = (double) bearingId;
                         v1Batch[SAMPLES_PER_BURST] = 1.0;
                         v2Batch[SAMPLES_PER_BURST] = 0.0;
-                        runtime.insert3Batch("vibration_raw", tsBatch, v0Batch, v1Batch, v2Batch);
+                        runtime.insertBatch("vibration_raw", tsBatch,
+                                new double[][] { v0Batch, v1Batch, v2Batch });
                         totalMessages += batchSize;
                     } else {
                         // Data samples
