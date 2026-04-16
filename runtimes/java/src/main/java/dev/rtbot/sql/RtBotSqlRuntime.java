@@ -140,6 +140,21 @@ public class RtBotSqlRuntime {
     }
 
     /**
+     * Encodes a text value to its dictionary double for a TEXT column. The
+     * mapping is stable — the same string always returns the same double
+     * within this runtime instance. New strings are assigned the next
+     * sequential ID automatically.
+     *
+     * <p>This is a pure Java {@link java.util.HashMap} lookup (~20ns) with
+     * no JNI crossing, so it is safe to call per-row when building
+     * all-double batch arrays for {@link #insertBatch}.
+     */
+    public double encodeText(String streamName, String columnName, String textValue) {
+        String dictKey = streamName + "." + columnName;
+        return catalog.getOrCreateDictionary(dictKey).encode(textValue);
+    }
+
+    /**
      * Insert a row with mixed types (doubles and strings for TEXT columns).
      *
      * <p>Strings are dictionary-encoded to doubles before passing to the
@@ -266,46 +281,48 @@ public class RtBotSqlRuntime {
     }
 
     /**
-     * Batched insert path for common 3-column numeric streams.
+     * Batched insert path for numeric streams with any number of columns.
      *
-     * <p>Feeds a whole batch of rows in one native call for single-source
-     * dependents on port {@code i1}. Falls back to row-by-row routing when
-     * collect mode is enabled, the source has direct subscribers, or a
-     * dependent requires a non-default input port.
+     * <p>{@code columns} is column-major: {@code columns[c][i]} is the value of
+     * column {@code c} at row {@code i}. Feeds the whole batch in one native
+     * call for single-source dependents on port {@code i1}. Falls back to
+     * row-by-row routing when collect mode is enabled, the source has direct
+     * subscribers, or a dependent requires a non-default input port.
      */
-    public void insert3Batch(String streamName,
-                             long[] timestamps,
-                             double[] v0,
-                             double[] v1,
-                             double[] v2) {
+    public void insertBatch(String streamName,
+                            long[] timestamps,
+                            double[][] columns) {
         StreamSchema schema = catalog.lookupStream(streamName);
         if (schema == null) {
             throw new SqlError("Unknown stream: " + streamName);
         }
-        if (schema.columns != null && !schema.columns.isEmpty()
-                && schema.columns.size() != 3) {
-            throw new SqlError("insert3Batch requires 3 columns for " + streamName
-                    + ", found " + schema.columns.size());
+        if (timestamps == null || columns == null) {
+            throw new SqlError("insertBatch arrays must not be null");
         }
-        if (timestamps == null || v0 == null || v1 == null || v2 == null) {
-            throw new SqlError("insert3Batch arrays must not be null");
+        if (schema.columns != null && !schema.columns.isEmpty()
+                && schema.columns.size() != columns.length) {
+            throw new SqlError("insertBatch column count mismatch for " + streamName
+                    + ": schema=" + schema.columns.size()
+                    + ", got=" + columns.length);
         }
         int n = timestamps.length;
-        if (v0.length != n || v1.length != n || v2.length != n) {
-            throw new SqlError("insert3Batch array length mismatch for " + streamName
-                    + ": ts=" + n
-                    + ", v0=" + v0.length
-                    + ", v1=" + v1.length
-                    + ", v2=" + v2.length);
+        for (int c = 0; c < columns.length; c++) {
+            if (columns[c] == null || columns[c].length != n) {
+                throw new SqlError("insertBatch column " + c + " null or length mismatch for "
+                        + streamName + ": expected " + n);
+            }
         }
         if (n == 0) {
             return;
         }
 
-        // Fallback when source stream needs direct materialization/callback.
         if (collectMode || subscriptions.containsKey(streamName)) {
             for (int i = 0; i < n; i++) {
-                insert(streamName, timestamps[i], java.util.Arrays.asList(v0[i], v1[i], v2[i]));
+                List<Double> row = new java.util.ArrayList<>(columns.length);
+                for (double[] col : columns) {
+                    row.add(col[i]);
+                }
+                insert(streamName, timestamps[i], row);
             }
             return;
         }
@@ -323,16 +340,19 @@ public class RtBotSqlRuntime {
             String port = portMap.getOrDefault(streamName, "i1");
 
             if ("i1".equals(port)) {
-                List<OutputMessage> outputs = runner.feedBatch3I1(
-                        pipelineId, timestamps, v0, v1, v2);
+                List<OutputMessage> outputs = runner.feedBatchI1(
+                        pipelineId, timestamps, columns);
                 for (OutputMessage out : outputs) {
                     appendAndPropagate(dependent, out.timestamp, out.values);
                 }
             } else {
-                // Multi-source/non-default-port case: preserve current semantics.
                 for (int i = 0; i < n; i++) {
-                    List<OutputMessage> outputs = runner.feed3(
-                            pipelineId, timestamps[i], v0[i], v1[i], v2[i], port);
+                    List<Double> row = new java.util.ArrayList<>(columns.length);
+                    for (double[] col : columns) {
+                        row.add(col[i]);
+                    }
+                    List<OutputMessage> outputs = runner.feed(
+                            pipelineId, timestamps[i], row, port);
                     for (OutputMessage out : outputs) {
                         appendAndPropagate(dependent, out.timestamp, out.values);
                     }

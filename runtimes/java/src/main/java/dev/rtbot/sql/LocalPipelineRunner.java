@@ -161,47 +161,47 @@ public class LocalPipelineRunner implements PipelineRunner {
     }
 
     /**
-     * Batched hot path for 3-value messages on default input port "i1".
+     * Batched hot path for messages on default input port "i1".
      *
-     * <p>Feeds all rows in one JNI/native call to amortize boundary overhead.
+     * <p>{@code columns} is column-major: {@code columns[c][i]} is the value of
+     * column {@code c} at row {@code i}. Feeds all rows in one JNI/native call
+     * to amortize boundary overhead.
      */
-    public List<OutputMessage> feedBatch3I1(
+    public List<OutputMessage> feedBatchI1(
             String pipelineId,
             long[] timestamps,
-            double[] v0,
-            double[] v1,
-            double[] v2) {
+            double[][] columns) {
         Long handle = pipelines.get(pipelineId);
         if (handle == null) {
             throw new IllegalArgumentException("Unknown pipeline: " + pipelineId);
         }
-        if (timestamps == null || v0 == null || v1 == null || v2 == null) {
-            throw new IllegalArgumentException("feedBatch3I1 arrays must not be null");
+        if (timestamps == null || columns == null) {
+            throw new IllegalArgumentException("feedBatchI1 arrays must not be null");
         }
         int n = timestamps.length;
-        if (v0.length != n || v1.length != n || v2.length != n) {
-            throw new IllegalArgumentException(
-                    "feedBatch3I1 array length mismatch: ts=" + n
-                            + ", v0=" + v0.length
-                            + ", v1=" + v1.length
-                            + ", v2=" + v2.length);
+        for (int c = 0; c < columns.length; c++) {
+            if (columns[c] == null || columns[c].length != n) {
+                throw new IllegalArgumentException(
+                        "feedBatchI1 column " + c + " null or length mismatch: expected "
+                                + n + ", got " + (columns[c] == null ? "null" : columns[c].length));
+            }
         }
 
         if (!perfStatsEnabled) {
-            String json = RtBotSqlCompiler.feedPipeline3BatchI1(
-                    handle, timestamps, v0, v1, v2);
+            String json = RtBotSqlCompiler.feedPipelineBatchI1(
+                    handle, timestamps, columns);
             return parseOutputMessages(json);
         }
 
         long t0 = System.nanoTime();
-        String json = RtBotSqlCompiler.feedPipeline3BatchI1(
-                handle, timestamps, v0, v1, v2);
+        String json = RtBotSqlCompiler.feedPipelineBatchI1(
+                handle, timestamps, columns);
         long t1 = System.nanoTime();
         List<OutputMessage> outputs = parseOutputMessages(json);
         long t2 = System.nanoTime();
 
         feedCalls++;
-        inputValues += (long) n * 3L;
+        inputValues += (long) n * (long) columns.length;
         nativeNs += (t1 - t0);
         parseNs += (t2 - t1);
         outputMessages += outputs.size();

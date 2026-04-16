@@ -109,18 +109,17 @@ public final class RtBotSqlCompiler {
                                                 double v0, double v1, double v2);
 
     /**
-     * Feed a batch of 3-value messages on default input port "i1".
+     * Feed a batch of messages on default input port "i1".
      *
-     * <p>All arrays must have identical length. The native side feeds the
-     * full batch in one call via Program::receive_batch, then returns all
-     * produced output messages as JSON.
+     * <p>{@code columns} is column-major: {@code columns[c]} is the array of
+     * values for column {@code c}, and all arrays must have the same length as
+     * {@code timestamps}. The native side feeds the full batch in one call via
+     * Program::receive_batch, then returns all produced output messages as JSON.
      */
-    public static native String feedPipeline3BatchI1(
+    public static native String feedPipelineBatchI1(
             long handle,
             long[] timestamps,
-            double[] v0,
-            double[] v1,
-            double[] v2);
+            double[][] columns);
 
     /**
      * Reset cumulative native feed-path profiling counters.

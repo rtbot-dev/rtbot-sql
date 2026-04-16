@@ -820,12 +820,10 @@ Java_dev_rtbot_sql_RtBotSqlCompiler_feedPipeline3I1(JNIEnv* env, jclass,
 }
 
 JNIEXPORT jstring JNICALL
-Java_dev_rtbot_sql_RtBotSqlCompiler_feedPipeline3BatchI1(JNIEnv* env, jclass,
-                                                          jlong handle,
-                                                          jlongArray timestamps,
-                                                          jdoubleArray v0,
-                                                          jdoubleArray v1,
-                                                          jdoubleArray v2) {
+Java_dev_rtbot_sql_RtBotSqlCompiler_feedPipelineBatchI1(JNIEnv* env, jclass,
+                                                         jlong handle,
+                                                         jlongArray timestamps,
+                                                         jobjectArray columns) {
   try {
     const bool profile =
         g_native_feed_stats_enabled.load(std::memory_order_relaxed);
@@ -833,27 +831,33 @@ Java_dev_rtbot_sql_RtBotSqlCompiler_feedPipeline3BatchI1(JNIEnv* env, jclass,
 
     auto* program = reinterpret_cast<rtbot::Program*>(handle);
     if (!program) {
-      throw_runtime_exception(env, "feedPipeline3BatchI1: null pipeline handle");
+      throw_runtime_exception(env, "feedPipelineBatchI1: null pipeline handle");
       return nullptr;
     }
-    if (!timestamps || !v0 || !v1 || !v2) {
-      throw_runtime_exception(env, "feedPipeline3BatchI1: null input array");
+    if (!timestamps || !columns) {
+      throw_runtime_exception(env, "feedPipelineBatchI1: null input array");
       return nullptr;
     }
 
     const jsize n = env->GetArrayLength(timestamps);
-    if (env->GetArrayLength(v0) != n
-        || env->GetArrayLength(v1) != n
-        || env->GetArrayLength(v2) != n) {
-      throw_runtime_exception(
-          env, "feedPipeline3BatchI1: array length mismatch");
-      return nullptr;
+    const jsize num_cols = env->GetArrayLength(columns);
+
+    // Pin all column arrays up front to minimise JNI crossings.
+    std::vector<jdoubleArray> col_refs(num_cols);
+    std::vector<jdouble*> col_elems(num_cols);
+    for (jsize c = 0; c < num_cols; ++c) {
+      col_refs[c] = static_cast<jdoubleArray>(env->GetObjectArrayElement(columns, c));
+      if (!col_refs[c] || env->GetArrayLength(col_refs[c]) != n) {
+        for (jsize j = 0; j < c; ++j) {
+          env->ReleaseDoubleArrayElements(col_refs[j], col_elems[j], JNI_ABORT);
+        }
+        throw_runtime_exception(env, "feedPipelineBatchI1: column array null or length mismatch");
+        return nullptr;
+      }
+      col_elems[c] = env->GetDoubleArrayElements(col_refs[c], nullptr);
     }
 
     jlong* ts_elems = env->GetLongArrayElements(timestamps, nullptr);
-    jdouble* v0_elems = env->GetDoubleArrayElements(v0, nullptr);
-    jdouble* v1_elems = env->GetDoubleArrayElements(v1, nullptr);
-    jdouble* v2_elems = env->GetDoubleArrayElements(v2, nullptr);
     const std::uint64_t t_after_values = profile ? now_ns() : 0;
 
     std::map<std::string, std::vector<std::unique_ptr<rtbot::BaseMessage>>> buffer;
@@ -861,10 +865,10 @@ Java_dev_rtbot_sql_RtBotSqlCompiler_feedPipeline3BatchI1(JNIEnv* env, jclass,
     port_messages.reserve(static_cast<std::size_t>(n));
     for (jsize i = 0; i < n; ++i) {
       std::vector<double> values_vec;
-      values_vec.reserve(3);
-      values_vec.push_back(static_cast<double>(v0_elems[i]));
-      values_vec.push_back(static_cast<double>(v1_elems[i]));
-      values_vec.push_back(static_cast<double>(v2_elems[i]));
+      values_vec.reserve(static_cast<std::size_t>(num_cols));
+      for (jsize c = 0; c < num_cols; ++c) {
+        values_vec.push_back(static_cast<double>(col_elems[c][i]));
+      }
       port_messages.push_back(rtbot::create_message<rtbot::VectorNumberData>(
           static_cast<rtbot::timestamp_t>(ts_elems[i]),
           rtbot::VectorNumberData{std::move(values_vec)}));
@@ -872,9 +876,9 @@ Java_dev_rtbot_sql_RtBotSqlCompiler_feedPipeline3BatchI1(JNIEnv* env, jclass,
     const std::uint64_t t_after_msg = profile ? now_ns() : 0;
 
     env->ReleaseLongArrayElements(timestamps, ts_elems, JNI_ABORT);
-    env->ReleaseDoubleArrayElements(v0, v0_elems, JNI_ABORT);
-    env->ReleaseDoubleArrayElements(v1, v1_elems, JNI_ABORT);
-    env->ReleaseDoubleArrayElements(v2, v2_elems, JNI_ABORT);
+    for (jsize c = 0; c < num_cols; ++c) {
+      env->ReleaseDoubleArrayElements(col_refs[c], col_elems[c], JNI_ABORT);
+    }
 
     auto batch = program->receive_batch(buffer);
     const std::uint64_t t_after_receive = profile ? now_ns() : 0;
@@ -883,7 +887,8 @@ Java_dev_rtbot_sql_RtBotSqlCompiler_feedPipeline3BatchI1(JNIEnv* env, jclass,
         const std::uint64_t t_end = now_ns();
         g_native_feed_stats.calls.fetch_add(1, std::memory_order_relaxed);
         g_native_feed_stats.input_values.fetch_add(
-            static_cast<std::uint64_t>(n) * 3ULL, std::memory_order_relaxed);
+            static_cast<std::uint64_t>(n) * static_cast<std::uint64_t>(num_cols),
+            std::memory_order_relaxed);
         g_native_feed_stats.total_ns.fetch_add(
             t_end - t0, std::memory_order_relaxed);
         g_native_feed_stats.values_copy_ns.fetch_add(
@@ -904,7 +909,8 @@ Java_dev_rtbot_sql_RtBotSqlCompiler_feedPipeline3BatchI1(JNIEnv* env, jclass,
       BatchStats batch_stats = count_batch_stats(batch);
       g_native_feed_stats.calls.fetch_add(1, std::memory_order_relaxed);
       g_native_feed_stats.input_values.fetch_add(
-          static_cast<std::uint64_t>(n) * 3ULL, std::memory_order_relaxed);
+          static_cast<std::uint64_t>(n) * static_cast<std::uint64_t>(num_cols),
+          std::memory_order_relaxed);
       g_native_feed_stats.total_ns.fetch_add(
           t_end - t0, std::memory_order_relaxed);
       g_native_feed_stats.values_copy_ns.fetch_add(
@@ -925,7 +931,7 @@ Java_dev_rtbot_sql_RtBotSqlCompiler_feedPipeline3BatchI1(JNIEnv* env, jclass,
     return out;
   } catch (const std::exception& e) {
     throw_runtime_exception(
-        env, std::string("feedPipeline3BatchI1: ") + e.what());
+        env, std::string("feedPipelineBatchI1: ") + e.what());
     return nullptr;
   }
 }
