@@ -279,3 +279,18 @@ java_test(
         "@maven//:com_google_code_gson_gson",
     ],
 )
+
+# ---------------------------------------------------------------------------
+# Insert batch tests — pre-encoding and N-column batch insert paths
+#
+# Run:  bazel test //runtimes/java:insert-batch-test --test_output=all
+# ---------------------------------------------------------------------------
+java_test(
+    name = "insert-batch-test",
+    srcs = ["src/test/java/dev/rtbot/sql/InsertBatchTest.java"],
+    test_class = "dev.rtbot.sql.InsertBatchTest",
+    deps = [
+        ":rtbot-sql-java-runtime",
+        "@maven//:junit_junit",
+    ],
+)
