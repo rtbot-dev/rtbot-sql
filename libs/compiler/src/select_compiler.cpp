@@ -5,6 +5,8 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+
+#include "rtbot/fuse/FusedBytecode.h"
 #include "rtbot_sql/compiler/expression_compiler.h"
 
 namespace rtbot_sql::compiler {
@@ -163,7 +165,61 @@ SelectResult compile_select_projection(
     }
 
     if (all_fusable && !column_to_input.empty()) {
-      // Emit VectorExtract per unique input column
+      // Island detection: if every referenced column comes from the same
+      // upstream stream, collapse N VectorExtract + FusedExpression into a
+      // single FusedExpressionVector that reads columns directly from the
+      // source vector. This eliminates N scalar Message allocations per
+      // tick and the Join-based re-synchronization inside FE.
+      bool single_source = true;
+      std::string only_stream = column_to_input.begin()->first.first;
+      for (const auto& [key, _idx] : column_to_input) {
+        if (key.first != only_stream) {
+          single_source = false;
+          break;
+        }
+      }
+
+      if (single_source) {
+        Endpoint source_ep = input_endpoint;
+        if (source_endpoints) {
+          auto it = source_endpoints->find(only_stream);
+          if (it != source_endpoints->end()) source_ep = it->second;
+        }
+
+        // Rewrite INPUT opcodes: swap the compacted port index for the
+        // original vector column index. Walk respecting each opcode's
+        // inline-arg count so we only touch INPUT's first arg.
+        std::vector<int> compacted_to_col(column_to_input.size());
+        for (const auto& [key, compacted] : column_to_input) {
+          compacted_to_col[static_cast<std::size_t>(compacted)] = key.second;
+        }
+        std::vector<double> rewritten = all_bytecode;
+        for (std::size_t pc = 0; pc < rewritten.size();) {
+          const auto op = static_cast<std::uint8_t>(rewritten[pc]);
+          const std::size_t n = rtbot::fuse::inline_arg_count(op);
+          if (op == 0 /* INPUT */) {
+            const int compacted = static_cast<int>(rewritten[pc + 1]);
+            rewritten[pc + 1] =
+                static_cast<double>(compacted_to_col[compacted]);
+          }
+          pc += 1 + n;
+        }
+
+        std::map<std::string, std::vector<double>> fev_params = {
+            {"bytecode", rewritten}, {"constants", constants}};
+        auto fev_id = builder.next_id("fusedv");
+        builder.add_operator(
+            fev_id, "FusedExpressionVector",
+            {{"numOutputs", static_cast<double>(select_list.size())}},
+            {},  // no string params
+            fev_params);
+        builder.connect(source_ep, {fev_id, "i1"});
+
+        return {{fev_id, "o1"}, field_map};
+      }
+
+      // Multi-source projection: keep the VectorExtract + FusedExpression
+      // path so the FE's inherited Join handles cross-stream synchronization.
       size_t num_inputs = column_to_input.size();
       std::vector<Endpoint> extract_endpoints(num_inputs);
 
@@ -183,9 +239,6 @@ SelectResult compile_select_projection(
         extract_endpoints[input_idx] = {ext_id, "o1"};
       }
 
-      // Emit single FusedExpression operator. Windowed opcodes carry their
-      // window size inline; the FusedExpression packer auto-allocates state
-      // slots and builds the internal aux_args side table.
       std::map<std::string, std::vector<double>> double_array_params = {
           {"bytecode", all_bytecode}, {"constants", constants}};
       auto fused_id = builder.next_id("fused");

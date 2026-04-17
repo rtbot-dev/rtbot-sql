@@ -102,7 +102,9 @@ TEST_F(SelectTest, PureColumnRefsUseVectorProject) {
 }
 
 // SELECT instrument_id, price * quantity AS trade_value
-// → FusedExpression with bytecode (all items are fusable pure arithmetic)
+// Single-source projection collapses to a single FusedExpressionVector that
+// reads columns directly from the source vector — eliminates N VectorExtract
+// operators and the Join-based resync a multi-port FusedExpression would need.
 TEST_F(SelectTest, MixedColumnsAndExpressionsUseFusedExpression) {
   std::vector<SelectItem> select_list;
   select_list.push_back(item(col("instrument_id")));
@@ -111,23 +113,23 @@ TEST_F(SelectTest, MixedColumnsAndExpressionsUseFusedExpression) {
   auto [ep, field_map, _seg] =
       compile_select_projection(select_list, input, scope, builder);
 
-  // All items are fusable → FusedExpression replaces VectorCompose
   const OperatorDef* fused = nullptr;
   for (const auto& op : builder.operators()) {
-    if (op.type == "FusedExpression") {
+    if (op.type == "FusedExpressionVector") {
       fused = &op;
       break;
     }
   }
   ASSERT_NE(fused, nullptr);
-  EXPECT_EQ(fused->params.at("numPorts"), 3.0);   // instrument_id, price, quantity
   EXPECT_EQ(fused->params.at("numOutputs"), 2.0);  // 2 SELECT items
   EXPECT_EQ(ep.operator_id, fused->id);
   EXPECT_EQ(ep.port, "o1");
 
-  // No VectorCompose should exist
+  // No VectorExtract, VectorCompose, or multi-port FusedExpression.
   for (const auto& op : builder.operators()) {
     EXPECT_NE(op.type, "VectorCompose");
+    EXPECT_NE(op.type, "VectorExtract");
+    EXPECT_NE(op.type, "FusedExpression");
   }
 
   EXPECT_EQ(field_map.at("instrument_id"), 0);
@@ -219,13 +221,16 @@ TEST_F(SelectTest, ComplexExpressionMixingFunctionsAndArithmetic) {
   //   - Default: MOVING_AVERAGE and MOVING_STD lower to standalone operators,
   //     glued together through a VectorCompose.
   //   - RTBOT_FUSE_WINDOWED=1: everything collapses into a single
-  //     FusedExpression emitting MA_UPDATE / STD_UPDATE opcodes inline.
+  //     FusedExpressionVector (single-source island) emitting MA_UPDATE /
+  //     STD_UPDATE opcodes inline.
   bool has_ma = false, has_sd = false, has_compose = false, has_fused = false;
   for (const auto& op : builder.operators()) {
     if (op.type == "MovingAverage") has_ma = true;
     if (op.type == "StandardDeviation") has_sd = true;
     if (op.type == "VectorCompose") has_compose = true;
-    if (op.type == "FusedExpression") has_fused = true;
+    if (op.type == "FusedExpression" ||
+        op.type == "FusedExpressionVector")
+      has_fused = true;
   }
   if (std::getenv("RTBOT_FUSE_WINDOWED") != nullptr) {
     EXPECT_TRUE(has_fused);

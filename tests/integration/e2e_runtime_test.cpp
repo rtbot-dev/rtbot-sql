@@ -2616,15 +2616,21 @@ TEST_F(E2eRuntimeTest, FusedExpressionArithmeticProjection) {
   ASSERT_FALSE(r.has_errors());
   EXPECT_EQ(r.field_map.at("trade_value"), 0);
 
-  // Verify graph uses FusedExpression (not separate Multiplication + VectorCompose)
+  // Verify graph fuses the projection. Single-source projections collapse
+  // to FusedExpressionVector (reads columns directly from the source vector);
+  // multi-source keeps FusedExpression. Either replaces standalone
+  // Multiplication + VectorCompose.
   auto program_json = json::parse(r.program_json);
   bool has_fused = false;
   bool has_multiplication = false;
   for (const auto& op : program_json["operators"]) {
-    if (op["type"] == "FusedExpression") has_fused = true;
+    if (op["type"] == "FusedExpression" ||
+        op["type"] == "FusedExpressionVector")
+      has_fused = true;
     if (op["type"] == "Multiplication") has_multiplication = true;
   }
-  EXPECT_TRUE(has_fused) << "Arithmetic projection must use FusedExpression";
+  EXPECT_TRUE(has_fused)
+      << "Arithmetic projection must fuse into FE or FEV";
   EXPECT_FALSE(has_multiplication)
       << "Multiplication should be fused into bytecode";
 

@@ -9,5 +9,6 @@ cc_library(
         "//libs/api",
         "//libs/parser",
         "@json-cpp//:lib",
+        "@rtbot//libs/fuse:rtbot-fuse",
     ],
 )
