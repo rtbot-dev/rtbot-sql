@@ -18,9 +18,6 @@ bazel_dep(name = "rules_jvm_external", version = "6.10")
 
 python = use_extension("@rules_python//python/extensions:python.bzl", "python")
 python.toolchain(
-    python_version = "3.10",
-)
-python.toolchain(
     is_default = True,
     python_version = "3.11",
 )
@@ -32,8 +29,6 @@ python.toolchain(
 )
 use_repo(
     python,
-    "python_3_10",
-    "python_3_10_host",
     "python_3_11",
     "python_3_11_host",
     "python_3_13",
@@ -125,19 +120,19 @@ bazel_dep(name = "aspect_rules_jest", version = "0.22.0")
 bazel_dep(name = "aspect_rules_swc", version = "2.0.1")
 bazel_dep(name = "aspect_bazel_lib", version = "2.21.1")
 
-# Work around missing windows_arm64 host repos under rules_js npm extension.
-yq_platform_repo = use_repo_rule("@aspect_bazel_lib//lib/private:yq_toolchain.bzl", "yq_platform_repo")
-yq_platform_repo(
-    name = "yq_windows_arm64",
-    platform = "windows_arm64",
-    version = "4.45.2",
-)
+# rules_nodejs 6.3.0 (the lower bound from aspect_rules_js 2.1.0) doesn't
+# ship a nodejs_windows_arm64 platform. 6.5.0+ does. Pin to 6.7.4.
+bazel_dep(name = "rules_nodejs", version = "6.7.4")
 
-coreutils_platform_repo = use_repo_rule("@aspect_bazel_lib//lib/private:coreutils_toolchain.bzl", "coreutils_platform_repo")
-coreutils_platform_repo(
-    name = "coreutils_windows_arm64",
-    platform = "windows_arm64",
-    version = "0.1.0",
+# aspect_rules_js 2.1.0 doesn't expose the windows_arm64 host toolchains
+# (nodejs / yq / coreutils) that its npm extension references. Upstream
+# PR https://github.com/aspect-build/rules_js/pull/2276 was closed unmerged.
+# Patch its MODULE.bazel locally to add the missing use_repo entries.
+single_version_override(
+    module_name = "aspect_rules_js",
+    patch_strip = 1,
+    patches = ["//tools/patches:aspect_rules_js-windows-arm64.patch"],
+    version = "2.1.0",
 )
 
 rules_ts_ext = use_extension("@aspect_rules_ts//ts:extensions.bzl", "ext")
