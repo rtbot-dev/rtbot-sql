@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <map>
 #include <stdexcept>
 #include <string>
@@ -41,15 +42,20 @@ struct BytecodeResult {
 // The column_to_input map is shared across all expressions in a projection
 // and maps (stream_name, column_index) pairs to FusedExpression input port indices.
 // The constants vector is shared across all expressions.
+// When enable_windowed is true, recognized windowed functions (MOVING_AVG,
+// MOVING_SUM, STDDEV, ...) emit tier-1 opcodes inline with their window size
+// carried in the bytecode (state offsets and aux_args are auto-derived by
+// FusedExpression's packer). When false, those functions are treated as
+// unfusable and the caller falls back to the standalone-operator path.
 // Returns success=false if the expression contains non-fusable nodes
-// (aggregates, windowed functions, CASE, TIMESHIFT, RESAMPLE, etc.),
-// allowing the caller to fall back to the standard operator-chain path.
+// (aggregates, CASE, TIMESHIFT, RESAMPLE, etc.).
 BytecodeResult compile_expression_to_bytecode(
     const parser::ast::Expr& expr,
     const analyzer::Scope& scope,
     std::map<std::pair<std::string, int>, int>& column_to_input,
     std::vector<double>& constants,
-    const std::map<std::string, Endpoint>* source_endpoints = nullptr);
+    const std::map<std::string, Endpoint>* source_endpoints = nullptr,
+    bool enable_windowed = false);
 
 // Context for compiling aggregate expressions to bytecode.
 // Shared across all expressions in a GROUP BY inner prototype to track

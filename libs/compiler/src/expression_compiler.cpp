@@ -534,13 +534,20 @@ double binary_op_to_opcode(const std::string& op) {
 
 // Recursive bytecode compilation for a single expression.
 // Appends opcodes to `bytecode`. Returns false if expression is not fusable.
+//
+// enable_windowed: when true, recognized windowed functions emit tier-1
+// opcodes with their window size carried inline. State offsets and aux_args
+// are auto-derived by the FusedExpression packer — the compiler never sees
+// them. When false, those functions are treated as unfusable (caller falls
+// back to the standalone-operator emission path).
 bool compile_expr_bytecode_recursive(
     const parser::ast::Expr& expr,
     const analyzer::Scope& scope,
     std::map<std::pair<std::string, int>, int>& column_to_input,
     std::vector<double>& constants,
     std::vector<double>& bytecode,
-    const std::map<std::string, Endpoint>* source_endpoints) {
+    const std::map<std::string, Endpoint>* source_endpoints,
+    bool enable_windowed = false) {
   using namespace parser::ast;
 
   // ColumnRef → INPUT opcode
@@ -579,10 +586,12 @@ bool compile_expr_bytecode_recursive(
     double opcode = binary_op_to_opcode(bin.op);
     if (opcode < 0) return false;  // unknown binary operator
     if (!compile_expr_bytecode_recursive(bin.left, scope, column_to_input,
-                                         constants, bytecode, source_endpoints))
+                                         constants, bytecode, source_endpoints,
+                                         enable_windowed))
       return false;
     if (!compile_expr_bytecode_recursive(bin.right, scope, column_to_input,
-                                         constants, bytecode, source_endpoints))
+                                         constants, bytecode, source_endpoints,
+                                         enable_windowed))
       return false;
     bytecode.push_back(opcode);
     return true;
@@ -600,11 +609,13 @@ bool compile_expr_bytecode_recursive(
       if (func.args.size() != 2) return false;
       if (!compile_expr_bytecode_recursive(func.args[0], scope,
                                             column_to_input, constants,
-                                            bytecode, source_endpoints))
+                                            bytecode, source_endpoints,
+                                            enable_windowed))
         return false;
       if (!compile_expr_bytecode_recursive(func.args[1], scope,
                                             column_to_input, constants,
-                                            bytecode, source_endpoints))
+                                            bytecode, source_endpoints,
+                                            enable_windowed))
         return false;
       bytecode.push_back(6);  // fused_op::POW
       return true;
@@ -615,7 +626,8 @@ bool compile_expr_bytecode_recursive(
       if (func.args.size() != 1) return false;
       if (!compile_expr_bytecode_recursive(func.args[0], scope,
                                             column_to_input, constants,
-                                            bytecode, source_endpoints))
+                                            bytecode, source_endpoints,
+                                            enable_windowed))
         return false;
       bytecode.push_back(8);  // fused_op::SQRT
       return true;
@@ -623,17 +635,51 @@ bool compile_expr_bytecode_recursive(
 
     // Unary math functions
     double opcode = math_func_to_opcode(func.name);
-    if (opcode < 0) {
-      // Not a fusable function (aggregate, windowed, DSP, TS, TIMESHIFT, etc.)
-      return false;
+    if (opcode >= 0) {
+      if (func.args.size() != 1) return false;
+      if (!compile_expr_bytecode_recursive(func.args[0], scope,
+                                            column_to_input, constants,
+                                            bytecode, source_endpoints,
+                                            enable_windowed))
+        return false;
+      bytecode.push_back(opcode);
+      return true;
     }
-    if (func.args.size() != 1) return false;
-    if (!compile_expr_bytecode_recursive(func.args[0], scope,
-                                          column_to_input, constants,
-                                          bytecode, source_endpoints))
-      return false;
-    bytecode.push_back(opcode);
-    return true;
+
+    // Windowed functions (tier-1 opcodes). Emit `OPCODE, W` inline — the
+    // FusedExpression packer auto-allocates state slots and builds the
+    // internal aux_args side table.
+    if (enable_windowed) {
+      auto emit_ring_window = [&](int opcode_id) -> bool {
+        if (func.args.size() != 2) return false;
+        auto* win_const = std::get_if<Constant>(&func.args[1]);
+        if (!win_const) return false;
+        int W = static_cast<int>(win_const->value);
+        if (W <= 0 || W > 65535) return false;
+        if (!compile_expr_bytecode_recursive(func.args[0], scope,
+                                              column_to_input, constants,
+                                              bytecode, source_endpoints,
+                                              enable_windowed))
+          return false;
+        bytecode.push_back(static_cast<double>(opcode_id));
+        bytecode.push_back(static_cast<double>(W));
+        return true;
+      };
+
+      if (upper_name == "MOVING_AVG" || upper_name == "MOVING_AVERAGE") {
+        return emit_ring_window(35 /* MA_UPDATE */);
+      }
+      if (upper_name == "MOVING_SUM") {
+        return emit_ring_window(36 /* MSUM_UPDATE */);
+      }
+      if (upper_name == "STDDEV" || upper_name == "MOVING_STD") {
+        return emit_ring_window(37 /* STD_UPDATE */);
+      }
+    }
+
+    // Not a fusable function (aggregate, windowed when disabled, DSP, TS,
+    // TIMESHIFT, etc.)
+    return false;
   }
 
   // Anything else (CaseExpr, StringConstant, ArrayLiteral, ComparisonExpr,
@@ -958,11 +1004,12 @@ BytecodeResult compile_expression_to_bytecode(
     const analyzer::Scope& scope,
     std::map<std::pair<std::string, int>, int>& column_to_input,
     std::vector<double>& constants,
-    const std::map<std::string, Endpoint>* source_endpoints) {
+    const std::map<std::string, Endpoint>* source_endpoints,
+    bool enable_windowed) {
   BytecodeResult result;
   result.success = compile_expr_bytecode_recursive(
       expr, scope, column_to_input, constants, result.bytecode,
-      source_endpoints);
+      source_endpoints, enable_windowed);
   if (result.success) {
     result.bytecode.push_back(20);  // fused_op::END
   }

@@ -215,16 +215,28 @@ TEST_F(SelectTest, ComplexExpressionMixingFunctionsAndArithmetic) {
   auto [ep, field_map, _seg] =
       compile_select_projection(select_list, input, scope, builder);
 
-  // Verify the graph has the expected operator types
-  bool has_ma = false, has_sd = false, has_compose = false;
+  // Two valid shapes depending on fusion config:
+  //   - Default: MOVING_AVERAGE and MOVING_STD lower to standalone operators,
+  //     glued together through a VectorCompose.
+  //   - RTBOT_FUSE_WINDOWED=1: everything collapses into a single
+  //     FusedExpression emitting MA_UPDATE / STD_UPDATE opcodes inline.
+  bool has_ma = false, has_sd = false, has_compose = false, has_fused = false;
   for (const auto& op : builder.operators()) {
     if (op.type == "MovingAverage") has_ma = true;
     if (op.type == "StandardDeviation") has_sd = true;
     if (op.type == "VectorCompose") has_compose = true;
+    if (op.type == "FusedExpression") has_fused = true;
   }
-  EXPECT_TRUE(has_ma);
-  EXPECT_TRUE(has_sd);
-  EXPECT_TRUE(has_compose);
+  if (std::getenv("RTBOT_FUSE_WINDOWED") != nullptr) {
+    EXPECT_TRUE(has_fused);
+    EXPECT_FALSE(has_ma);
+    EXPECT_FALSE(has_sd);
+    EXPECT_FALSE(has_compose);
+  } else {
+    EXPECT_TRUE(has_ma);
+    EXPECT_TRUE(has_sd);
+    EXPECT_TRUE(has_compose);
+  }
 
   EXPECT_EQ(field_map.at("price"), 0);
   EXPECT_EQ(field_map.at("upper_band"), 1);

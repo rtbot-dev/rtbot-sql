@@ -139,10 +139,18 @@ SelectResult compile_select_projection(
     FieldMap field_map;
     bool all_fusable = true;
 
+    // When RTBOT_FUSE_WINDOWED is set, windowed functions (MOVING_AVG,
+    // STDDEV, MOVING_SUM) fuse into the same FusedExpression as the
+    // surrounding arithmetic instead of emitting standalone operators. Off
+    // by default so existing integration tests continue to see the old
+    // operator graphs.
+    const bool fuse_windowed =
+        std::getenv("RTBOT_FUSE_WINDOWED") != nullptr;
+
     for (size_t i = 0; i < select_list.size(); ++i) {
       auto bc = compile_expression_to_bytecode(
           select_list[i].expr, scope, column_to_input, constants,
-          source_endpoints);
+          source_endpoints, fuse_windowed);
       if (!bc.success) {
         all_fusable = false;
         break;
@@ -175,14 +183,18 @@ SelectResult compile_select_projection(
         extract_endpoints[input_idx] = {ext_id, "o1"};
       }
 
-      // Emit single FusedExpression operator
+      // Emit single FusedExpression operator. Windowed opcodes carry their
+      // window size inline; the FusedExpression packer auto-allocates state
+      // slots and builds the internal aux_args side table.
+      std::map<std::string, std::vector<double>> double_array_params = {
+          {"bytecode", all_bytecode}, {"constants", constants}};
       auto fused_id = builder.next_id("fused");
       builder.add_operator(
           fused_id, "FusedExpression",
           {{"numPorts", static_cast<double>(num_inputs)},
            {"numOutputs", static_cast<double>(select_list.size())}},
           {},  // no string params
-          {{"bytecode", all_bytecode}, {"constants", constants}});
+          double_array_params);
 
       for (size_t i = 0; i < num_inputs; ++i) {
         builder.connect(extract_endpoints[i],
