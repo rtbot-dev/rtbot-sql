@@ -67,7 +67,10 @@ SelectResult compile_select_projection(
     const Endpoint& input_endpoint,
     const analyzer::Scope& scope,
     GraphBuilder& builder,
-    const std::map<std::string, Endpoint>* source_endpoints) {
+    const std::map<std::string, Endpoint>* source_endpoints,
+    const parser::ast::Expr* where_clause,
+    bool* where_absorbed) {
+  if (where_absorbed) *where_absorbed = false;
   // SELECT * → identity passthrough
   if (select_list.empty()) {
     // Build field map from scope — not available directly, so return empty map.
@@ -205,8 +208,37 @@ SelectResult compile_select_projection(
           pc += 1 + n;
         }
 
+        // Try to absorb WHERE predicate into the bytecode as <pred> GATE
+        // prefix. Only kicks in when caller supplied a where_clause and the
+        // predicate compiles to fusable bytecode (comparison/logical/between
+        // opcodes). On success, we emit a single FEV covering filter +
+        // projection and tell the caller to skip compile_where.
+        //
+        // Safety: the caller (compiler.cpp) must only pass where_clause when
+        // there is NO GROUP BY — WHERE has to run before segment detection
+        // or the Pipeline would see rows that should have been filtered out.
+        //
+        // Absorption contract: when where_clause is non-null and the
+        // predicate isn't fusable, we must NOT emit the projection (the
+        // FEV would compute the SELECT over unfiltered input — wrong
+        // semantics). Bail out and let the caller fall back to compile_where
+        // followed by a WHERE-less projection.
+        std::vector<double> final_bytecode = std::move(rewritten);
+        if (where_clause != nullptr) {
+          std::vector<double> where_bc;
+          if (!compile_predicate_to_bytecode(*where_clause, scope, only_stream,
+                                              constants, where_bc)) {
+            return {};  // unusable; caller falls back
+          }
+          where_bc.push_back(44);  // fused_op::GATE
+          where_bc.insert(where_bc.end(), final_bytecode.begin(),
+                           final_bytecode.end());
+          final_bytecode = std::move(where_bc);
+          if (where_absorbed) *where_absorbed = true;
+        }
+
         std::map<std::string, std::vector<double>> fev_params = {
-            {"bytecode", rewritten}, {"constants", constants}};
+            {"bytecode", final_bytecode}, {"constants", constants}};
         auto fev_id = builder.next_id("fusedv");
         builder.add_operator(
             fev_id, "FusedExpressionVector",
@@ -216,6 +248,14 @@ SelectResult compile_select_projection(
         builder.connect(source_ep, {fev_id, "i1"});
 
         return {{fev_id, "o1"}, field_map};
+      }
+
+      // Non-single-source fusable path wants to use the multi-port FE; if
+      // the caller supplied a where_clause we can't absorb it here either,
+      // so bail out and let compiler.cpp run compile_where + a WHERE-less
+      // retry.
+      if (where_clause != nullptr) {
+        return {};
       }
 
       // Multi-source projection: keep the VectorExtract + FusedExpression

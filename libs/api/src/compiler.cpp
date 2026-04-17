@@ -284,8 +284,14 @@ CompilationResult compile_select_to_program(
   }
   // ─────────────────────────────────────────────────────────────────────────
 
-  // WHERE clause
-  if (expanded_where.has_value()) {
+  // WHERE clause. Defer the compile_where emission when there's no GROUP BY:
+  // the select projection may be able to absorb the predicate into a single
+  // FusedExpressionVector via GATE, eliminating the VectorExtract + CompareGT
+  // + Demultiplexer chain. When GROUP BY is present WHERE must run first so
+  // segment detection sees only the filtered rows.
+  const bool try_absorb_where =
+      expanded_where.has_value() && expanded_group_by.empty();
+  if (expanded_where.has_value() && !try_absorb_where) {
     current = compiler::compile_where(*expanded_where, current, scope, builder);
   }
 
@@ -325,12 +331,28 @@ CompilationResult compile_select_to_program(
     field_map = fm;
     is_segment_only_group_by = seg_only;
   } else {
-    // SELECT projection
-    auto [ep, fm, _seg2] =
-        compiler::compile_select_projection(expanded_select, current, scope,
-                                            builder);
-    current = ep;
-    field_map = fm;
+    // SELECT projection. When try_absorb_where is on, we haven't yet emitted
+    // compile_where — give the projection a shot at folding it into the FEV.
+    const parser::ast::Expr* where_ptr =
+        try_absorb_where ? &*expanded_where : nullptr;
+    bool where_absorbed = false;
+    auto [ep, fm, _seg2] = compiler::compile_select_projection(
+        expanded_select, current, scope, builder,
+        /*source_endpoints=*/nullptr, where_ptr, &where_absorbed);
+    // Absorption is best-effort. If the projection fell back (multi-source
+    // or unfusable SELECT), it silently ignored where_ptr — emit the
+    // standalone compile_where and re-run the projection.
+    if (try_absorb_where && !where_absorbed) {
+      current = compiler::compile_where(*expanded_where, current, scope,
+                                         builder);
+      auto retry = compiler::compile_select_projection(expanded_select, current,
+                                                        scope, builder);
+      current = retry.endpoint;
+      field_map = retry.field_map;
+    } else {
+      current = ep;
+      field_map = fm;
+    }
   }
 
   // ORDER BY + LIMIT → TopK

@@ -1044,4 +1044,14 @@ SegmentBytecodeResult compile_segment_to_bytecode(
   return result;
 }
 
+bool compile_predicate_to_bytecode(
+    const parser::ast::Expr& expr,
+    const analyzer::Scope& scope,
+    const std::string& stream_name,
+    std::vector<double>& constants,
+    std::vector<double>& bytecode) {
+  return compile_segment_expr_recursive(expr, scope, stream_name, constants,
+                                         bytecode);
+}
+
 }  // namespace rtbot_sql::compiler

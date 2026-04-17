@@ -89,4 +89,16 @@ SegmentBytecodeResult compile_segment_to_bytecode(
     const analyzer::Scope& scope,
     const std::string& stream_name);
 
+// Compile a predicate (WHERE clause) to fused bytecode using the original
+// vector column index for INPUT opcodes (no compaction). Appends to shared
+// `constants`. Does NOT emit END — callers typically follow with a GATE
+// opcode so the FE/FEV evaluator suppresses the message on predicate=false.
+// Returns false if the predicate contains non-fusable nodes.
+bool compile_predicate_to_bytecode(
+    const parser::ast::Expr& expr,
+    const analyzer::Scope& scope,
+    const std::string& stream_name,
+    std::vector<double>& constants,
+    std::vector<double>& bytecode);
+
 }  // namespace rtbot_sql::compiler

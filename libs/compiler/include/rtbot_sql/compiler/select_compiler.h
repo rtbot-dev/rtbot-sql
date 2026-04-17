@@ -23,11 +23,19 @@ struct SelectResult {
 // - Mixed expressions/functions → VectorCompose
 // - Empty select_list → SELECT * passthrough (identity)
 // Returns the output endpoint and field map (name → position).
+//
+// `where_clause`: optional WHERE predicate. When supplied together with a
+// single-source fusable SELECT, the predicate is absorbed into the emitted
+// FusedExpressionVector's bytecode via a GATE opcode — eliminating the
+// standalone VectorExtract + CompareGT + Demultiplexer chain. Callers must
+// set `where_absorbed` (out) to know whether to skip their own compile_where.
 SelectResult compile_select_projection(
     const std::vector<parser::ast::SelectItem>& select_list,
     const Endpoint& input_endpoint,
     const analyzer::Scope& scope,
     GraphBuilder& builder,
-    const std::map<std::string, Endpoint>* source_endpoints = nullptr);
+    const std::map<std::string, Endpoint>* source_endpoints = nullptr,
+    const parser::ast::Expr* where_clause = nullptr,
+    bool* where_absorbed = nullptr);
 
 }  // namespace rtbot_sql::compiler
