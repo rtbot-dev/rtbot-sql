@@ -32,12 +32,6 @@ using rtbot_sql::ViewMeta;
 using rtbot_sql::ViewType;
 using rtbot_sql::ColumnType;
 
-struct InputVectorMessage {
-  std::uint64_t timestamp = 0;
-  std::vector<double> values;
-  std::string port = "i1";
-};
-
 struct RuntimeOutputMessage {
   std::uint64_t timestamp = 0;
   std::vector<double> values;
@@ -64,6 +58,9 @@ std::vector<RuntimeOutputMessage> decode_batch(
   return out;
 }
 
+// Tier-3 SELECT one-shot pipeline: construct-feed-discard. The long-lived
+// per-view program has been replaced by the consolidated NativeSessionPipeline
+// below, so the only caller is LocalPipelineRunner.run_once.
 class NativePipeline {
  public:
   explicit NativePipeline(const std::string& program_json)
@@ -77,77 +74,6 @@ class NativePipeline {
         static_cast<rtbot::timestamp_t>(timestamp),
         rtbot::VectorNumberData{values});
     return decode_batch(program_.receive(std::move(msg), port));
-  }
-
-  std::vector<RuntimeOutputMessage> run(
-      const std::vector<InputVectorMessage>& inputs) {
-    std::vector<RuntimeOutputMessage> out;
-    for (const auto& input : inputs) {
-      auto chunk = feed(input.timestamp, input.values, input.port);
-      out.insert(out.end(), chunk.begin(), chunk.end());
-    }
-    return out;
-  }
-
-  std::vector<RuntimeOutputMessage> feed_batch(
-      py::array_t<int64_t, py::array::c_style> timestamps,
-      py::array_t<double, py::array::c_style> values,
-      const std::string& port = "i1") {
-    auto ts = timestamps.template unchecked<1>();
-    auto vals = values.template unchecked<2>();
-
-    if (ts.shape(0) != vals.shape(0)) {
-      throw std::invalid_argument(
-          "timestamps and values must have the same number of rows");
-    }
-
-    std::vector<RuntimeOutputMessage> all_outputs;
-    auto ncols = static_cast<size_t>(vals.shape(1));
-
-    for (py::ssize_t i = 0; i < ts.shape(0); ++i) {
-      std::vector<double> row(ncols);
-      for (size_t j = 0; j < ncols; ++j) {
-        row[j] = vals(i, static_cast<py::ssize_t>(j));
-      }
-      auto msg = rtbot::create_message<rtbot::VectorNumberData>(
-          static_cast<rtbot::timestamp_t>(ts(i)),
-          rtbot::VectorNumberData{std::move(row)});
-      auto batch = program_.receive(std::move(msg), port);
-      auto decoded = decode_batch(batch);
-      all_outputs.insert(all_outputs.end(),
-                         std::make_move_iterator(decoded.begin()),
-                         std::make_move_iterator(decoded.end()));
-    }
-    return all_outputs;
-  }
-
-  // Zero-copy buffered feed: numpy's C-contiguous row-major layout is
-  // handed directly to Program::receive_buffer with no transpose. Pairs
-  // with operators that override receive_data_buffer for further wins.
-  std::vector<RuntimeOutputMessage> feed_buffer(
-      py::array_t<int64_t, py::array::c_style> timestamps,
-      py::array_t<double, py::array::c_style> values,
-      const std::string& port = "i1") {
-    auto ts_info = timestamps.request();
-    auto vals_info = values.request();
-    if (ts_info.ndim != 1 || vals_info.ndim != 2) {
-      throw std::invalid_argument(
-          "timestamps must be 1D, values must be 2D");
-    }
-    if (ts_info.shape[0] != vals_info.shape[0]) {
-      throw std::invalid_argument(
-          "timestamps and values must have the same number of rows");
-    }
-    const auto nrows = static_cast<std::size_t>(ts_info.shape[0]);
-    const auto ncols = static_cast<std::size_t>(vals_info.shape[1]);
-
-    static_assert(sizeof(std::int64_t) == sizeof(rtbot::timestamp_t),
-                  "int64 vs timestamp_t mismatch");
-    const auto* times = reinterpret_cast<const rtbot::timestamp_t*>(ts_info.ptr);
-    const auto* rows = static_cast<const double*>(vals_info.ptr);
-
-    auto batch = program_.receive_buffer(port, rows, nrows, ncols, times);
-    return decode_batch(batch);
   }
 
  private:
@@ -320,16 +246,6 @@ PYBIND11_MODULE(_rtbot_sql_native, m) {
       .def_readwrite("dictionary_updates", &CompilationResult::dictionary_updates)
       .def("has_errors", &CompilationResult::has_errors);
 
-  py::class_<InputVectorMessage>(m, "InputVectorMessage")
-      .def(py::init<>())
-      .def(py::init<std::uint64_t, std::vector<double>, std::string>(),
-           py::arg("timestamp"),
-           py::arg("values"),
-           py::arg("port") = "i1")
-      .def_readwrite("timestamp", &InputVectorMessage::timestamp)
-      .def_readwrite("values", &InputVectorMessage::values)
-      .def_readwrite("port", &InputVectorMessage::port);
-
   py::class_<RuntimeOutputMessage>(m, "RuntimeOutputMessage")
       .def(py::init<>())
       .def_readwrite("timestamp", &RuntimeOutputMessage::timestamp)
@@ -342,16 +258,7 @@ PYBIND11_MODULE(_rtbot_sql_native, m) {
       .def("feed", &NativePipeline::feed,
            py::arg("timestamp"),
            py::arg("values"),
-           py::arg("port") = "i1")
-      .def("feed_batch", &NativePipeline::feed_batch,
-           py::arg("timestamps"),
-           py::arg("values"),
-           py::arg("port") = "i1")
-      .def("feed_buffer", &NativePipeline::feed_buffer,
-           py::arg("timestamps"),
-           py::arg("values"),
-           py::arg("port") = "i1")
-      .def("run", &NativePipeline::run, py::arg("inputs"));
+           py::arg("port") = "i1");
 
   py::class_<NativeSessionPipeline>(m, "NativeSessionPipeline")
       .def(py::init<const std::string&>(), py::arg("program_json"))
