@@ -5,6 +5,7 @@
 #include <limits>
 #include <map>
 #include <regex>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <variant>
@@ -1089,37 +1090,47 @@ SessionCompilationResult compile_session_program(
     return out;
   }
 
-  // 2. Collect base streams referenced across all views.
+  // 2. Collect base streams referenced across all views, in a
+  //    deterministic (topo-visit) order. Each distinct base stream gets
+  //    its own port on the shared session Input operator.
   std::vector<std::string> base_streams;
   {
-    std::map<std::string, bool> seen;
-    for (const auto& [vname, view] : catalog.views) {
+    std::set<std::string> seen;
+    for (const auto& vname : order) {
+      const auto& view = catalog.views.at(vname);
       for (const auto& src : view.source_streams) {
-        if (catalog.streams.count(src) && !seen[src]) {
-          seen[src] = true;
+        if (catalog.streams.count(src) && !seen.count(src)) {
+          seen.insert(src);
           base_streams.push_back(src);
         }
       }
     }
   }
-
-  // 3. Only one base stream supported for now — the session has a single
-  //    entry operator (see Program.h:138). Multi-stream support would need
-  //    either a splitter entry or Program multi-entry relaxation.
-  if (base_streams.size() > 1) {
+  if (base_streams.empty()) {
     out.errors.push_back(
-        {"multi-base-stream sessions not supported yet", -1, -1});
+        {"session has no base streams — cannot emit entry", -1, -1});
     return out;
   }
 
   compiler::GraphBuilder merged;
 
-  // 4. One Input operator per base stream (single port "i1").
-  for (const auto& s : base_streams) {
-    std::string id = "input__" + s;
-    merged.add_operator(id, "Input");
-    out.base_stream_inputs[s] = id;
-    out.base_stream_ports[s] = "i1";
+  // 3. Single session-level Input with one port per base stream. The
+  //    runtime addresses each stream via its port id (i1, i2, …).
+  const std::string session_input_id = "input__session";
+  {
+    std::map<std::string, double> params;
+    if (base_streams.size() > 1) {
+      params["numInputPorts"] =
+          static_cast<double>(base_streams.size());
+    }
+    merged.add_operator(session_input_id, "Input", params);
+  }
+  std::map<std::string, int> stream_port_index;
+  for (std::size_t i = 0; i < base_streams.size(); ++i) {
+    stream_port_index[base_streams[i]] = static_cast<int>(i);
+    out.base_stream_inputs[base_streams[i]] = session_input_id;
+    out.base_stream_ports[base_streams[i]] =
+        "i" + std::to_string(i + 1);
   }
 
   // view name → endpoint feeding its terminal in the merged graph.
@@ -1128,35 +1139,47 @@ SessionCompilationResult compile_session_program(
   // outputs (currently always one port per materialized view).
   std::map<std::string, std::vector<std::string>> named_outputs;
 
-  // 5. Merge each view's subgraph in topological order.
+  // 4. Merge each view's subgraph in topological order. Views may have
+  //    multiple sources (cross-select); each source_streams[i]
+  //    corresponds to the i-th port on the view-local Input operator
+  //    and is wired to the session-level endpoint for that source.
   for (const auto& vname : order) {
     const auto& view = catalog.views.at(vname);
 
-    if (view.source_streams.size() != 1) {
-      out.errors.push_back(
-          {"view '" + vname +
-               "' has multiple sources — not supported in session",
-           -1, -1});
-      return out;
-    }
     if (view.program_json.empty()) {
       out.errors.push_back(
           {"view '" + vname + "' has no program_json", -1, -1});
       return out;
     }
 
-    // Source endpoint in the merged graph: either a base-stream Input or an
-    // upstream view's terminal.
-    const std::string& source = view.source_streams[0];
-    compiler::Endpoint source_ep;
-    if (out.base_stream_inputs.count(source)) {
-      source_ep = {out.base_stream_inputs[source], "o1"};
-    } else if (view_terminal.count(source)) {
-      source_ep = view_terminal[source];
-    } else {
+    // Resolve each source to a merged-graph endpoint. Stream sources
+    // map to their session-Input port; view sources map to the upstream
+    // view's terminal. Table sources (Stream JOIN Table) are not yet
+    // supported — the changelog-stream wiring needs its own pass.
+    std::vector<compiler::Endpoint> source_endpoints;
+    source_endpoints.reserve(view.source_streams.size());
+    for (const auto& src : view.source_streams) {
+      auto stream_it = stream_port_index.find(src);
+      if (stream_it != stream_port_index.end()) {
+        source_endpoints.push_back(
+            {session_input_id,
+             "o" + std::to_string(stream_it->second + 1)});
+        continue;
+      }
+      auto view_it = view_terminal.find(src);
+      if (view_it != view_terminal.end()) {
+        source_endpoints.push_back(view_it->second);
+        continue;
+      }
+      if (catalog.tables.count(src)) {
+        out.errors.push_back(
+            {"view '" + vname + "' references table '" + src +
+                 "' — session mode does not yet support table JOINs",
+             -1, -1});
+        return out;
+      }
       out.errors.push_back(
-          {"view '" + vname + "' references unknown source '" + source +
-               "'",
+          {"view '" + vname + "' references unknown source '" + src + "'",
            -1, -1});
       return out;
     }
@@ -1223,10 +1246,28 @@ SessionCompilationResult compile_session_program(
                      {prefix + c.to_id, c.to_port});
     }
 
-    // Wire the view body's true entry points from the source endpoint.
+    // Wire each local-Input outgoing edge from its corresponding source
+    // endpoint. Port "oN" on the local Input corresponds to
+    // source_streams[N-1]; we use that to index into source_endpoints.
     for (const auto& c : per_view.connections()) {
       if (c.from_id != local_input) continue;
-      merged.connect(source_ep, {prefix + c.to_id, c.to_port});
+      int port_idx = -1;
+      if (c.from_port.size() >= 2 && c.from_port[0] == 'o') {
+        try {
+          port_idx = std::stoi(c.from_port.substr(1)) - 1;
+        } catch (...) {
+        }
+      }
+      if (port_idx < 0 ||
+          port_idx >= static_cast<int>(source_endpoints.size())) {
+        out.errors.push_back(
+            {"view '" + vname + "' input port '" + c.from_port +
+                 "' has no corresponding source_streams entry",
+             -1, -1});
+        return out;
+      }
+      merged.connect(source_endpoints[static_cast<std::size_t>(port_idx)],
+                     {prefix + c.to_id, c.to_port});
     }
 
     // Record terminal for dependents and session-level outputs.
@@ -1243,15 +1284,8 @@ SessionCompilationResult compile_session_program(
     }
   }
 
-  // 6. Pick the session's single entry operator.
-  std::string entry_op_id;
-  if (!out.base_stream_inputs.empty()) {
-    entry_op_id = out.base_stream_inputs.begin()->second;
-  } else {
-    out.errors.push_back(
-        {"session has no base streams — cannot emit entry", -1, -1});
-    return out;
-  }
+  // 5. Entry is always the single session-level Input (one op, multi-port).
+  const std::string entry_op_id = session_input_id;
 
   // 7. Validate the merged graph (without requiring Input/Output presence;
   //    exactly one Input is always present here, but no Output is).
