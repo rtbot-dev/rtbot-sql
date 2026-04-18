@@ -113,8 +113,80 @@ class LocalPipelineRunner:
         for out in native_outputs
     ]
 
+  def feed_buffer(
+      self,
+      pipeline_id: str,
+      timestamps: Any,
+      values_2d: Any,
+      port: str = "i1",
+  ) -> List[PipelineOutput]:
+    """Buffered feed: numpy arrays → rtbot's ``receive_buffer`` with no
+    row-by-row Message allocation. Operators that override
+    ``receive_data_buffer`` (e.g. BurstAggregate) skip per-row boxing
+    entirely; others fall back to the default per-row Message creation.
+    Output is identical to :meth:`feed_batch`.
+    """
+    if not _HAS_NUMPY:
+      raise ImportError("feed_buffer requires numpy")
+    pipeline = self._pipelines[pipeline_id]
+    native_outputs = pipeline.feed_buffer(
+        np.ascontiguousarray(timestamps, dtype=np.int64),
+        np.ascontiguousarray(values_2d, dtype=np.float64),
+        str(port),
+    )
+    return [
+        PipelineOutput(
+            timestamp=int(out.timestamp),
+            values=[float(v) for v in out.values],
+            operator_id=str(out.operator_id),
+            port=str(out.port),
+        )
+        for out in native_outputs
+    ]
+
   def destroy(self, pipeline_id: str) -> None:
     self._pipelines.pop(pipeline_id, None)
+
+  # -- Consolidated-session pipeline ----------------------------------
+
+  def deploy_session(
+      self, program_json: str, op_ids: List[str],
+  ) -> "native.NativeSessionPipeline":
+    """Instantiate a NativeSessionPipeline and register its output op ids.
+
+    Unlike the regular per-view pipelines tracked by :meth:`deploy`, the
+    session pipeline is returned directly — the caller (typically
+    :class:`rtbot_sql.RtBotSql`) owns its lifetime.
+    """
+    session = native.NativeSessionPipeline(program_json)
+    if op_ids:
+      session.register_outputs(list(op_ids))
+    return session
+
+  def feed_session_buffer(
+      self,
+      session: "native.NativeSessionPipeline",
+      timestamps: Any,
+      values_2d: Any,
+      port: str = "i1",
+  ) -> List[PipelineOutput]:
+    """Feed one batch through the consolidated session pipeline."""
+    if not _HAS_NUMPY:
+      raise ImportError("feed_session_buffer requires numpy")
+    native_outputs = session.feed_buffer(
+        np.ascontiguousarray(timestamps, dtype=np.int64),
+        np.ascontiguousarray(values_2d, dtype=np.float64),
+        str(port),
+    )
+    return [
+        PipelineOutput(
+            timestamp=int(out.timestamp),
+            values=[float(v) for v in out.values],
+            operator_id=str(out.operator_id),
+            port=str(out.port),
+        )
+        for out in native_outputs
+    ]
 
   def _run_pipeline(self, pipeline: native.NativePipeline, input_messages: Iterable[Any]) -> List[PipelineOutput]:
     outputs: List[PipelineOutput] = []
