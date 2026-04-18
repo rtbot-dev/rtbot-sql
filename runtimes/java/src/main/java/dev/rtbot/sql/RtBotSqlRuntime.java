@@ -549,38 +549,26 @@ public class RtBotSqlRuntime {
     /**
      * Feed a batch into the consolidated session on the given base
      * stream's port, then demux outputs to each view terminal's
-     * subscribers / materialized-view store.
+     * subscribers / materialized-view store via the binary frame
+     * returned by {@link RtBotSqlCompiler#feedPipelineBufferSession}.
      */
     private void feedSessionBuffer(String streamName, long[] timestamps,
                                     double[][] columns, boolean useBuffer) {
         if (sessionPipelineId == null) return;
         String port = sessionStreamPort.getOrDefault(streamName, "i1");
-        if (!"i1".equals(port)) {
-            // Multi-base-stream session: per-row feed on the right port
-            // with JSON outputs demuxed by op id.
-            int n = timestamps.length;
-            for (int i = 0; i < n; i++) {
-                List<Double> row = new ArrayList<>(columns.length);
-                for (double[] col : columns) row.add(col[i]);
-                dispatchSessionOutputs(runner.feed(sessionPipelineId,
-                        timestamps[i], row, port));
-            }
-            return;
-        }
-        // Hot path: binary output frame via pre-registered op-index map.
-        int bytes = runner.feedBufferSessionI1(
-                sessionPipelineId, timestamps, columns, sessionOutBuf);
+        int bytes = runner.feedBufferSession(
+                sessionPipelineId, port, timestamps, columns, sessionOutBuf);
         if (bytes < -1) {
             int needed = -bytes;
             int newCap = Math.max(needed, sessionOutBuf.capacity() * 2);
             sessionOutBuf = ByteBuffer.allocateDirect(newCap)
                     .order(ByteOrder.nativeOrder());
-            bytes = runner.feedBufferSessionI1(
-                    sessionPipelineId, timestamps, columns, sessionOutBuf);
+            bytes = runner.feedBufferSession(
+                    sessionPipelineId, port, timestamps, columns, sessionOutBuf);
         }
         if (bytes < 0) {
             throw new SqlError(
-                    "feedBufferSessionI1 failed with return code " + bytes);
+                    "feedBufferSession failed with return code " + bytes);
         }
         dispatchSessionBinary(sessionOutBuf, bytes);
     }
@@ -589,25 +577,22 @@ public class RtBotSqlRuntime {
                                    double v0, double v1, double v2) {
         if (sessionPipelineId == null) return;
         String port = sessionStreamPort.getOrDefault(streamName, "i1");
-        List<OutputMessage> outputs =
-                runner.feed3(sessionPipelineId, timestamp, v0, v1, v2, port);
-        dispatchSessionOutputs(outputs);
+        dispatchSessionOutputs(
+                runner.feed3(sessionPipelineId, timestamp, v0, v1, v2, port));
     }
 
     private void feedSessionRow(String streamName, long timestamp,
                                   List<Double> values) {
         if (sessionPipelineId == null) return;
         String port = sessionStreamPort.getOrDefault(streamName, "i1");
-        List<OutputMessage> outputs =
-                runner.feed(sessionPipelineId, timestamp, values, port);
-        dispatchSessionOutputs(outputs);
+        dispatchSessionOutputs(
+                runner.feed(sessionPipelineId, timestamp, values, port));
     }
 
     /**
-     * Non-default-port fallback: JSON outputs keyed by operator id
-     * string. Used only on multi-base-stream sessions that hit
-     * {@link #feedSessionBuffer}'s else-branch, and by
-     * {@link #feedSessionRow3} / {@link #feedSessionRow}.
+     * JSON-output dispatch used by the per-row insert paths
+     * ({@link #insert3} / {@link #insert}). The buffered path uses the
+     * index-keyed binary frame via {@link #dispatchSessionBinary}.
      */
     private void dispatchSessionOutputs(List<OutputMessage> outputs) {
         for (OutputMessage out : outputs) {
@@ -619,7 +604,7 @@ public class RtBotSqlRuntime {
 
     /**
      * Parse the binary output frame written by
-     * {@link RtBotSqlCompiler#feedPipelineBufferSessionI1} and dispatch
+     * {@link RtBotSqlCompiler#feedPipelineBufferSession} and dispatch
      * each message using the preregistered op-index table. No POJO
      * allocation, no Gson, no string keys — just {@link ByteBuffer} reads
      * plus one array index per message.

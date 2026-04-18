@@ -147,10 +147,11 @@ public final class RtBotSqlCompiler {
     public static native void registerSessionOutputs(long handle, String[] opIds);
 
     /**
-     * Consolidated-session buffered feed. Same column-major input shape as
-     * {@link #feedPipelineBufferI1}, but outputs are written into a
-     * caller-supplied direct {@link java.nio.ByteBuffer} as a compact
-     * binary frame (native byte order):
+     * Consolidated-session buffered feed.
+     *
+     * <p>Outputs are written into a caller-supplied direct
+     * {@link java.nio.ByteBuffer} as a compact binary frame (native byte
+     * order; caller must set {@link java.nio.ByteOrder#nativeOrder()}):
      *
      * <pre>
      *   int32 num_outputs
@@ -161,13 +162,17 @@ public final class RtBotSqlCompiler {
      *     float64 values[num_values]
      * </pre>
      *
-     * Returns bytes written on success. If the buffer is too small, returns
-     * a negative value equal to {@code -required_bytes}; caller must grow
-     * and retry. Returns {@code -1} if {@code outBuffer} is not a direct
-     * buffer.
+     * <p>Returns bytes written on success. If the buffer is too small,
+     * returns a negative value equal to {@code -required_bytes} and the
+     * caller must grow and retry. Returns {@code -1} if
+     * {@code outBuffer} is not a direct buffer.
+     *
+     * @param port input port on the session entry operator (e.g. "i1",
+     *             "i2" for multi-base-stream sessions)
      */
-    public static native int feedPipelineBufferSessionI1(
+    public static native int feedPipelineBufferSession(
             long handle,
+            String port,
             long[] timestamps,
             double[][] columns,
             java.nio.ByteBuffer outBuffer);

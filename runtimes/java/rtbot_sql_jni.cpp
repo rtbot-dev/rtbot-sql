@@ -865,28 +865,29 @@ Java_dev_rtbot_sql_RtBotSqlCompiler_registerSessionOutputs(JNIEnv* env,
 //     -1: buffer is not a direct buffer
 //   < -1: required capacity in bytes (negated) — caller must grow and retry
 JNIEXPORT jint JNICALL
-Java_dev_rtbot_sql_RtBotSqlCompiler_feedPipelineBufferSessionI1(
+Java_dev_rtbot_sql_RtBotSqlCompiler_feedPipelineBufferSession(
     JNIEnv* env, jclass,
     jlong handle,
+    jstring port,
     jlongArray timestamps,
     jobjectArray columns,
     jobject outBuffer) {
   try {
     auto* program = reinterpret_cast<rtbot::Program*>(handle);
     if (!program) {
-      throw_runtime_exception(env, "feedPipelineBufferSessionI1: null handle");
+      throw_runtime_exception(env, "feedPipelineBufferSession: null handle");
       return 0;
     }
     const auto* session_map =
         api::SessionOutputRegistry::instance().lookup(program);
     if (!session_map) {
       throw_runtime_exception(env,
-          "feedPipelineBufferSessionI1: registerSessionOutputs not called");
+          "feedPipelineBufferSession: registerSessionOutputs not called");
       return 0;
     }
     if (!timestamps || !columns) {
       throw_runtime_exception(env,
-          "feedPipelineBufferSessionI1: null arrays");
+          "feedPipelineBufferSession: null arrays");
       return 0;
     }
     void* buf_addr = env->GetDirectBufferAddress(outBuffer);
@@ -894,6 +895,8 @@ Java_dev_rtbot_sql_RtBotSqlCompiler_feedPipelineBufferSessionI1(
     if (!buf_addr || buf_capacity < 0) {
       return -1;  // signal: not a direct buffer
     }
+
+    std::string port_str = port ? jstring_to_std(env, port) : std::string{"i1"};
 
     const jsize n = env->GetArrayLength(timestamps);
     const jsize num_cols = env->GetArrayLength(columns);
@@ -908,7 +911,7 @@ Java_dev_rtbot_sql_RtBotSqlCompiler_feedPipelineBufferSessionI1(
           env->ReleaseDoubleArrayElements(col_refs[j], col_elems[j], JNI_ABORT);
         }
         throw_runtime_exception(env,
-            "feedPipelineBufferSessionI1: column array null or length mismatch");
+            "feedPipelineBufferSession: column array null or length mismatch");
         return 0;
       }
       col_elems[c] = env->GetDoubleArrayElements(col_refs[c], nullptr);
@@ -929,7 +932,7 @@ Java_dev_rtbot_sql_RtBotSqlCompiler_feedPipelineBufferSessionI1(
                   "jlong vs timestamp_t mismatch");
     auto* times = reinterpret_cast<const rtbot::timestamp_t*>(ts_elems);
 
-    auto batch = program->receive_buffer("i1", rows.data(),
+    auto batch = program->receive_buffer(port_str, rows.data(),
                                           static_cast<std::size_t>(n),
                                           static_cast<std::size_t>(num_cols),
                                           times);
@@ -983,7 +986,7 @@ Java_dev_rtbot_sql_RtBotSqlCompiler_feedPipelineBufferSessionI1(
     return static_cast<jint>(required);
   } catch (const std::exception& e) {
     throw_runtime_exception(
-        env, std::string("feedPipelineBufferSessionI1: ") + e.what());
+        env, std::string("feedPipelineBufferSession: ") + e.what());
     return 0;
   }
 }
