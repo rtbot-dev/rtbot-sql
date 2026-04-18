@@ -75,7 +75,7 @@ TEST_F(SessionConsolidationTest, SingleMaterializedView) {
 
   // One base-stream input.
   ASSERT_EQ(s.base_stream_inputs.size(), 1u);
-  EXPECT_EQ(s.base_stream_inputs.at("trades"), "input__trades");
+  EXPECT_EQ(s.base_stream_inputs.at("trades"), "input__session");
   EXPECT_EQ(s.base_stream_ports.at("trades"), "i1");
 
   // Program JSON has an "output" map keyed by the terminal op id.
@@ -233,6 +233,206 @@ TEST_F(SessionConsolidationTest, RuntimeParityWithSingleView) {
   EXPECT_EQ(solo_vals, session_vals);
   ASSERT_EQ(session_vals.size(), 1u);
   EXPECT_DOUBLE_EQ(session_vals[0], 3.14);  // price was column 1
+}
+
+// ---------------------------------------------------------------------------
+// Multi-base-stream: two distinct streams, each with its own view; session
+// emits a single shared Input with two ports.
+// ---------------------------------------------------------------------------
+
+TEST_F(SessionConsolidationTest, MultiBaseStream) {
+  StreamSchema other{"ticks", {{"price", 0}, {"qty", 1}}};
+  catalog.streams["ticks"] = other;
+
+  auto rA = compile_sql(
+      "CREATE MATERIALIZED VIEW va AS SELECT price FROM trades", catalog);
+  ASSERT_FALSE(rA.has_errors()) << rA.errors[0].message;
+  register_view("va", rA, EntityType::MATERIALIZED_VIEW);
+
+  auto rB = compile_sql(
+      "CREATE MATERIALIZED VIEW vb AS SELECT price FROM ticks", catalog);
+  ASSERT_FALSE(rB.has_errors()) << rB.errors[0].message;
+  register_view("vb", rB, EntityType::MATERIALIZED_VIEW);
+
+  auto s = compile_session_program(catalog);
+  ASSERT_FALSE(s.has_errors())
+      << (s.errors.empty() ? "" : s.errors[0].message);
+
+  // Two base streams, each with its own port on the shared session Input.
+  ASSERT_EQ(s.base_stream_inputs.size(), 2u);
+  EXPECT_EQ(s.base_stream_inputs.at("trades"), "input__session");
+  EXPECT_EQ(s.base_stream_inputs.at("ticks"), "input__session");
+  // Ports are assigned in topological-visit order.
+  EXPECT_NE(s.base_stream_ports.at("trades"),
+            s.base_stream_ports.at("ticks"));
+
+  auto program = json::parse(s.program_json);
+  // Exactly one Input operator with numInputPorts=2 (encoded as portTypes array).
+  int input_count = 0;
+  for (const auto& op : program["operators"]) {
+    if (op["type"].get<std::string>() == "Input") {
+      input_count++;
+      ASSERT_TRUE(op.contains("portTypes"));
+      EXPECT_EQ(op["portTypes"].size(), 2u);
+    }
+  }
+  EXPECT_EQ(input_count, 1);
+
+  // Feed each stream on its port and confirm the corresponding view emits.
+  rtbot::Program program_obj(s.program_json);
+
+  auto trades_port = s.base_stream_ports.at("trades");
+  auto msg_t = rtbot::create_message<rtbot::VectorNumberData>(
+      1, rtbot::VectorNumberData{{100.0, 42.0, 1.0}});
+  auto batch_t = program_obj.receive(std::move(msg_t), trades_port);
+
+  auto ticks_port = s.base_stream_ports.at("ticks");
+  auto msg_k = rtbot::create_message<rtbot::VectorNumberData>(
+      2, rtbot::VectorNumberData{{3.14, 1.0}});
+  auto batch_k = program_obj.receive(std::move(msg_k), ticks_port);
+
+  EXPECT_TRUE(batch_t.count(s.view_terminals.at("va")));
+  EXPECT_TRUE(batch_k.count(s.view_terminals.at("vb")));
+}
+
+// ---------------------------------------------------------------------------
+// Table-JOIN view: still rejected in session mode (table changelog wiring
+// is a follow-up). The error message must be informative.
+// ---------------------------------------------------------------------------
+
+TEST_F(SessionConsolidationTest, TableJoinRejectedInSession) {
+  TableSchema instruments;
+  instruments.name = "instruments";
+  instruments.columns = {{"id", 0}, {"name", 1, ColumnType::TEXT}};
+  catalog.tables["instruments"] = instruments;
+
+  auto r = compile_sql(
+      "CREATE MATERIALIZED VIEW v1 AS "
+      "SELECT price FROM trades "
+      "INNER JOIN instruments ON trades.instrument_id = instruments.id",
+      catalog);
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  register_view("v1", r, EntityType::MATERIALIZED_VIEW);
+
+  auto s = compile_session_program(catalog);
+  EXPECT_TRUE(s.has_errors());
+  ASSERT_FALSE(s.errors.empty());
+  EXPECT_NE(s.errors[0].message.find("table"), std::string::npos)
+      << "error should mention table join: " << s.errors[0].message;
+}
+
+// ---------------------------------------------------------------------------
+// Port alignment: in a multi-base-stream catalog, the view's local Input
+// oN port must wire to the correct session source matching its
+// source_streams[N-1] ordering. Tested via runtime parity: both streams
+// feeding the session produces the same output the stand-alone views
+// would have, on the same timestamps.
+// ---------------------------------------------------------------------------
+
+TEST_F(SessionConsolidationTest, MultiBaseStreamRuntimeParity) {
+  StreamSchema other{"ticks", {{"price", 0}, {"qty", 1}}};
+  catalog.streams["ticks"] = other;
+
+  auto rA = compile_sql(
+      "CREATE MATERIALIZED VIEW va AS SELECT price FROM trades", catalog);
+  register_view("va", rA, EntityType::MATERIALIZED_VIEW);
+  auto rB = compile_sql(
+      "CREATE MATERIALIZED VIEW vb AS SELECT price FROM ticks", catalog);
+  register_view("vb", rB, EntityType::MATERIALIZED_VIEW);
+
+  // Solo pipelines for each view.
+  rtbot::Program solo_a(rA.program_json);
+  rtbot::Program solo_b(rB.program_json);
+  auto solo_a_batch = solo_a.receive(
+      rtbot::create_message<rtbot::VectorNumberData>(
+          10, rtbot::VectorNumberData{{9.0, 2.5, 4.0}}),
+      "i1");
+  auto solo_b_batch = solo_b.receive(
+      rtbot::create_message<rtbot::VectorNumberData>(
+          20, rtbot::VectorNumberData{{7.7, 1.0}}),
+      "i1");
+
+  auto s = compile_session_program(catalog);
+  ASSERT_FALSE(s.has_errors())
+      << (s.errors.empty() ? "" : s.errors[0].message);
+  rtbot::Program session(s.program_json);
+  auto session_a = session.receive(
+      rtbot::create_message<rtbot::VectorNumberData>(
+          10, rtbot::VectorNumberData{{9.0, 2.5, 4.0}}),
+      s.base_stream_ports.at("trades"));
+  auto session_b = session.receive(
+      rtbot::create_message<rtbot::VectorNumberData>(
+          20, rtbot::VectorNumberData{{7.7, 1.0}}),
+      s.base_stream_ports.at("ticks"));
+
+  auto first = [](const rtbot::ProgramMsgBatch& b) -> std::vector<double> {
+    for (const auto& [op_id, op_batch] : b) {
+      for (const auto& [port, msgs] : op_batch) {
+        if (msgs.empty()) continue;
+        auto* v = dynamic_cast<rtbot::Message<rtbot::VectorNumberData>*>(
+            msgs[0].get());
+        if (v && v->data.values) return *v->data.values;
+      }
+    }
+    return {};
+  };
+
+  EXPECT_EQ(first(solo_a_batch), first(session_a));
+  EXPECT_EQ(first(solo_b_batch), first(session_b));
+}
+
+// ---------------------------------------------------------------------------
+// Cycle detection still works after the multi-source refactor.
+// ---------------------------------------------------------------------------
+
+TEST_F(SessionConsolidationTest, CycleDetection) {
+  ViewMeta a{};
+  a.name = "a";
+  a.entity_type = EntityType::VIEW;
+  a.source_streams = {"b"};
+  a.program_json = "{}";  // content irrelevant — topo sort trips first
+  catalog.views["a"] = a;
+
+  ViewMeta b{};
+  b.name = "b";
+  b.entity_type = EntityType::VIEW;
+  b.source_streams = {"a"};
+  b.program_json = "{}";
+  catalog.views["b"] = b;
+
+  auto s = compile_session_program(catalog);
+  EXPECT_TRUE(s.has_errors());
+  ASSERT_FALSE(s.errors.empty());
+  EXPECT_NE(s.errors[0].message.find("cycle"), std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// Unknown source: view references something that's not a stream, view, or
+// table.
+// ---------------------------------------------------------------------------
+
+TEST_F(SessionConsolidationTest, UnknownSourceError) {
+  // Register a legitimate view so `base_streams` is non-empty and the
+  // compile reaches the per-view source-resolution step.
+  auto rOk = compile_sql(
+      "CREATE MATERIALIZED VIEW vok AS SELECT price FROM trades", catalog);
+  ASSERT_FALSE(rOk.has_errors());
+  register_view("vok", rOk, EntityType::MATERIALIZED_VIEW);
+
+  // Insert a view that claims a bogus source in the catalog.
+  ViewMeta v{};
+  v.name = "vbad";
+  v.entity_type = EntityType::MATERIALIZED_VIEW;
+  v.source_streams = {"no_such_stream"};
+  v.program_json = rOk.program_json;
+  catalog.views["vbad"] = v;
+
+  auto s = compile_session_program(catalog);
+  EXPECT_TRUE(s.has_errors());
+  ASSERT_FALSE(s.errors.empty());
+  // Any error message mentioning the bogus source name is acceptable.
+  EXPECT_NE(s.errors[0].message.find("no_such_stream"), std::string::npos)
+      << "error should name the bogus source: " << s.errors[0].message;
 }
 
 }  // namespace
