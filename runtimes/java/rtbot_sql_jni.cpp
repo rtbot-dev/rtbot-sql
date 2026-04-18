@@ -3,14 +3,18 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstring>
+#include <mutex>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
 #include <nlohmann/json.hpp>
 
 #include "rtbot/Message.h"
 #include "rtbot/Program.h"
+#include "rtbot_sql/api/batch_decoder.h"
 #include "rtbot_sql/api/compiler.h"
 #include "rtbot_sql/api/preprocessor.h"
 #include "rtbot_sql/api/types.h"
@@ -20,6 +24,7 @@ using json = nlohmann::json;
 using namespace rtbot_sql;
 
 namespace {
+
 
 struct NativeFeedStats {
   std::atomic<std::uint64_t> calls{0};
@@ -384,62 +389,17 @@ json result_to_json(const CompilationResult& r) {
 }
 
 // ---------------------------------------------------------------------------
-// Pipeline output serialization
-// (pattern from runtimes/python/sql_bindings.cpp decode_batch)
+// Pipeline output serialization — JSON. Iteration + sort come from the
+// shared rtbot_sql::api::decode_program_batch; this function only
+// renders the decoded messages as JSON for the legacy text-output JNI
+// entrypoints.
 // ---------------------------------------------------------------------------
 
 std::string batch_to_json(const rtbot::ProgramMsgBatch& batch) {
-  struct OutputMsg {
-    std::uint64_t timestamp;
-    std::vector<double> values;
-    std::string operator_id;
-    std::string port;
-  };
-
-  std::vector<OutputMsg> out;
-
-  for (const auto& [operator_id, operator_batch] : batch) {
-    for (const auto& [port, messages] : operator_batch) {
-      for (const auto& message : messages) {
-        if (auto* vec =
-                dynamic_cast<rtbot::Message<rtbot::VectorNumberData>*>(
-                    message.get())) {
-          OutputMsg msg{};
-          msg.timestamp = static_cast<std::uint64_t>(vec->time);
-          if (vec->data.values) {
-            msg.values = *vec->data.values;
-          } else {
-            msg.values.clear();
-          }
-          msg.operator_id = operator_id;
-          msg.port = port;
-          out.push_back(msg);
-          continue;
-        }
-
-        if (auto* num =
-                dynamic_cast<rtbot::Message<rtbot::NumberData>*>(
-                    message.get())) {
-          OutputMsg msg{};
-          msg.timestamp = static_cast<std::uint64_t>(num->time);
-          msg.values = {num->data.value};
-          msg.operator_id = operator_id;
-          msg.port = port;
-          out.push_back(msg);
-        }
-      }
-    }
-  }
-
-  std::stable_sort(out.begin(), out.end(),
-                   [](const OutputMsg& a, const OutputMsg& b) {
-                     return std::tie(a.timestamp, a.operator_id, a.port) <
-                            std::tie(b.timestamp, b.operator_id, b.port);
-                   });
-
+  auto decoded = api::decode_program_batch(batch);
   json arr = json::array();
-  for (const auto& m : out) {
-    arr.push_back({{"timestamp", m.timestamp},
+  for (const auto& m : decoded) {
+    arr.push_back({{"timestamp", static_cast<std::uint64_t>(m.timestamp)},
                    {"values", m.values},
                    {"operator_id", m.operator_id},
                    {"port", m.port}});
@@ -1046,6 +1006,180 @@ Java_dev_rtbot_sql_RtBotSqlCompiler_feedPipelineBufferI1(JNIEnv* env, jclass,
   }
 }
 
+// Register the ordered set of output operator ids for a consolidated
+// session pipeline. Must be called after createPipeline and before
+// feedPipelineBufferSessionI1. The ordering is caller-defined; outputs
+// emitted by the native side reference this registration by index, and
+// the Java caller uses the same index to demux.
+JNIEXPORT void JNICALL
+Java_dev_rtbot_sql_RtBotSqlCompiler_registerSessionOutputs(JNIEnv* env,
+                                                            jclass,
+                                                            jlong handle,
+                                                            jobjectArray opIds) {
+  try {
+    auto* program = reinterpret_cast<rtbot::Program*>(handle);
+    if (!program) {
+      throw_runtime_exception(env, "registerSessionOutputs: null handle");
+      return;
+    }
+    if (!opIds) {
+      throw_runtime_exception(env, "registerSessionOutputs: null opIds");
+      return;
+    }
+    jsize n = env->GetArrayLength(opIds);
+    std::vector<std::string> ids;
+    ids.reserve(static_cast<size_t>(n));
+    for (jsize i = 0; i < n; ++i) {
+      auto js = static_cast<jstring>(env->GetObjectArrayElement(opIds, i));
+      ids.push_back(jstring_to_std(env, js));
+    }
+    api::SessionOutputRegistry::instance().register_outputs(program,
+                                                             std::move(ids));
+  } catch (const std::exception& e) {
+    throw_runtime_exception(
+        env, std::string("registerSessionOutputs: ") + e.what());
+  }
+}
+
+// Consolidated-session buffered feed. Writes outputs in a compact binary
+// frame into a caller-supplied direct ByteBuffer. Frame layout (all
+// little-endian / native order; caller must set ByteOrder.nativeOrder()):
+//
+//   int32 num_outputs
+//   per output (variable):
+//     int32 op_index         // index into the registered op-ids array
+//     int32 num_values
+//     int64 timestamp
+//     float64 values[num_values]
+//
+// Return value:
+//   >= 0: bytes written into the buffer
+//     -1: buffer is not a direct buffer
+//   < -1: required capacity in bytes (negated) — caller must grow and retry
+JNIEXPORT jint JNICALL
+Java_dev_rtbot_sql_RtBotSqlCompiler_feedPipelineBufferSessionI1(
+    JNIEnv* env, jclass,
+    jlong handle,
+    jlongArray timestamps,
+    jobjectArray columns,
+    jobject outBuffer) {
+  try {
+    auto* program = reinterpret_cast<rtbot::Program*>(handle);
+    if (!program) {
+      throw_runtime_exception(env, "feedPipelineBufferSessionI1: null handle");
+      return 0;
+    }
+    const auto* session_map =
+        api::SessionOutputRegistry::instance().lookup(program);
+    if (!session_map) {
+      throw_runtime_exception(env,
+          "feedPipelineBufferSessionI1: registerSessionOutputs not called");
+      return 0;
+    }
+    if (!timestamps || !columns) {
+      throw_runtime_exception(env,
+          "feedPipelineBufferSessionI1: null arrays");
+      return 0;
+    }
+    void* buf_addr = env->GetDirectBufferAddress(outBuffer);
+    jlong buf_capacity = env->GetDirectBufferCapacity(outBuffer);
+    if (!buf_addr || buf_capacity < 0) {
+      return -1;  // signal: not a direct buffer
+    }
+
+    const jsize n = env->GetArrayLength(timestamps);
+    const jsize num_cols = env->GetArrayLength(columns);
+
+    std::vector<jdoubleArray> col_refs(num_cols);
+    std::vector<jdouble*> col_elems(num_cols);
+    for (jsize c = 0; c < num_cols; ++c) {
+      col_refs[c] = static_cast<jdoubleArray>(
+          env->GetObjectArrayElement(columns, c));
+      if (!col_refs[c] || env->GetArrayLength(col_refs[c]) != n) {
+        for (jsize j = 0; j < c; ++j) {
+          env->ReleaseDoubleArrayElements(col_refs[j], col_elems[j], JNI_ABORT);
+        }
+        throw_runtime_exception(env,
+            "feedPipelineBufferSessionI1: column array null or length mismatch");
+        return 0;
+      }
+      col_elems[c] = env->GetDoubleArrayElements(col_refs[c], nullptr);
+    }
+
+    jlong* ts_elems = env->GetLongArrayElements(timestamps, nullptr);
+
+    std::vector<double> rows(static_cast<std::size_t>(n) *
+                              static_cast<std::size_t>(num_cols));
+    for (jsize i = 0; i < n; ++i) {
+      for (jsize c = 0; c < num_cols; ++c) {
+        rows[static_cast<std::size_t>(i) * num_cols + c] =
+            static_cast<double>(col_elems[c][i]);
+      }
+    }
+
+    static_assert(sizeof(jlong) == sizeof(rtbot::timestamp_t),
+                  "jlong vs timestamp_t mismatch");
+    auto* times = reinterpret_cast<const rtbot::timestamp_t*>(ts_elems);
+
+    auto batch = program->receive_buffer("i1", rows.data(),
+                                          static_cast<std::size_t>(n),
+                                          static_cast<std::size_t>(num_cols),
+                                          times);
+
+    env->ReleaseLongArrayElements(timestamps, ts_elems, JNI_ABORT);
+    for (jsize c = 0; c < num_cols; ++c) {
+      env->ReleaseDoubleArrayElements(col_refs[c], col_elems[c], JNI_ABORT);
+    }
+
+    // Decode via shared helper (iteration + stable sort by
+    // (timestamp, operator_id, port) shared across runtimes). Outputs
+    // from operators not present in the session's registered terminal
+    // table are discarded; in practice the consolidated compiler only
+    // exposes materialized-view terminals so every decoded message
+    // should resolve to a registered index.
+    auto decoded = api::decode_program_batch(batch);
+
+    size_t kept = 0;
+    size_t required = sizeof(int32_t);
+    for (const auto& m : decoded) {
+      if (session_map->id_to_idx.find(m.operator_id)
+              == session_map->id_to_idx.end()) continue;
+      required += sizeof(int32_t) + sizeof(int32_t) + sizeof(int64_t) +
+                  m.values.size() * sizeof(double);
+      kept++;
+    }
+    if (static_cast<jlong>(required) > buf_capacity) {
+      return -static_cast<jint>(required);  // caller grows and retries
+    }
+
+    char* p = static_cast<char*>(buf_addr);
+    auto write_bytes = [&p](const void* src, size_t sz) {
+      std::memcpy(p, src, sz);
+      p += sz;
+    };
+    const int32_t nout = static_cast<int32_t>(kept);
+    write_bytes(&nout, sizeof(int32_t));
+    for (const auto& m : decoded) {
+      auto it = session_map->id_to_idx.find(m.operator_id);
+      if (it == session_map->id_to_idx.end()) continue;
+      const int32_t opIdx = it->second;
+      const int32_t nvals = static_cast<int32_t>(m.values.size());
+      const int64_t ts = static_cast<int64_t>(m.timestamp);
+      write_bytes(&opIdx, sizeof(int32_t));
+      write_bytes(&nvals, sizeof(int32_t));
+      write_bytes(&ts, sizeof(int64_t));
+      if (nvals > 0) {
+        write_bytes(m.values.data(), nvals * sizeof(double));
+      }
+    }
+    return static_cast<jint>(required);
+  } catch (const std::exception& e) {
+    throw_runtime_exception(
+        env, std::string("feedPipelineBufferSessionI1: ") + e.what());
+    return 0;
+  }
+}
+
 JNIEXPORT void JNICALL
 Java_dev_rtbot_sql_RtBotSqlCompiler_resetNativeFeedStats(JNIEnv* env,
                                                           jclass) {
@@ -1087,6 +1221,7 @@ Java_dev_rtbot_sql_RtBotSqlCompiler_destroyPipeline(JNIEnv* env, jclass,
                                                      jlong handle) {
   try {
     auto* program = reinterpret_cast<rtbot::Program*>(handle);
+    if (program) api::SessionOutputRegistry::instance().clear(program);
     delete program;
   } catch (const std::exception& e) {
     throw_runtime_exception(
