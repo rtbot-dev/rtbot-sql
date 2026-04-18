@@ -3,6 +3,7 @@ package dev.rtbot.sql;
 import com.google.gson.Gson;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -45,6 +46,18 @@ public class RtBotSqlRuntime {
     private final Map<String, Map<String, String>> viewPortMaps = new HashMap<>();
     /** source stream name -> set of dependent view names */
     private final Map<String, Set<String>> dependencies = new HashMap<>();
+
+    // -- Consolidated-session state (opt-in) -----------------------------
+    // When enabled, all registered views are compiled into a single
+    // rtbot Program at first insert and inserts route through that
+    // Program's entry Input. Outputs are demuxed by upstream operator id
+    // and forwarded to each view's appendAndPropagate.
+    private boolean useConsolidatedSession = false;
+    private String sessionPipelineId = null;
+    /** terminal operator id (in the merged graph) -> view name */
+    private Map<String, String> sessionOpIdToView = Collections.emptyMap();
+    /** base stream name -> port id on the session Input */
+    private Map<String, String> sessionStreamPort = Collections.emptyMap();
 
     /** stream/view name -> active output listener (subscription registry) */
     private final Map<String, OutputListener> subscriptions = new ConcurrentHashMap<>();
@@ -234,6 +247,12 @@ public class RtBotSqlRuntime {
                     + ": expected " + schema.columns.size() + ", got " + payload.size());
         }
 
+        if (useConsolidatedSession) {
+            appendAndPropagate(streamName, timestamp, payload, /*propagate=*/false);
+            feedSessionRow(streamName, timestamp, payload);
+            return;
+        }
+
         appendAndPropagate(streamName, timestamp, payload);
     }
 
@@ -253,6 +272,17 @@ public class RtBotSqlRuntime {
                 && schema.columns.size() != 3) {
             throw new SqlError("insert3 requires 3 columns for " + streamName
                     + ", found " + schema.columns.size());
+        }
+
+        // Consolidated-session fast path.
+        if (useConsolidatedSession) {
+            if (collectMode || subscriptions.containsKey(streamName)) {
+                appendAndPropagate(streamName, timestamp,
+                                    Arrays.asList(v0, v1, v2),
+                                    /*propagate=*/false);
+            }
+            feedSessionRow3(streamName, timestamp, v0, v1, v2);
+            return;
         }
 
         // Fallback when source stream needs direct materialization/callback.
@@ -333,6 +363,23 @@ public class RtBotSqlRuntime {
             }
         }
         if (n == 0) {
+            return;
+        }
+
+        // Consolidated-session fast path: one JNI round-trip for the
+        // whole batch, outputs demuxed to each materialized view.
+        if (useConsolidatedSession) {
+            boolean needRawSideEffects =
+                    collectMode || subscriptions.containsKey(streamName);
+            if (needRawSideEffects) {
+                for (int i = 0; i < n; i++) {
+                    List<Double> row = new ArrayList<>(columns.length);
+                    for (double[] col : columns) row.add(col[i]);
+                    appendAndPropagate(streamName, timestamps[i], row,
+                                        /*propagate=*/false);
+                }
+            }
+            feedSessionBuffer(streamName, timestamps, columns, useBuffer);
             return;
         }
 
@@ -431,6 +478,137 @@ public class RtBotSqlRuntime {
      */
     public boolean hasSubscriber(String streamOrViewName) {
         return subscriptions.containsKey(streamOrViewName);
+    }
+
+    /**
+     * Enable or disable consolidated-session ingest mode.
+     *
+     * <p>When enabled, all currently registered views are merged into a
+     * single rtbot Program at first insert (deploy-time only — DDL after
+     * the session deploys is rejected). Incoming data is fed once to the
+     * session's entry Input; the Collector-sink outputs are demuxed by
+     * upstream operator id and forwarded to each view's
+     * {@link #appendAndPropagate}. The net effect is one JNI round-trip
+     * per insert regardless of view-DAG depth.
+     *
+     * <p>Default is off. See
+     * {@code docs/plans/2026-04-18-single-program-views.md} for the full
+     * spec and non-goals (single base stream, no mid-run DDL, no
+     * per-view state preservation across restarts in session mode).
+     *
+     * @param enabled true to route inserts through the consolidated session
+     */
+    public void setUseConsolidatedSession(boolean enabled) {
+        if (enabled == this.useConsolidatedSession) return;
+        // Reset any previously deployed session when toggling.
+        if (sessionPipelineId != null) {
+            try { runner.destroy(sessionPipelineId); } catch (Exception ignored) {}
+            sessionPipelineId = null;
+            sessionOpIdToView = Collections.emptyMap();
+            sessionStreamPort = Collections.emptyMap();
+        }
+        this.useConsolidatedSession = enabled;
+    }
+
+    /**
+     * Returns whether consolidated-session mode is enabled.
+     */
+    public boolean isUseConsolidatedSession() {
+        return useConsolidatedSession;
+    }
+
+    /**
+     * Lazily compile and deploy the consolidated session. No-op if
+     * already deployed. Throws {@link SqlError} on compile failure.
+     */
+    private void ensureSessionDeployed() {
+        if (sessionPipelineId != null) return;
+        String catalogJson = catalog.snapshotJson();
+        String sessionJson = RtBotSqlCompiler.compileSessionJson(catalogJson);
+        com.google.gson.JsonObject obj =
+                gson.fromJson(sessionJson, com.google.gson.JsonObject.class);
+        com.google.gson.JsonArray errs = obj.getAsJsonArray("errors");
+        if (errs != null && errs.size() > 0) {
+            throw new SqlError("compile_session failed: " + errs.toString());
+        }
+        String programJson = obj.get("program_json").getAsString();
+        sessionPipelineId = runner.deploy(programJson, new ArrayList<>(),
+                                           Collections.emptyMap());
+
+        // Build op_id -> view_name map for output demux.
+        Map<String, String> opToView = new HashMap<>();
+        com.google.gson.JsonObject vt = obj.getAsJsonObject("view_terminals");
+        for (Map.Entry<String, com.google.gson.JsonElement> e : vt.entrySet()) {
+            opToView.put(e.getValue().getAsString(), e.getKey());
+        }
+        this.sessionOpIdToView = opToView;
+
+        // Build base_stream -> port map for routing.
+        Map<String, String> sp = new HashMap<>();
+        com.google.gson.JsonObject bsp =
+                obj.getAsJsonObject("base_stream_ports");
+        for (Map.Entry<String, com.google.gson.JsonElement> e : bsp.entrySet()) {
+            sp.put(e.getKey(), e.getValue().getAsString());
+        }
+        this.sessionStreamPort = sp;
+    }
+
+    /**
+     * Feed a batch into the consolidated session on the given base
+     * stream's port, then demux outputs to each materialized view's
+     * {@link #appendAndPropagate}. Called only when
+     * {@link #useConsolidatedSession} is on and the stream has
+     * dependent views.
+     */
+    private void feedSessionBuffer(String streamName, long[] timestamps,
+                                    double[][] columns, boolean useBuffer) {
+        ensureSessionDeployed();
+        String port = sessionStreamPort.getOrDefault(streamName, "i1");
+        List<OutputMessage> outputs;
+        if ("i1".equals(port)) {
+            outputs = useBuffer
+                    ? runner.feedBufferI1(sessionPipelineId, timestamps, columns)
+                    : runner.feedBatchI1(sessionPipelineId, timestamps, columns);
+        } else {
+            // Non-default port: fall back to per-row feed with explicit port.
+            outputs = new ArrayList<>();
+            int n = timestamps.length;
+            for (int i = 0; i < n; i++) {
+                List<Double> row = new ArrayList<>(columns.length);
+                for (double[] col : columns) row.add(col[i]);
+                outputs.addAll(runner.feed(sessionPipelineId, timestamps[i], row, port));
+            }
+        }
+        dispatchSessionOutputs(outputs);
+    }
+
+    private void feedSessionRow3(String streamName, long timestamp,
+                                  double v0, double v1, double v2) {
+        ensureSessionDeployed();
+        String port = sessionStreamPort.getOrDefault(streamName, "i1");
+        List<OutputMessage> outputs =
+                runner.feed3(sessionPipelineId, timestamp, v0, v1, v2, port);
+        dispatchSessionOutputs(outputs);
+    }
+
+    private void feedSessionRow(String streamName, long timestamp,
+                                 List<Double> values) {
+        ensureSessionDeployed();
+        String port = sessionStreamPort.getOrDefault(streamName, "i1");
+        List<OutputMessage> outputs =
+                runner.feed(sessionPipelineId, timestamp, values, port);
+        dispatchSessionOutputs(outputs);
+    }
+
+    private void dispatchSessionOutputs(List<OutputMessage> outputs) {
+        for (OutputMessage out : outputs) {
+            String viewName = sessionOpIdToView.get(out.operatorId);
+            if (viewName == null) continue;
+            // Session's internal wiring has already routed between views;
+            // do not re-cascade into per-view pipelines.
+            appendAndPropagate(viewName, out.timestamp, out.values,
+                               /*propagate=*/false);
+        }
     }
 
     /**
@@ -845,6 +1023,17 @@ public class RtBotSqlRuntime {
      * propagate to dependents and subscribers.
      */
     private void appendAndPropagate(String streamName, long timestamp, List<Double> values) {
+        appendAndPropagate(streamName, timestamp, values, /*propagate=*/true);
+    }
+
+    /**
+     * Append-notify-(optionally)propagate. When {@code propagate} is
+     * false, only the store/subscriber side-effects run; dependent
+     * views are NOT fed. Used in consolidated-session mode where the
+     * session Program already routes data internally.
+     */
+    private void appendAndPropagate(String streamName, long timestamp,
+                                      List<Double> values, boolean propagate) {
         ViewMeta view = catalog.lookupView(streamName);
         boolean isPlainView = (view != null
                 && EntityType.VIEW.name().equals(view.entityType));
@@ -868,6 +1057,8 @@ public class RtBotSqlRuntime {
         if (listener != null) {
             listener.onMessage(streamName, timestamp, values);
         }
+
+        if (!propagate) return;
 
         // Propagate to all dependent views
         Set<String> dependents = dependencies.get(streamName);
@@ -1231,5 +1422,11 @@ public class RtBotSqlRuntime {
         viewPortMaps.clear();
         dependencies.clear();
         subscriptions.clear();
+        if (sessionPipelineId != null) {
+            try { runner.destroy(sessionPipelineId); } catch (Exception ignored) {}
+            sessionPipelineId = null;
+            sessionOpIdToView = Collections.emptyMap();
+            sessionStreamPort = Collections.emptyMap();
+        }
     }
 }
