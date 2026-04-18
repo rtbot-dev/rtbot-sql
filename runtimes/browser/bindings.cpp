@@ -304,6 +304,33 @@ std::string validate_sql(const std::string& sql) {
   }
 }
 
+std::string compile_session_json(const std::string& catalog_json) {
+  try {
+    auto catalog = catalog_from_json(catalog_json);
+    auto r = api::compile_session_program(catalog);
+    json j;
+    j["program_json"] = r.program_json;
+    j["view_terminals"] = r.view_terminals;
+    j["view_terminal_ports"] = r.view_terminal_ports;
+    j["materialized_views"] = r.materialized_views;
+    j["base_stream_inputs"] = r.base_stream_inputs;
+    j["base_stream_ports"] = r.base_stream_ports;
+    json errs = json::array();
+    for (const auto& e : r.errors) {
+      errs.push_back(
+          {{"message", e.message}, {"line", e.line}, {"column", e.column}});
+    }
+    j["errors"] = errs;
+    return j.dump();
+  } catch (const std::exception& e) {
+    json j;
+    json errs = json::array();
+    errs.push_back({{"message", e.what()}, {"line", -1}, {"column", -1}});
+    j["errors"] = errs;
+    return j.dump();
+  }
+}
+
 std::string preprocess_sql_json(const std::string& sql,
                                 int ts_units_per_second) {
   try {
@@ -328,6 +355,7 @@ std::string preprocess_sql_json(const std::string& sql,
 
 EMSCRIPTEN_BINDINGS(RtBotSql) {
   emscripten::function("compileSqlJson", &compile_sql_json);
+  emscripten::function("compileSessionJson", &compile_session_json);
   emscripten::function("validateSql", &validate_sql);
   emscripten::function("preprocessSqlJson", &preprocess_sql_json);
 }
