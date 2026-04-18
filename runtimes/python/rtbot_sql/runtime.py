@@ -57,7 +57,7 @@ def _extract_limit(sql: str) -> Optional[int]:
 
 
 class RtBotSql:
-  def __init__(self, *, use_consolidated_session: bool = True) -> None:
+  def __init__(self) -> None:
     self._catalog = InMemoryCatalog()
     self._store = InMemoryStreamStore()
     self._runner = LocalPipelineRunner()
@@ -71,9 +71,8 @@ class RtBotSql:
     # Consolidated-session state. Every registered view is compiled
     # into a single rtbot Program at CREATE VIEW / first insert time.
     # DDL invalidates the session so the next deploy picks up the
-    # updated catalog; `backfill_session_from_store` replays stored
+    # updated catalog; `_backfill_session_from_store` replays stored
     # source data so newly registered views inherit history.
-    self._use_consolidated_session: bool = bool(use_consolidated_session)
     self._session_pipeline: Optional[Any] = None
     self._session_op_to_view: Dict[str, str] = {}
     self._session_stream_port: Dict[str, str] = {}
@@ -264,8 +263,7 @@ class RtBotSql:
     # new view immediately participates (and picks up already-stored
     # source-stream data via `_backfill_session_from_store`).
     self._invalidate_session()
-    if self._use_consolidated_session:
-      self._ensure_session_deployed()
+    self._ensure_session_deployed()
 
   def _handle_drop(self, result: native.CompilationResult) -> None:
     name = result.drop_entity_name
@@ -684,23 +682,6 @@ class RtBotSql:
     return row_count
 
   # --- Consolidated-session helpers ---------------------------------
-
-  def set_use_consolidated_session(self, enabled: bool) -> None:
-    """Enable or disable consolidated-session ingest mode.
-
-    When enabled, :meth:`insert_dataframe` routes through a single
-    merged rtbot Program built from every registered view; one native
-    call per batch, Collector-sink outputs demuxed by op id to each
-    materialized view. Deploy-time only — creating or dropping a view
-    after the session has been deployed raises an error.
-    """
-    enabled = bool(enabled)
-    if enabled == self._use_consolidated_session:
-      return
-    # Tear down any previously deployed session so the next insert
-    # rebuilds from the current catalog.
-    self._invalidate_session()
-    self._use_consolidated_session = enabled
 
   def _ensure_session_deployed(self) -> None:
     """Lazily compile and deploy the consolidated session.

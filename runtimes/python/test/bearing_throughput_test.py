@@ -102,10 +102,7 @@ class BearingThroughputTest(unittest.TestCase):
     NUM_BURSTS = _int_env("RTBOT_BENCHMARK_BURSTS", 300)
 
     def test_bearing_preset_throughput(self):
-        # Session mode is the default; RTBOT_BENCHMARK_SESSION=0 opts
-        # out to measure the per-view-cascade fallback path.
-        use_session = _bool_env("RTBOT_BENCHMARK_SESSION", default=True)
-        sql = rtbot_sql.RtBotSql(use_consolidated_session=use_session)
+        sql = rtbot_sql.RtBotSql()
         sql.execute(SQL_STREAM)
         sql.execute(SQL_BASE_VIEW)
         sql.execute(SQL_RMS)
@@ -152,7 +149,7 @@ class BearingThroughputTest(unittest.TestCase):
         rms_rows = len(sql._store.read("rms_trend"))
         kurtosis_rows = len(sql._store.read("kurtosis_trend"))
 
-        mode = "CONSOLIDATED SESSION" if use_session else "baseline (per-view)"
+        mode = "CONSOLIDATED SESSION"
         print()
         print("=" * 64)
         print(f"BEARING PRESET THROUGHPUT (Python) — {mode}")
