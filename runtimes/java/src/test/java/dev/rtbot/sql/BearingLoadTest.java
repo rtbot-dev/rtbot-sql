@@ -100,6 +100,13 @@ public class BearingLoadTest {
         // Default: subscription mode — no data accumulated in memory
 
         try {
+            // Honor -Drtbot.benchmark.session=true to route inserts through
+            // the consolidated-session path (views merged into one rtbot
+            // Program). Default off preserves baseline measurements.
+            boolean session = Boolean.parseBoolean(
+                System.getProperty("rtbot.benchmark.session", "false"));
+            runtime.setUseConsolidatedSession(session);
+
             // -- Setup pipeline -------------------------------------------
             runtime.execute(SQL_STREAM);
             runtime.execute(SQL_BASE_VIEW);
