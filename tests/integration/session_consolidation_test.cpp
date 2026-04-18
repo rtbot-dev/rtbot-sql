@@ -146,10 +146,16 @@ TEST_F(SessionConsolidationTest, ViewToMaterializedViewChain) {
   }
   EXPECT_EQ(input_count, 1);
 
-  // Output map contains only vb's terminal, not va's.
+  // Output map exposes every view terminal (subscribers on plain views
+  // need the same Collector-sink tap as materialized views do).
+  // `materialized_views` still identifies the subset whose outputs are
+  // persisted to the store.
   ASSERT_TRUE(program.contains("output"));
-  EXPECT_EQ(program["output"].size(), 1u);
+  EXPECT_EQ(program["output"].size(), 2u);
   EXPECT_TRUE(program["output"].contains(s.view_terminals.at("vb")));
+  EXPECT_TRUE(program["output"].contains(s.view_terminals.at("va")));
+  ASSERT_EQ(s.materialized_views.size(), 1u);
+  EXPECT_EQ(s.materialized_views[0], "vb");
 }
 
 // ---------------------------------------------------------------------------
@@ -180,9 +186,11 @@ TEST_F(SessionConsolidationTest, DiamondFanout) {
   ASSERT_EQ(s.materialized_views.size(), 2u);
   auto program = json::parse(s.program_json);
 
-  // Named outputs: vb and vc terminals both present.
+  // All three view terminals exposed (va is plain but still needs a
+  // Collector for potential subscribers).
   ASSERT_TRUE(program.contains("output"));
-  EXPECT_EQ(program["output"].size(), 2u);
+  EXPECT_EQ(program["output"].size(), 3u);
+  EXPECT_TRUE(program["output"].contains(s.view_terminals.at("va")));
   EXPECT_TRUE(program["output"].contains(s.view_terminals.at("vb")));
   EXPECT_TRUE(program["output"].contains(s.view_terminals.at("vc")));
 }

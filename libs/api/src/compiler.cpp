@@ -1277,9 +1277,15 @@ SessionCompilationResult compile_session_program(
     out.view_terminals[vname] = merged_terminal.operator_id;
     out.view_terminal_ports[vname] = merged_terminal.port;
 
+    // Every view — plain or materialized — gets its terminal exposed
+    // as a Program output. Subscribers on plain views (e.g. observers
+    // upstream of further views) need the same Collector-sink wiring
+    // that materialized views get. Collectors are passive taps that
+    // don't steal data from downstream operators, so this does not
+    // change dataflow semantics.
+    named_outputs[merged_terminal.operator_id].push_back(
+        merged_terminal.port);
     if (view.entity_type == EntityType::MATERIALIZED_VIEW) {
-      named_outputs[merged_terminal.operator_id].push_back(
-          merged_terminal.port);
       out.materialized_views.push_back(vname);
     }
   }
