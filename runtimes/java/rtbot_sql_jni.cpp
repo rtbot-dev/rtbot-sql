@@ -508,6 +508,41 @@ Java_dev_rtbot_sql_RtBotSqlCompiler_compileSqlJson(JNIEnv* env, jclass,
   }
 }
 
+// Compile all views in a catalog into one consolidated rtbot Program.
+// Returns JSON { program_json, view_terminals, view_terminal_ports,
+//                materialized_views, base_stream_inputs, base_stream_ports,
+//                errors }.
+// Errors are returned in the "errors" array; callers should check before
+// deploying.
+JNIEXPORT jstring JNICALL
+Java_dev_rtbot_sql_RtBotSqlCompiler_compileSessionJson(JNIEnv* env, jclass,
+                                                        jstring catalogJson) {
+  try {
+    auto catalog = catalog_from_json(jstring_to_std(env, catalogJson));
+    auto result = api::compile_session_program(catalog);
+    json j;
+    j["program_json"] = result.program_json;
+    j["view_terminals"] = result.view_terminals;
+    j["view_terminal_ports"] = result.view_terminal_ports;
+    j["materialized_views"] = result.materialized_views;
+    j["base_stream_inputs"] = result.base_stream_inputs;
+    j["base_stream_ports"] = result.base_stream_ports;
+    json errs = json::array();
+    for (const auto& e : result.errors) {
+      errs.push_back(
+          {{"message", e.message}, {"line", e.line}, {"column", e.column}});
+    }
+    j["errors"] = errs;
+    return std_to_jstring(env, j.dump());
+  } catch (const std::exception& e) {
+    json j;
+    j["errors"] = json::array();
+    j["errors"].push_back(
+        {{"message", e.what()}, {"line", -1}, {"column", -1}});
+    return std_to_jstring(env, j.dump());
+  }
+}
+
 JNIEXPORT jstring JNICALL
 Java_dev_rtbot_sql_RtBotSqlCompiler_validateSql(JNIEnv* env, jclass,
                                                  jstring sql) {

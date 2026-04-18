@@ -69,6 +69,34 @@ public final class RtBotSqlCompiler {
      */
     public static native String validateSql(String sql);
 
+    /**
+     * Consolidate every view currently registered in the catalog into one
+     * rtbot Program. Each view's body is inlined; Output operators at view
+     * boundaries are dropped (the Collector-sink mechanism in Program.h
+     * replaces them). Exactly one Input operator is retained per base
+     * stream as the session's entry. Materialized views are exposed as
+     * named outputs.
+     *
+     * <p>Returns JSON with:
+     * <ul>
+     *   <li>{@code program_json} — consolidated Program JSON.</li>
+     *   <li>{@code view_terminals} — view_name → operator id producing
+     *       that view's output in the consolidated graph.</li>
+     *   <li>{@code view_terminal_ports} — view_name → output port id on
+     *       that terminal operator.</li>
+     *   <li>{@code materialized_views} — subset of view_terminals keys
+     *       exposed as Program outputs.</li>
+     *   <li>{@code base_stream_inputs} — base_stream_name → Input
+     *       operator id in the consolidated graph.</li>
+     *   <li>{@code base_stream_ports} — base_stream_name → port id.</li>
+     *   <li>{@code errors} — non-empty if compilation fails.</li>
+     * </ul>
+     *
+     * @param catalogJson JSON representation of the catalog snapshot (same
+     *                    shape as the catalog passed to {@link #compileSqlJson})
+     */
+    public static native String compileSessionJson(String catalogJson);
+
     // -----------------------------------------------------------------
     // Pipeline lifecycle
     // -----------------------------------------------------------------
