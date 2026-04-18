@@ -211,6 +211,58 @@ public class LocalPipelineRunner implements PipelineRunner {
         return outputs;
     }
 
+    /**
+     * Raw-buffer variant of {@link #feedBatchI1}. Skips per-row Message
+     * allocation on the native side by passing a row-major buffer directly
+     * to {@code Program::receive_buffer}. Best paired with a compiled
+     * pipeline whose entry operator overrides {@code receive_data_buffer}
+     * (e.g. BurstAggregate) — otherwise falls back to the default per-row
+     * Message creation so output is identical to {@link #feedBatchI1}.
+     */
+    public List<OutputMessage> feedBufferI1(
+            String pipelineId,
+            long[] timestamps,
+            double[][] columns) {
+        Long handle = pipelines.get(pipelineId);
+        if (handle == null) {
+            throw new IllegalArgumentException("Unknown pipeline: " + pipelineId);
+        }
+        if (timestamps == null || columns == null) {
+            throw new IllegalArgumentException("feedBufferI1 arrays must not be null");
+        }
+        int n = timestamps.length;
+        for (int c = 0; c < columns.length; c++) {
+            if (columns[c] == null || columns[c].length != n) {
+                throw new IllegalArgumentException(
+                        "feedBufferI1 column " + c + " null or length mismatch: expected "
+                                + n + ", got " + (columns[c] == null ? "null" : columns[c].length));
+            }
+        }
+
+        if (!perfStatsEnabled) {
+            String json = RtBotSqlCompiler.feedPipelineBufferI1(
+                    handle, timestamps, columns);
+            return parseOutputMessages(json);
+        }
+
+        long t0 = System.nanoTime();
+        String json = RtBotSqlCompiler.feedPipelineBufferI1(
+                handle, timestamps, columns);
+        long t1 = System.nanoTime();
+        List<OutputMessage> outputs = parseOutputMessages(json);
+        long t2 = System.nanoTime();
+
+        feedCalls++;
+        inputValues += (long) n * (long) columns.length;
+        nativeNs += (t1 - t0);
+        parseNs += (t2 - t1);
+        outputMessages += outputs.size();
+        for (OutputMessage out : outputs) {
+            outputValues += out.values != null ? out.values.size() : 0;
+        }
+        return outputs;
+    }
+
     @Override
     public List<OutputMessage> runOnce(String programJson, List<InputMessage> inputs) {
         long handle = RtBotSqlCompiler.createPipeline(programJson);

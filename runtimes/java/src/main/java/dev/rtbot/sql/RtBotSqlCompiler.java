@@ -122,6 +122,21 @@ public final class RtBotSqlCompiler {
             double[][] columns);
 
     /**
+     * Raw-buffer variant of the batched feed. Same Java-side shape as
+     * {@link #feedPipelineBatchI1} (column-major {@code double[][]} plus a
+     * parallel {@code long[]} timestamps array), but the native side skips
+     * per-row {@code Message<VectorNumberData>} allocation and streams the
+     * row span straight into the entry operator via
+     * {@code Program::receive_buffer}. Operators that override
+     * {@code receive_data_buffer} (e.g. BurstAggregate) benefit the most;
+     * other operators fall back to the default per-row Message creation.
+     */
+    public static native String feedPipelineBufferI1(
+            long handle,
+            long[] timestamps,
+            double[][] columns);
+
+    /**
      * Reset cumulative native feed-path profiling counters.
      */
     public static native void resetNativeFeedStats();
@@ -203,7 +218,7 @@ public final class RtBotSqlCompiler {
         } else if (os.contains("mac")) {
             platform = "mac-" + (arch.contains("aarch64") ? "aarch64" : "x86_64");
         } else if (os.contains("win")) {
-            platform = "win-x86_64";
+            platform = "win-" + (arch.contains("aarch64") ? "aarch64" : "x86_64");
         } else {
             platform = "unknown";
         }

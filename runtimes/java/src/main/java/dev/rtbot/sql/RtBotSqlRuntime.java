@@ -289,9 +289,29 @@ public class RtBotSqlRuntime {
      * row-by-row routing when collect mode is enabled, the source has direct
      * subscribers, or a dependent requires a non-default input port.
      */
+    /**
+     * Raw-buffer variant of {@link #insertBatch}. Same contract, but routes
+     * i1 dependents through {@code feedBufferI1} so operators that override
+     * {@code receive_data_buffer} (e.g. BurstAggregate) skip per-row Message
+     * allocation on the native side. Non-i1 ports and subscriber/collect
+     * modes fall back to row-by-row routing.
+     */
+    public void insertBuffer(String streamName,
+                              long[] timestamps,
+                              double[][] columns) {
+        insertBatchImpl(streamName, timestamps, columns, /*useBuffer=*/true);
+    }
+
     public void insertBatch(String streamName,
                             long[] timestamps,
                             double[][] columns) {
+        insertBatchImpl(streamName, timestamps, columns, /*useBuffer=*/false);
+    }
+
+    private void insertBatchImpl(String streamName,
+                                   long[] timestamps,
+                                   double[][] columns,
+                                   boolean useBuffer) {
         StreamSchema schema = catalog.lookupStream(streamName);
         if (schema == null) {
             throw new SqlError("Unknown stream: " + streamName);
@@ -340,8 +360,9 @@ public class RtBotSqlRuntime {
             String port = portMap.getOrDefault(streamName, "i1");
 
             if ("i1".equals(port)) {
-                List<OutputMessage> outputs = runner.feedBatchI1(
-                        pipelineId, timestamps, columns);
+                List<OutputMessage> outputs = useBuffer
+                        ? runner.feedBufferI1(pipelineId, timestamps, columns)
+                        : runner.feedBatchI1(pipelineId, timestamps, columns);
                 for (OutputMessage out : outputs) {
                     appendAndPropagate(dependent, out.timestamp, out.values);
                 }

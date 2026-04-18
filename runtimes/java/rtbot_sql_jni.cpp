@@ -936,6 +936,81 @@ Java_dev_rtbot_sql_RtBotSqlCompiler_feedPipelineBatchI1(JNIEnv* env, jclass,
   }
 }
 
+// Raw-buffer feed path — hands a flat row-major double buffer + parallel
+// timestamps to Program::receive_buffer, skipping per-row Message allocation.
+// Takes the same columnar Java arrays as feedPipelineBatchI1, but the hot
+// path on the C++ side reads the row span directly (no shared_ptr<vector>
+// per message), which is what BurstAggregate's override consumes.
+JNIEXPORT jstring JNICALL
+Java_dev_rtbot_sql_RtBotSqlCompiler_feedPipelineBufferI1(JNIEnv* env, jclass,
+                                                          jlong handle,
+                                                          jlongArray timestamps,
+                                                          jobjectArray columns) {
+  try {
+    auto* program = reinterpret_cast<rtbot::Program*>(handle);
+    if (!program) {
+      throw_runtime_exception(env, "feedPipelineBufferI1: null pipeline handle");
+      return nullptr;
+    }
+    if (!timestamps || !columns) {
+      throw_runtime_exception(env, "feedPipelineBufferI1: null input array");
+      return nullptr;
+    }
+
+    const jsize n = env->GetArrayLength(timestamps);
+    const jsize num_cols = env->GetArrayLength(columns);
+
+    std::vector<jdoubleArray> col_refs(num_cols);
+    std::vector<jdouble*> col_elems(num_cols);
+    for (jsize c = 0; c < num_cols; ++c) {
+      col_refs[c] = static_cast<jdoubleArray>(env->GetObjectArrayElement(columns, c));
+      if (!col_refs[c] || env->GetArrayLength(col_refs[c]) != n) {
+        for (jsize j = 0; j < c; ++j) {
+          env->ReleaseDoubleArrayElements(col_refs[j], col_elems[j], JNI_ABORT);
+        }
+        throw_runtime_exception(env, "feedPipelineBufferI1: column array null or length mismatch");
+        return nullptr;
+      }
+      col_elems[c] = env->GetDoubleArrayElements(col_refs[c], nullptr);
+    }
+
+    jlong* ts_elems = env->GetLongArrayElements(timestamps, nullptr);
+
+    // Transpose column-major Java arrays into a row-major C++ buffer so the
+    // operator's receive_data_buffer can stream over contiguous rows.
+    std::vector<double> rows(static_cast<std::size_t>(n) *
+                              static_cast<std::size_t>(num_cols));
+    for (jsize i = 0; i < n; ++i) {
+      for (jsize c = 0; c < num_cols; ++c) {
+        rows[static_cast<std::size_t>(i) * num_cols + c] =
+            static_cast<double>(col_elems[c][i]);
+      }
+    }
+
+    static_assert(sizeof(jlong) == sizeof(rtbot::timestamp_t),
+                  "jlong vs timestamp_t mismatch");
+    auto* times = reinterpret_cast<const rtbot::timestamp_t*>(ts_elems);
+
+    auto batch = program->receive_buffer("i1", rows.data(),
+                                           static_cast<std::size_t>(n),
+                                           static_cast<std::size_t>(num_cols),
+                                           times);
+
+    env->ReleaseLongArrayElements(timestamps, ts_elems, JNI_ABORT);
+    for (jsize c = 0; c < num_cols; ++c) {
+      env->ReleaseDoubleArrayElements(col_refs[c], col_elems[c], JNI_ABORT);
+    }
+
+    if (is_batch_empty(batch)) return nullptr;
+    std::string json_out = batch_to_json(batch);
+    return std_to_jstring(env, json_out);
+  } catch (const std::exception& e) {
+    throw_runtime_exception(
+        env, std::string("feedPipelineBufferI1: ") + e.what());
+    return nullptr;
+  }
+}
+
 JNIEXPORT void JNICALL
 Java_dev_rtbot_sql_RtBotSqlCompiler_resetNativeFeedStats(JNIEnv* env,
                                                           jclass) {

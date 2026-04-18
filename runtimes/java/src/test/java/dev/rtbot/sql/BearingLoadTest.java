@@ -113,6 +113,8 @@ public class BearingLoadTest {
                 System.getProperty("rtbot.benchmark.profile", "false"));
             boolean batch = Boolean.parseBoolean(
                 System.getProperty("rtbot.benchmark.batch", "false"));
+            boolean buffer = Boolean.parseBoolean(
+                System.getProperty("rtbot.benchmark.buffer", "false"));
             AtomicLong rmsCount = new AtomicLong(0);
             AtomicLong kurtosisCount = new AtomicLong(0);
             AtomicLong rawCount = new AtomicLong(0);
@@ -149,7 +151,9 @@ public class BearingLoadTest {
             System.out.printf("Pipeline: vibration_raw -> vibration_moments (VIEW)%n");
             System.out.printf("          -> rms_trend + kurtosis_trend (MAT VIEWs)%n");
             System.out.println("Mode: SUBSCRIPTION (nothing stored, output to subscribers only)");
-            System.out.printf("Feed mode: %s%n", batch ? "BATCH insertBatch" : "ROW insert3");
+            System.out.printf("Feed mode: %s%n",
+                    buffer ? "BUFFER insertBuffer"
+                           : (batch ? "BATCH insertBatch" : "ROW insert3"));
             System.out.println("----------------------------------------------------------------");
             System.out.printf("  %6s  %10s  %12s  %10s%n",
                               "Burst", "Msgs", "Msgs/sec", "Heap MB");
@@ -162,7 +166,7 @@ public class BearingLoadTest {
             for (int burstIdx = 0; burstIdx < NUM_BURSTS; burstIdx++) {
                 for (int bearingId = 1; bearingId <= NUM_BEARINGS; bearingId++) {
                     double[] amps = generateBurstAmplitudes(SAMPLES_PER_BURST);
-                    if (batch) {
+                    if (batch || buffer) {
                         int batchSize = SAMPLES_PER_BURST + 1;
                         long[] tsBatch = new long[batchSize];
                         double[] v0Batch = new double[batchSize];
@@ -178,8 +182,13 @@ public class BearingLoadTest {
                         v0Batch[SAMPLES_PER_BURST] = (double) bearingId;
                         v1Batch[SAMPLES_PER_BURST] = 1.0;
                         v2Batch[SAMPLES_PER_BURST] = 0.0;
-                        runtime.insertBatch("vibration_raw", tsBatch,
-                                new double[][] { v0Batch, v1Batch, v2Batch });
+                        if (buffer) {
+                            runtime.insertBuffer("vibration_raw", tsBatch,
+                                    new double[][] { v0Batch, v1Batch, v2Batch });
+                        } else {
+                            runtime.insertBatch("vibration_raw", tsBatch,
+                                    new double[][] { v0Batch, v1Batch, v2Batch });
+                        }
                         totalMessages += batchSize;
                     } else {
                         // Data samples
