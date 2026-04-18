@@ -865,24 +865,27 @@ TEST_F(CompilerIntegrationTest, MixedGroupByProducesKeyedView) {
       << "Mixed GROUP BY should produce KEYED view";
   EXPECT_EQ(r.key_index, 0);
 
-  // Verify KeyedPipeline with nested Pipeline in the program
+  // Verify KeyedPipeline with either nested Pipeline (legacy path) or a
+  // BurstAggregate inside the prototype (collapsed path when the aggregate
+  // bytecode is windowless).
   auto program = json::parse(r.program_json);
   bool has_keyed_pipeline = false;
   bool has_nested_pipeline = false;
+  bool has_nested_burst = false;
   for (const auto& op : program["operators"]) {
     if (op["type"] == "KeyedPipeline") {
       has_keyed_pipeline = true;
-      // Check that prototype contains a Pipeline
       if (op.contains("prototype") && op["prototype"].contains("operators")) {
         for (const auto& proto_op : op["prototype"]["operators"]) {
           if (proto_op["type"] == "Pipeline") has_nested_pipeline = true;
+          if (proto_op["type"] == "BurstAggregate") has_nested_burst = true;
         }
       }
     }
   }
   EXPECT_TRUE(has_keyed_pipeline) << "should have KeyedPipeline";
-  EXPECT_TRUE(has_nested_pipeline)
-      << "KeyedPipeline prototype should contain Pipeline";
+  EXPECT_TRUE(has_nested_pipeline || has_nested_burst)
+      << "KeyedPipeline prototype should contain Pipeline or BurstAggregate";
 }
 
 // --- Segment-only HAVING → post-Pipeline filter ---
@@ -944,33 +947,31 @@ TEST_F(CompilerIntegrationTest, CompositeKeysWithSegmentExpression) {
   EXPECT_EQ(r.view_type, ViewType::KEYED)
       << "Composite keys + segment should produce KEYED view";
 
-  // Verify KeyedPipeline with computed key and nested Pipeline in the program
+  // Verify KeyedPipeline with either nested Pipeline (legacy path) or a
+  // BurstAggregate inside the prototype (collapsed path).
   auto program = json::parse(r.program_json);
   bool has_keyed_pipeline = false;
   bool has_nested_pipeline = false;
+  bool has_nested_burst = false;
   for (const auto& op : program["operators"]) {
     EXPECT_NE(op["type"], "Linear")
         << "Linear should NOT be in outer graph (computed key mode)";
     if (op["type"] == "KeyedPipeline") {
       has_keyed_pipeline = true;
-      // Computed key mode: has keyColumnIndices, no key_index or keyCoefficients
-      EXPECT_FALSE(op.contains("key_index"))
-          << "Computed key mode should not have key_index";
-      EXPECT_TRUE(op.contains("keyColumnIndices"))
-          << "KeyedPipeline should have keyColumnIndices";
-      EXPECT_FALSE(op.contains("keyCoefficients"))
-          << "keyCoefficients should not be in JSON (computed internally by operator)";
-      // Check that prototype contains a Pipeline
+      EXPECT_FALSE(op.contains("key_index"));
+      EXPECT_TRUE(op.contains("keyColumnIndices"));
+      EXPECT_FALSE(op.contains("keyCoefficients"));
       if (op.contains("prototype") && op["prototype"].contains("operators")) {
         for (const auto& proto_op : op["prototype"]["operators"]) {
           if (proto_op["type"] == "Pipeline") has_nested_pipeline = true;
+          if (proto_op["type"] == "BurstAggregate") has_nested_burst = true;
         }
       }
     }
   }
   EXPECT_TRUE(has_keyed_pipeline) << "should have KeyedPipeline";
-  EXPECT_TRUE(has_nested_pipeline)
-      << "KeyedPipeline prototype should contain Pipeline";
+  EXPECT_TRUE(has_nested_pipeline || has_nested_burst)
+      << "KeyedPipeline prototype should contain Pipeline or BurstAggregate";
 
   // Field map: computed key mode outputs directly (no VectorProject), 0-based
   EXPECT_EQ(r.field_map.at("device_id"), 0);

@@ -2815,13 +2815,17 @@ int json_count_operator_type(const json& node,
 }
 
 bool json_contains_fused_aggregate_operator(const json& node) {
+  // BurstAggregate collapses FEV+Pipeline into one operator but carries the
+  // same fused-bytecode aggregate semantics, so we accept it here too.
   return json_contains_operator_type(node, "FusedExpression") ||
-         json_contains_operator_type(node, "FusedExpressionVector");
+         json_contains_operator_type(node, "FusedExpressionVector") ||
+         json_contains_operator_type(node, "BurstAggregate");
 }
 
 int json_count_fused_aggregate_operators(const json& node) {
   return json_count_operator_type(node, "FusedExpression") +
-         json_count_operator_type(node, "FusedExpressionVector");
+         json_count_operator_type(node, "FusedExpressionVector") +
+         json_count_operator_type(node, "BurstAggregate");
 }
 
 // ---------------------------------------------------------------------------

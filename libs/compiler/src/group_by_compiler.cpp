@@ -4,6 +4,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "rtbot/fuse/FusedBytecode.h"
 #include "rtbot_sql/compiler/expr_cache.h"
 #include "rtbot_sql/compiler/expression_compiler.h"
 #include "rtbot_sql/compiler/where_compiler.h"
@@ -429,8 +430,16 @@ SelectResult compile_group_by(
 
     // --- Attempt fused aggregate path for inner prototype ---
     // Replaces the per-aggregate operator chains + VectorCompose with a single
-    // FusedExpression bytecode interpreter.
+    // FusedExpression bytecode interpreter. When the aggregate bytecode has
+    // no windowed opcodes and the surrounding group-by has a segment
+    // expression, we additionally try to collapse the inner FEV + outer
+    // Pipeline into a single BurstAggregate operator (Phase C).
     bool inner_fused = false;
+    bool use_burst_aggregate = false;
+    std::vector<double> burst_agg_bytecode;
+    std::vector<double> burst_agg_constants;
+    std::vector<std::size_t> burst_key_columns;
+    std::size_t burst_num_agg_outputs = 0;
     if (std::getenv("RTBOT_DISABLE_FUSION") == nullptr) {
       std::map<std::pair<std::string, int>, int> column_to_input;
       std::vector<double> constants;
@@ -438,6 +447,13 @@ SelectResult compile_group_by(
       AggBytecodeContext agg_ctx;
       bool all_fusable = true;
       size_t num_outputs = 0;
+
+      // Separate aggregate-only bytecode for the BurstAggregate path — it
+      // expresses keys through the `key_columns` constructor parameter rather
+      // than inline INPUT/END pairs, so we compile aggregates without the key
+      // prefix that the FEV path uses.
+      std::vector<double> agg_only_bytecode;
+      size_t agg_only_num_outputs = 0;
 
       // For composite keys: emit INPUT binding.index, END per key column
       // so the fused operator passes key values through to the output vector.
@@ -451,9 +467,11 @@ SelectResult compile_group_by(
           all_bytecode.push_back(20.0);  // fused_op::END
           field_names.push_back(ki.name);
           ++num_outputs;
+          burst_key_columns.push_back(static_cast<std::size_t>(binding->index));
         }
       } else {
         field_names.push_back(keys[0].name);
+        burst_key_columns.push_back(static_cast<std::size_t>(keys[0].index));
       }
 
       // Compile aggregate expressions to bytecode
@@ -469,19 +487,44 @@ SelectResult compile_group_by(
           auto bc = compile_aggregate_expression_to_bytecode(
               select_item.expr, scope, column_to_input, constants, agg_ctx);
           if (!bc.success) { all_fusable = false; break; }
+          // Shared compilation output: append to both the FEV-keyed stream
+          // (all_bytecode) and the BurstAggregate-only stream (agg_only).
           all_bytecode.insert(all_bytecode.end(), bc.bytecode.begin(), bc.bytecode.end());
+          agg_only_bytecode.insert(agg_only_bytecode.end(), bc.bytecode.begin(), bc.bytecode.end());
           field_names.push_back(
               select_item.alias.value_or(default_alias(select_item.expr)));
           ++num_outputs;
+          ++agg_only_num_outputs;
         }
         if (all_fusable) {
           remap_input_args_to_column_indices(all_bytecode, aggregate_bytecode_start,
+                                             column_to_input);
+          remap_input_args_to_column_indices(agg_only_bytecode, /*start=*/0,
                                              column_to_input);
         }
       }
 
       if (all_fusable && num_outputs > 0) {
         inner_fused = true;
+
+        // BurstAggregate eligibility check: the aggregate bytecode must
+        // contain no windowed opcodes (35-43). Those require per-sample state
+        // that BurstAggregate's emit-on-segment semantics don't handle.
+        bool has_windowed = false;
+        for (std::size_t pc = 0; pc < agg_only_bytecode.size();) {
+          const auto op = static_cast<std::uint8_t>(agg_only_bytecode[pc++]);
+          if (op >= 35 && op <= 43) {
+            has_windowed = true;
+            break;
+          }
+          pc += rtbot::fuse::inline_arg_count(op);
+        }
+        if (!has_windowed) {
+          use_burst_aggregate = true;
+          burst_agg_bytecode = std::move(agg_only_bytecode);
+          burst_agg_constants = constants;
+          burst_num_agg_outputs = agg_only_num_outputs;
+        }
 
         // Emit FusedExpressionVector (single vector input)
         auto fused_id = inner_proto_builder.next_id("fused");
@@ -552,6 +595,104 @@ SelectResult compile_group_by(
       inner_proto_builder.connect({inner_compose_id, "o1"}, {"proto_out", "i1"});
     }
 
+    // Compile segment expression to bytecode up-front so we can reuse the
+    // result for both the BurstAggregate and Pipeline+FEV paths.
+    auto seg_result = compile_segment_to_bytecode(*segment_expr, scope, "");
+
+    // --- BurstAggregate fast path ---
+    // Single operator covering aggregate + segment detection. Inner/outer
+    // prototype distinction collapses into one prototype wrapped by
+    // KeyedPipeline. Only fires when the aggregate eligibility check above
+    // passed and the segment predicate also compiled.
+    if (use_burst_aggregate && seg_result.success) {
+      // Derive num_input_cols from the max INPUT index referenced in either
+      // the aggregate or segment bytecode.
+      std::size_t max_input_idx = 0;
+      auto scan_max_input = [&](const std::vector<double>& bc) {
+        for (std::size_t pc = 0; pc < bc.size();) {
+          const auto op = static_cast<std::uint8_t>(bc[pc++]);
+          const std::size_t n = rtbot::fuse::inline_arg_count(op);
+          if (op == 0 /* INPUT */ && n >= 1) {
+            const auto idx = static_cast<std::size_t>(bc[pc]);
+            if (idx + 1 > max_input_idx) max_input_idx = idx + 1;
+          }
+          pc += n;
+        }
+      };
+      scan_max_input(burst_agg_bytecode);
+      scan_max_input(seg_result.bytecode);
+      for (auto k : burst_key_columns) {
+        if (k + 1 > max_input_idx) max_input_idx = k + 1;
+      }
+
+      GraphBuilder burst_proto_builder;
+      burst_proto_builder.add_operator("proto_in", "Input");
+      auto burst_id = burst_proto_builder.next_id("burst");
+
+      std::map<std::string, std::vector<double>> burst_double_params = {
+          {"aggBytecode", burst_agg_bytecode},
+          {"segBytecode", seg_result.bytecode}};
+      if (!burst_agg_constants.empty()) {
+        burst_double_params["aggConstants"] = burst_agg_constants;
+      }
+      if (!seg_result.constants.empty()) {
+        burst_double_params["segConstants"] = seg_result.constants;
+      }
+
+      // In single-key mode KeyedPipeline prepends the key to the prototype
+      // output itself, so BurstAggregate should emit aggregates only. In
+      // composite (computed-key) mode the prototype output is the final
+      // output, so BurstAggregate must prepend key columns.
+      std::map<std::string, std::vector<int>> burst_int_params;
+      std::vector<int> key_cols_int;
+      if (composite) {
+        key_cols_int.reserve(burst_key_columns.size());
+        for (auto k : burst_key_columns) {
+          key_cols_int.push_back(static_cast<int>(k));
+        }
+      }
+      burst_int_params["keyColumns"] = std::move(key_cols_int);
+
+      burst_proto_builder.add_operator(
+          burst_id, "BurstAggregate",
+          {{"numAggOutputs", static_cast<double>(burst_num_agg_outputs)},
+           {"numInputCols", static_cast<double>(max_input_idx)}},
+          {},  // no string params
+          burst_double_params, burst_int_params);
+      burst_proto_builder.connect({"proto_in", "o1"}, {burst_id, "i1"});
+      burst_proto_builder.add_operator("proto_out", "Output");
+      burst_proto_builder.connect({burst_id, "o1"}, {"proto_out", "i1"});
+
+      auto burst_proto_id = builder.next_id("proto");
+      PrototypeDef burst_proto_def;
+      burst_proto_def.id = burst_proto_id;
+      burst_proto_def.entry_id = "proto_in";
+      burst_proto_def.output_id = "proto_out";
+      burst_proto_def.operators = burst_proto_builder.operators();
+      burst_proto_def.connections = burst_proto_builder.connections();
+      builder.add_prototype(burst_proto_def);
+
+      auto keyed_id = builder.next_id("keyed");
+      if (composite) {
+        builder.add_operator(keyed_id, "KeyedPipeline",
+                             {},
+                             {{"prototype", burst_proto_id}},
+                             {},
+                             {{"keyColumnIndices", key_column_indices}});
+      } else {
+        builder.add_operator(keyed_id, "KeyedPipeline",
+                             {{"key_index", static_cast<double>(keys[0].index)}},
+                             {{"prototype", burst_proto_id}});
+      }
+      builder.connect(keyed_input, {keyed_id, "i1"});
+
+      FieldMap field_map;
+      for (size_t i = 0; i < field_names.size(); ++i) {
+        field_map[field_names[i]] = static_cast<int>(i);
+      }
+      return {{keyed_id, "o1"}, field_map, /*is_segment_only=*/false};
+    }
+
     auto inner_proto_id = builder.next_id("proto");
     PrototypeDef inner_proto_def;
     inner_proto_def.id = inner_proto_id;
@@ -565,9 +706,6 @@ SelectResult compile_group_by(
     GraphBuilder outer_proto_builder;
     Endpoint outer_input_ep{"proto_in", "o1"};
     outer_proto_builder.add_operator("proto_in", "Input");
-
-    // Try bytecode path for segment expression first
-    auto seg_result = compile_segment_to_bytecode(*segment_expr, scope, "");
 
     auto pipeline_id = outer_proto_builder.next_id("pipeline");
     if (seg_result.success) {

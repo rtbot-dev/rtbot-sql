@@ -819,88 +819,113 @@ TEST_F(SegmentGroupByTest, MixedGroupBy) {
   }
   EXPECT_TRUE(has_keyed) << "Expected KeyedPipeline in outer graph";
 
-  // Should have 2 prototypes: one for KeyedPipeline (outer), one for Pipeline (inner)
-  EXPECT_EQ(builder.prototypes().size(), 2u);
-
-  // Find the outer prototype (the one containing a Pipeline operator)
-  const PrototypeDef* outer_proto = nullptr;
-  const PrototypeDef* inner_proto = nullptr;
+  // Two valid shapes depending on whether the planner picked the
+  // BurstAggregate fast path (single prototype with a BurstAggregate op) or
+  // the legacy Pipeline+FEV path (two prototypes: outer with Pipeline, inner
+  // with FEV). Either is correct — BurstAggregate collapses the inner/outer
+  // distinction when the aggregate bytecode has no windowed opcodes.
+  bool has_burst_aggregate = false;
   for (const auto& proto : builder.prototypes()) {
-    bool has_pipeline = false;
     for (const auto& op : proto.operators) {
-      if (op.type == "Pipeline") has_pipeline = true;
-    }
-    if (has_pipeline) {
-      outer_proto = &proto;
-    } else {
-      inner_proto = &proto;
-    }
-  }
-  ASSERT_NE(outer_proto, nullptr) << "One prototype should contain a Pipeline";
-  ASSERT_NE(inner_proto, nullptr) << "One prototype should be the inner aggregate";
-
-  // Outer prototype: segment expression is compiled to bytecode.
-  // No Abs/CompareGT/BooleanToNumber operators — Pipeline has segmentBytecode.
-  bool proto_has_pipeline = false;
-  for (const auto& op : outer_proto->operators) {
-    EXPECT_NE(op.type, "Abs")
-        << "Abs should NOT be in outer prototype (bytecode path)";
-    EXPECT_NE(op.type, "CompareGT")
-        << "CompareGT should NOT be in outer prototype (bytecode path)";
-    EXPECT_NE(op.type, "BooleanToNumber")
-        << "BooleanToNumber should NOT be in outer prototype (bytecode path)";
-    if (op.type == "Pipeline") proto_has_pipeline = true;
-  }
-  EXPECT_TRUE(proto_has_pipeline) << "Outer prototype should have Pipeline";
-
-  // Pipeline in outer prototype should have segmentBytecode/segmentConstants
-  for (const auto& op : outer_proto->operators) {
-    if (op.type == "Pipeline") {
-      EXPECT_TRUE(op.double_array_params.count("segmentBytecode"))
-          << "Pipeline should have segmentBytecode";
-      EXPECT_TRUE(op.double_array_params.count("segmentConstants"))
-          << "Pipeline should have segmentConstants";
-      EXPECT_FALSE(op.double_array_params.at("segmentBytecode").empty())
-          << "segmentBytecode should not be empty";
+      if (op.type == "BurstAggregate") has_burst_aggregate = true;
     }
   }
 
-  // No c1 connections to Pipeline in outer prototype (bytecode replaces control port)
-  for (const auto& conn : outer_proto->connections) {
-    if (conn.to_port == "c1") {
-      for (const auto& op : outer_proto->operators) {
-        if (op.id == conn.to_id && op.type == "Pipeline") {
-          ADD_FAILURE() << "Pipeline should NOT have a c1 connection (bytecode path)";
-        }
+  if (has_burst_aggregate) {
+    EXPECT_EQ(builder.prototypes().size(), 1u)
+        << "BurstAggregate path should collapse to one prototype";
+    const auto& proto = builder.prototypes().front();
+    bool has_burst = false;
+    for (const auto& op : proto.operators) {
+      EXPECT_NE(op.type, "Abs");
+      EXPECT_NE(op.type, "CompareGT");
+      EXPECT_NE(op.type, "BooleanToNumber");
+      EXPECT_NE(op.type, "Pipeline");
+      if (op.type == "BurstAggregate") {
+        has_burst = true;
+        EXPECT_TRUE(op.double_array_params.count("aggBytecode"));
+        EXPECT_TRUE(op.double_array_params.count("segBytecode"));
+        EXPECT_FALSE(op.double_array_params.at("aggBytecode").empty());
+        EXPECT_FALSE(op.double_array_params.at("segBytecode").empty());
+      }
+    }
+    EXPECT_TRUE(has_burst);
+  } else {
+    EXPECT_EQ(builder.prototypes().size(), 2u);
+    const PrototypeDef* outer_proto = nullptr;
+    const PrototypeDef* inner_proto = nullptr;
+    for (const auto& proto : builder.prototypes()) {
+      bool has_pipeline = false;
+      for (const auto& op : proto.operators) {
+        if (op.type == "Pipeline") has_pipeline = true;
+      }
+      if (has_pipeline) outer_proto = &proto;
+      else inner_proto = &proto;
+    }
+    ASSERT_NE(outer_proto, nullptr);
+    ASSERT_NE(inner_proto, nullptr);
+
+    bool proto_has_pipeline = false;
+    for (const auto& op : outer_proto->operators) {
+      EXPECT_NE(op.type, "Abs");
+      EXPECT_NE(op.type, "CompareGT");
+      EXPECT_NE(op.type, "BooleanToNumber");
+      if (op.type == "Pipeline") proto_has_pipeline = true;
+    }
+    EXPECT_TRUE(proto_has_pipeline);
+
+    for (const auto& op : outer_proto->operators) {
+      if (op.type == "Pipeline") {
+        EXPECT_TRUE(op.double_array_params.count("segmentBytecode"));
+        EXPECT_TRUE(op.double_array_params.count("segmentConstants"));
+        EXPECT_FALSE(op.double_array_params.at("segmentBytecode").empty());
       }
     }
   }
 
-  // Inner prototype: with fusion → FusedExpressionVector; without → CumulativeSum + CountNumber + VectorCompose
-  bool has_cumsum = false, has_count = false, has_compose = false;
-  bool has_fused_vector = false, has_fused_scalar = false;
-  int extract_count = 0;
-  for (const auto& op : inner_proto->operators) {
-    if (op.type == "CumulativeSum") has_cumsum = true;
-    if (op.type == "CountNumber") has_count = true;
-    if (op.type == "VectorExtract") extract_count++;
-    if (op.type == "VectorCompose") {
-      has_compose = true;
-      EXPECT_EQ(op.params.at("numPorts"), 2.0);  // total + cnt
+  // Inner-prototype shape check (only applies when BurstAggregate didn't
+  // collapse the two prototypes into one).
+  if (!has_burst_aggregate) {
+    const PrototypeDef* outer_proto = nullptr;
+    const PrototypeDef* inner_proto = nullptr;
+    for (const auto& proto : builder.prototypes()) {
+      bool has_pipeline = false;
+      for (const auto& op : proto.operators) {
+        if (op.type == "Pipeline") has_pipeline = true;
+      }
+      if (has_pipeline) outer_proto = &proto;
+      else inner_proto = &proto;
     }
-    if (op.type == "FusedExpressionVector") {
-      has_fused_vector = true;
-      EXPECT_EQ(op.params.at("numOutputs"), 2.0);  // total + cnt
+    for (const auto& conn : outer_proto->connections) {
+      if (conn.to_port == "c1") {
+        for (const auto& op : outer_proto->operators) {
+          if (op.id == conn.to_id && op.type == "Pipeline") {
+            ADD_FAILURE()
+                << "Pipeline should NOT have a c1 connection (bytecode path)";
+          }
+        }
+      }
     }
-    if (op.type == "FusedExpression") has_fused_scalar = true;
-  }
-  EXPECT_TRUE(has_fused_vector || (has_cumsum && has_count && has_compose))
-      << "Inner prototype should have FusedExpressionVector or CumulativeSum+CountNumber+VectorCompose";
-  EXPECT_FALSE(has_fused_scalar)
-      << "Inner prototype should use FusedExpressionVector for vector input fusion";
-  if (has_fused_vector) {
-    EXPECT_EQ(extract_count, 0)
-        << "FusedExpressionVector path should not emit VectorExtract operators";
+    bool has_cumsum = false, has_count = false, has_compose = false;
+    bool has_fused_vector = false, has_fused_scalar = false;
+    int extract_count = 0;
+    for (const auto& op : inner_proto->operators) {
+      if (op.type == "CumulativeSum") has_cumsum = true;
+      if (op.type == "CountNumber") has_count = true;
+      if (op.type == "VectorExtract") extract_count++;
+      if (op.type == "VectorCompose") {
+        has_compose = true;
+        EXPECT_EQ(op.params.at("numPorts"), 2.0);  // total + cnt
+      }
+      if (op.type == "FusedExpressionVector") {
+        has_fused_vector = true;
+        EXPECT_EQ(op.params.at("numOutputs"), 2.0);  // total + cnt
+      }
+      if (op.type == "FusedExpression") has_fused_scalar = true;
+    }
+    EXPECT_TRUE(has_fused_vector || (has_cumsum && has_count && has_compose));
+    EXPECT_FALSE(has_fused_scalar);
+    if (has_fused_vector) EXPECT_EQ(extract_count, 0);
   }
 
   // Field map: device_id=0, total=1, cnt=2
@@ -966,97 +991,84 @@ TEST_F(SegmentGroupByTest, CompositeKeysWithSegmentExpression) {
   }
   EXPECT_TRUE(has_keyed) << "Expected KeyedPipeline in outer graph";
 
-  // Should have 2 prototypes: outer (segment + Pipeline) and inner (aggregates)
-  EXPECT_EQ(builder.prototypes().size(), 2u);
-
-  // Find the outer prototype (contains Pipeline) and inner prototype
-  const PrototypeDef* outer_proto = nullptr;
-  const PrototypeDef* inner_proto = nullptr;
+  // Either BurstAggregate (single prototype) or legacy Pipeline+FEV
+  // (two prototypes with outer Pipeline + inner aggregate) — both are valid.
+  bool has_burst_aggregate = false;
   for (const auto& proto : builder.prototypes()) {
-    bool has_pipeline = false;
     for (const auto& op : proto.operators) {
-      if (op.type == "Pipeline") has_pipeline = true;
-    }
-    if (has_pipeline) {
-      outer_proto = &proto;
-    } else {
-      inner_proto = &proto;
+      if (op.type == "BurstAggregate") has_burst_aggregate = true;
     }
   }
-  ASSERT_NE(outer_proto, nullptr) << "One prototype should contain a Pipeline";
-  ASSERT_NE(inner_proto, nullptr) << "One prototype should be the inner aggregate";
-
-  // Outer prototype: segment expression compiled to bytecode.
-  // No Abs/CompareGT/BooleanToNumber operators — Pipeline has segmentBytecode.
-  bool proto_has_pipeline = false;
-  for (const auto& op : outer_proto->operators) {
-    EXPECT_NE(op.type, "Abs")
-        << "Abs should NOT be in outer prototype (bytecode path)";
-    EXPECT_NE(op.type, "CompareGT")
-        << "CompareGT should NOT be in outer prototype (bytecode path)";
-    EXPECT_NE(op.type, "BooleanToNumber")
-        << "BooleanToNumber should NOT be in outer prototype (bytecode path)";
-    if (op.type == "Pipeline") proto_has_pipeline = true;
-  }
-  EXPECT_TRUE(proto_has_pipeline) << "Outer prototype should have Pipeline";
-
-  // Pipeline in outer prototype should have segmentBytecode/segmentConstants
-  for (const auto& op : outer_proto->operators) {
-    if (op.type == "Pipeline") {
-      EXPECT_TRUE(op.double_array_params.count("segmentBytecode"))
-          << "Pipeline should have segmentBytecode";
-      EXPECT_TRUE(op.double_array_params.count("segmentConstants"))
-          << "Pipeline should have segmentConstants";
-      EXPECT_FALSE(op.double_array_params.at("segmentBytecode").empty())
-          << "segmentBytecode should not be empty";
+  if (has_burst_aggregate) {
+    EXPECT_EQ(builder.prototypes().size(), 1u);
+    const auto& proto = builder.prototypes().front();
+    bool has_burst = false;
+    for (const auto& op : proto.operators) {
+      if (op.type == "BurstAggregate") has_burst = true;
     }
-  }
-
-  // No c1 connections to Pipeline in outer prototype (bytecode path)
-  for (const auto& conn : outer_proto->connections) {
-    if (conn.to_port == "c1") {
-      for (const auto& op : outer_proto->operators) {
-        if (op.id == conn.to_id && op.type == "Pipeline") {
-          ADD_FAILURE() << "Pipeline should NOT have a c1 connection (bytecode path)";
+    EXPECT_TRUE(has_burst);
+  } else {
+    EXPECT_EQ(builder.prototypes().size(), 2u);
+    const PrototypeDef* outer_proto = nullptr;
+    const PrototypeDef* inner_proto = nullptr;
+    for (const auto& proto : builder.prototypes()) {
+      bool has_pipeline = false;
+      for (const auto& op : proto.operators) {
+        if (op.type == "Pipeline") has_pipeline = true;
+      }
+      if (has_pipeline) outer_proto = &proto;
+      else inner_proto = &proto;
+    }
+    ASSERT_NE(outer_proto, nullptr);
+    ASSERT_NE(inner_proto, nullptr);
+    bool proto_has_pipeline = false;
+    for (const auto& op : outer_proto->operators) {
+      EXPECT_NE(op.type, "Abs");
+      EXPECT_NE(op.type, "CompareGT");
+      EXPECT_NE(op.type, "BooleanToNumber");
+      if (op.type == "Pipeline") proto_has_pipeline = true;
+    }
+    EXPECT_TRUE(proto_has_pipeline);
+    for (const auto& op : outer_proto->operators) {
+      if (op.type == "Pipeline") {
+        EXPECT_TRUE(op.double_array_params.count("segmentBytecode"));
+        EXPECT_TRUE(op.double_array_params.count("segmentConstants"));
+        EXPECT_FALSE(op.double_array_params.at("segmentBytecode").empty());
+      }
+    }
+    for (const auto& conn : outer_proto->connections) {
+      if (conn.to_port == "c1") {
+        for (const auto& op : outer_proto->operators) {
+          if (op.id == conn.to_id && op.type == "Pipeline") {
+            ADD_FAILURE()
+                << "Pipeline should NOT have a c1 connection (bytecode path)";
+          }
         }
       }
     }
+    bool has_cumsum = false, has_count = false, has_compose = false;
+    bool has_fused_vector = false, has_fused_scalar = false;
+    int extract_count = 0;
+    for (const auto& op : inner_proto->operators) {
+      if (op.type == "CumulativeSum") has_cumsum = true;
+      if (op.type == "CountNumber") has_count = true;
+      if (op.type == "VectorExtract") extract_count++;
+      if (op.type == "VectorCompose") {
+        has_compose = true;
+        EXPECT_EQ(op.params.at("numPorts"), 4.0);
+      }
+      if (op.type == "FusedExpressionVector") {
+        has_fused_vector = true;
+        EXPECT_EQ(op.params.at("numOutputs"), 4.0);
+      }
+      if (op.type == "FusedExpression") has_fused_scalar = true;
+    }
+    EXPECT_TRUE(has_fused_vector || (has_cumsum && has_count && has_compose));
+    EXPECT_FALSE(has_fused_scalar);
+    if (has_fused_vector) EXPECT_EQ(extract_count, 0);
+    else EXPECT_GE(extract_count, 1);
   }
 
-  // Inner prototype: with fusion → FusedExpressionVector; without → key extracts + CumulativeSum + CountNumber + VectorCompose
-  bool has_cumsum = false, has_count = false, has_compose = false;
-  bool has_fused_vector = false, has_fused_scalar = false;
-  int extract_count = 0;
-  for (const auto& op : inner_proto->operators) {
-    if (op.type == "CumulativeSum") has_cumsum = true;
-    if (op.type == "CountNumber") has_count = true;
-    if (op.type == "VectorExtract") extract_count++;
-    if (op.type == "VectorCompose") {
-      has_compose = true;
-      // 2 key columns + 2 aggregates = 4 ports
-      EXPECT_EQ(op.params.at("numPorts"), 4.0);
-    }
-    if (op.type == "FusedExpressionVector") {
-      has_fused_vector = true;
-      // 2 key columns + 2 aggregates = 4 outputs
-      EXPECT_EQ(op.params.at("numOutputs"), 4.0);
-    }
-    if (op.type == "FusedExpression") has_fused_scalar = true;
-  }
-  EXPECT_TRUE(has_fused_vector || (has_cumsum && has_count && has_compose))
-      << "Inner prototype should have FusedExpressionVector or CumulativeSum+CountNumber+VectorCompose";
-  EXPECT_FALSE(has_fused_scalar)
-      << "Inner prototype should use FusedExpressionVector for vector input fusion";
-  if (has_fused_vector) {
-    EXPECT_EQ(extract_count, 0)
-        << "FusedExpressionVector path should not emit VectorExtract operators";
-  } else {
-    EXPECT_GE(extract_count, 1)
-        << "Fallback path should extract input columns";
-  }
-
-  // Field map: computed key mode outputs directly (no VectorProject), 0-based.
-  // prototype outputs: [device_id, frequency, total, cnt]
   EXPECT_EQ(field_map.at("device_id"), 0);
   EXPECT_EQ(field_map.at("frequency"), 1);
   EXPECT_EQ(field_map.at("total"), 2);
@@ -1135,75 +1147,85 @@ TEST_F(SegmentGroupByTest, MixedGroupByJsonRoundTrip) {
   std::string json_str = builder.to_json();
   auto j = nlohmann::json::parse(json_str);
 
-  // Find KeyedPipeline in JSON — its prototype should be inlined as an object
+  // Find KeyedPipeline and inspect its prototype shape. Either:
+  //   - BurstAggregate path: inlined prototype contains a single BurstAggregate.
+  //   - Legacy path: inlined prototype contains a Pipeline in native format.
   bool found_keyed = false;
+  bool prototype_has_burst = false;
   for (const auto& op : j["operators"]) {
     if (op["type"] == "KeyedPipeline") {
       found_keyed = true;
       ASSERT_TRUE(op.contains("prototype"));
-      ASSERT_TRUE(op["prototype"].is_object())
-          << "KeyedPipeline prototype should be inlined as object";
-
-      // The outer prototype should contain a Pipeline operator in native format
-      // (not with a "prototype" field, but with entryOperator, outputMappings, etc.)
-      bool found_inner_pipeline = false;
+      ASSERT_TRUE(op["prototype"].is_object());
       for (const auto& inner_op : op["prototype"]["operators"]) {
-        if (inner_op["type"] == "Pipeline") {
-          found_inner_pipeline = true;
-          EXPECT_FALSE(inner_op.contains("prototype"))
-              << "Pipeline inside prototype should NOT have 'prototype' field in native format";
-          EXPECT_TRUE(inner_op.contains("input_port_types"))
-              << "Pipeline should have input_port_types";
-          EXPECT_TRUE(inner_op.contains("output_port_types"))
-              << "Pipeline should have output_port_types";
-          EXPECT_TRUE(inner_op.contains("operators"))
-              << "Pipeline should have operators array";
-          EXPECT_TRUE(inner_op.contains("connections"))
-              << "Pipeline should have connections array";
-          EXPECT_TRUE(inner_op.contains("entryOperator"))
-              << "Pipeline should have entryOperator";
-          EXPECT_TRUE(inner_op.contains("outputMappings"))
-              << "Pipeline should have outputMappings";
-        }
+        if (inner_op["type"] == "BurstAggregate") prototype_has_burst = true;
       }
-      EXPECT_TRUE(found_inner_pipeline)
-          << "KeyedPipeline prototype should contain a Pipeline in native format";
+      if (prototype_has_burst) {
+        bool found_burst = false;
+        for (const auto& inner_op : op["prototype"]["operators"]) {
+          if (inner_op["type"] == "BurstAggregate") {
+            found_burst = true;
+            EXPECT_TRUE(inner_op.contains("aggBytecode"));
+            EXPECT_TRUE(inner_op.contains("segBytecode"));
+          }
+        }
+        EXPECT_TRUE(found_burst);
+      } else {
+        bool found_inner_pipeline = false;
+        for (const auto& inner_op : op["prototype"]["operators"]) {
+          if (inner_op["type"] == "Pipeline") {
+            found_inner_pipeline = true;
+            EXPECT_FALSE(inner_op.contains("prototype"));
+            EXPECT_TRUE(inner_op.contains("input_port_types"));
+            EXPECT_TRUE(inner_op.contains("output_port_types"));
+            EXPECT_TRUE(inner_op.contains("operators"));
+            EXPECT_TRUE(inner_op.contains("connections"));
+            EXPECT_TRUE(inner_op.contains("entryOperator"));
+            EXPECT_TRUE(inner_op.contains("outputMappings"));
+          }
+        }
+        EXPECT_TRUE(found_inner_pipeline);
+      }
     }
   }
-  EXPECT_TRUE(found_keyed) << "KeyedPipeline not found in JSON";
+  EXPECT_TRUE(found_keyed);
 
   // Round-trip: deserialize and check structure
   auto [builder2, pre_output] =
       GraphBuilder::from_json_for_augmentation(json_str);
 
-  // builder2 should have KeyedPipeline with a prototype reference
   bool found_keyed2 = false;
   for (const auto& op : builder2.operators()) {
     if (op.type == "KeyedPipeline") {
       found_keyed2 = true;
-      EXPECT_TRUE(op.string_params.count("prototype"))
-          << "KeyedPipeline should have prototype string_param after deser";
+      EXPECT_TRUE(op.string_params.count("prototype"));
     }
   }
   EXPECT_TRUE(found_keyed2);
 
-  // Should have 2 prototypes after round-trip (outer + inner)
-  EXPECT_EQ(builder2.prototypes().size(), 2u)
-      << "Should have 2 prototypes after round-trip (outer KeyedPipeline + inner Pipeline)";
-
-  // The outer prototype should contain a Pipeline referencing the inner prototype
-  bool outer_has_pipeline = false;
-  for (const auto& proto : builder2.prototypes()) {
-    for (const auto& op : proto.operators) {
-      if (op.type == "Pipeline") {
-        outer_has_pipeline = true;
-        EXPECT_TRUE(op.string_params.count("prototype"))
-            << "Pipeline inside prototype should reference inner prototype";
+  if (prototype_has_burst) {
+    EXPECT_EQ(builder2.prototypes().size(), 1u)
+        << "BurstAggregate path has a single prototype after round-trip";
+    bool proto_has_burst = false;
+    for (const auto& proto : builder2.prototypes()) {
+      for (const auto& op : proto.operators) {
+        if (op.type == "BurstAggregate") proto_has_burst = true;
       }
     }
+    EXPECT_TRUE(proto_has_burst);
+  } else {
+    EXPECT_EQ(builder2.prototypes().size(), 2u);
+    bool outer_has_pipeline = false;
+    for (const auto& proto : builder2.prototypes()) {
+      for (const auto& op : proto.operators) {
+        if (op.type == "Pipeline") {
+          outer_has_pipeline = true;
+          EXPECT_TRUE(op.string_params.count("prototype"));
+        }
+      }
+    }
+    EXPECT_TRUE(outer_has_pipeline);
   }
-  EXPECT_TRUE(outer_has_pipeline)
-      << "Outer prototype should contain a Pipeline after round-trip";
 }
 
 // Test: SELECT AVG(value) FROM sensor GROUP BY FLOOR(TS() / 1000000)
