@@ -304,11 +304,12 @@ TEST_F(SessionConsolidationTest, MultiBaseStream) {
 }
 
 // ---------------------------------------------------------------------------
-// Table-JOIN view: still rejected in session mode (table changelog wiring
-// is a follow-up). The error message must be informative.
+// Table-JOIN view: the table name gets its own port on the session Input
+// so INSERT INTO table_name routes through the consolidated Program
+// alongside stream inserts.
 // ---------------------------------------------------------------------------
 
-TEST_F(SessionConsolidationTest, TableJoinRejectedInSession) {
+TEST_F(SessionConsolidationTest, TableJoinInSession) {
   TableSchema instruments;
   instruments.name = "instruments";
   instruments.columns = {{"id", 0}, {"name", 1, ColumnType::TEXT}};
@@ -323,10 +324,19 @@ TEST_F(SessionConsolidationTest, TableJoinRejectedInSession) {
   register_view("v1", r, EntityType::MATERIALIZED_VIEW);
 
   auto s = compile_session_program(catalog);
-  EXPECT_TRUE(s.has_errors());
-  ASSERT_FALSE(s.errors.empty());
-  EXPECT_NE(s.errors[0].message.find("table"), std::string::npos)
-      << "error should mention table join: " << s.errors[0].message;
+  ASSERT_FALSE(s.has_errors())
+      << (s.errors.empty() ? "" : s.errors[0].message);
+
+  // Both the stream and the table have dedicated ports on the shared
+  // session Input.
+  ASSERT_EQ(s.base_stream_inputs.size(), 2u);
+  EXPECT_EQ(s.base_stream_inputs.at("trades"), "input__session");
+  EXPECT_EQ(s.base_stream_inputs.at("instruments"), "input__session");
+  EXPECT_NE(s.base_stream_ports.at("trades"),
+            s.base_stream_ports.at("instruments"));
+
+  ASSERT_EQ(s.materialized_views.size(), 1u);
+  EXPECT_EQ(s.materialized_views[0], "v1");
 }
 
 // ---------------------------------------------------------------------------

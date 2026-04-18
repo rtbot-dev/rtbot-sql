@@ -1090,16 +1090,22 @@ SessionCompilationResult compile_session_program(
     return out;
   }
 
-  // 2. Collect base streams referenced across all views, in a
-  //    deterministic (topo-visit) order. Each distinct base stream gets
-  //    its own port on the shared session Input operator.
+  // 2. Collect external sources referenced across all views, in a
+  //    deterministic (topo-visit) order. Both streams and tables are
+  //    treated as session-level inputs: each gets its own port on the
+  //    shared session Input operator. Views that JOIN a table (whose
+  //    per-view program has a secondary port consuming table changelog
+  //    messages) wire that port to the table's session-level entry, so
+  //    INSERT INTO table_name routes through the same consolidated
+  //    Program as stream inserts.
   std::vector<std::string> base_streams;
   {
     std::set<std::string> seen;
     for (const auto& vname : order) {
       const auto& view = catalog.views.at(vname);
       for (const auto& src : view.source_streams) {
-        if (catalog.streams.count(src) && !seen.count(src)) {
+        if (seen.count(src)) continue;
+        if (catalog.streams.count(src) || catalog.tables.count(src)) {
           seen.insert(src);
           base_streams.push_back(src);
         }
@@ -1170,13 +1176,6 @@ SessionCompilationResult compile_session_program(
       if (view_it != view_terminal.end()) {
         source_endpoints.push_back(view_it->second);
         continue;
-      }
-      if (catalog.tables.count(src)) {
-        out.errors.push_back(
-            {"view '" + vname + "' references table '" + src +
-                 "' — session mode does not yet support table JOINs",
-             -1, -1});
-        return out;
       }
       out.errors.push_back(
           {"view '" + vname + "' references unknown source '" + src + "'",
