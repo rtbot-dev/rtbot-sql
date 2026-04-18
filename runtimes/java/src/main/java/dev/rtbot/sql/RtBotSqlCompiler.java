@@ -137,34 +137,6 @@ public final class RtBotSqlCompiler {
                                                 double v0, double v1, double v2);
 
     /**
-     * Feed a batch of messages on default input port "i1".
-     *
-     * <p>{@code columns} is column-major: {@code columns[c]} is the array of
-     * values for column {@code c}, and all arrays must have the same length as
-     * {@code timestamps}. The native side feeds the full batch in one call via
-     * Program::receive_batch, then returns all produced output messages as JSON.
-     */
-    public static native String feedPipelineBatchI1(
-            long handle,
-            long[] timestamps,
-            double[][] columns);
-
-    /**
-     * Raw-buffer variant of the batched feed. Same Java-side shape as
-     * {@link #feedPipelineBatchI1} (column-major {@code double[][]} plus a
-     * parallel {@code long[]} timestamps array), but the native side skips
-     * per-row {@code Message<VectorNumberData>} allocation and streams the
-     * row span straight into the entry operator via
-     * {@code Program::receive_buffer}. Operators that override
-     * {@code receive_data_buffer} (e.g. BurstAggregate) benefit the most;
-     * other operators fall back to the default per-row Message creation.
-     */
-    public static native String feedPipelineBufferI1(
-            long handle,
-            long[] timestamps,
-            double[][] columns);
-
-    /**
      * Register the ordered list of output operator ids for a consolidated
      * session pipeline. Must be called once after
      * {@link #createPipeline(String)} and before any call to
