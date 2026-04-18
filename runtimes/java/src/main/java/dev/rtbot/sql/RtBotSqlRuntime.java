@@ -49,12 +49,18 @@ public class RtBotSqlRuntime {
     /** source stream name -> set of dependent view names */
     private final Map<String, Set<String>> dependencies = new HashMap<>();
 
-    // -- Consolidated-session state (opt-in) -----------------------------
-    // When enabled, all registered views are compiled into a single
-    // rtbot Program at first insert and inserts route through that
-    // Program's entry Input. Outputs are demuxed by upstream operator id
-    // and forwarded to each view's appendAndPropagate.
-    private boolean useConsolidatedSession = false;
+    // -- Consolidated-session state --------------------------------------
+    // On by default. All registered views are compiled into a single
+    // rtbot Program at first insert. Outputs are demuxed by upstream
+    // operator id and forwarded to each view's appendAndPropagate.
+    //
+    // If compile_session fails (e.g. the catalog contains a Stream JOIN
+    // Table view that session mode does not yet support) the runtime
+    // auto-falls-back to the per-view cascade for this deployment. Any
+    // subsequent DDL invalidates the session so the next insert
+    // reattempts compile_session from the updated catalog.
+    private boolean useConsolidatedSession = true;
+    private boolean sessionFallbackActive = false;
     private String sessionPipelineId = null;
     /** Preresolved view info indexed by op_index registered with the JNI. */
     private SessionViewInfo[] sessionTerminalsByIndex = new SessionViewInfo[0];
@@ -284,9 +290,13 @@ public class RtBotSqlRuntime {
         }
 
         if (useConsolidatedSession) {
-            appendAndPropagate(streamName, timestamp, payload, /*propagate=*/false);
-            feedSessionRow(streamName, timestamp, payload);
-            return;
+            // Speculate on session path; on fallback the legacy path
+            // below owns all side effects for this row.
+            if (ensureSessionDeployed()) {
+                appendAndPropagate(streamName, timestamp, payload, /*propagate=*/false);
+                feedSessionRow(streamName, timestamp, payload);
+                return;
+            }
         }
 
         appendAndPropagate(streamName, timestamp, payload);
@@ -310,8 +320,10 @@ public class RtBotSqlRuntime {
                     + ", found " + schema.columns.size());
         }
 
-        // Consolidated-session fast path.
-        if (useConsolidatedSession) {
+        // Consolidated-session fast path. Falls through to per-view
+        // cascade when the catalog isn't representable as a session
+        // (e.g. Stream JOIN Table).
+        if (useConsolidatedSession && ensureSessionDeployed()) {
             if (collectMode || subscriptions.containsKey(streamName)) {
                 appendAndPropagate(streamName, timestamp,
                                     Arrays.asList(v0, v1, v2),
@@ -402,9 +414,9 @@ public class RtBotSqlRuntime {
             return;
         }
 
-        // Consolidated-session fast path: one JNI round-trip for the
-        // whole batch, outputs demuxed to each materialized view.
-        if (useConsolidatedSession) {
+        // Consolidated-session fast path. Falls through to per-view
+        // cascade if the catalog isn't session-compatible.
+        if (useConsolidatedSession && ensureSessionDeployed()) {
             boolean needRawSideEffects =
                     collectMode || subscriptions.containsKey(streamName);
             if (needRawSideEffects) {
@@ -555,18 +567,25 @@ public class RtBotSqlRuntime {
     }
 
     /**
-     * Lazily compile and deploy the consolidated session. No-op if
-     * already deployed. Throws {@link SqlError} on compile failure.
+     * Lazily compile and deploy the consolidated session. Returns true if
+     * the session is available after this call (either already deployed
+     * or newly deployed). Returns false if {@code compile_session} failed
+     * — the runtime sets {@link #sessionFallbackActive} so later inserts
+     * route through the per-view cascade.
      */
-    private void ensureSessionDeployed() {
-        if (sessionPipelineId != null) return;
+    private boolean ensureSessionDeployed() {
+        if (sessionPipelineId != null) return true;
+        if (sessionFallbackActive) return false;
         String catalogJson = catalog.snapshotJson();
         String sessionJson = RtBotSqlCompiler.compileSessionJson(catalogJson);
         com.google.gson.JsonObject obj =
                 gson.fromJson(sessionJson, com.google.gson.JsonObject.class);
         com.google.gson.JsonArray errs = obj.getAsJsonArray("errors");
         if (errs != null && errs.size() > 0) {
-            throw new SqlError("compile_session failed: " + errs.toString());
+            // Catalog not representable as a session (e.g. Stream JOIN
+            // Table or unknown source). Fall back to per-view cascade.
+            sessionFallbackActive = true;
+            return false;
         }
         String programJson = obj.get("program_json").getAsString();
         sessionPipelineId = runner.deploy(programJson, new ArrayList<>(),
@@ -617,6 +636,54 @@ public class RtBotSqlRuntime {
             sp.put(e.getKey(), e.getValue().getAsString());
         }
         this.sessionStreamPort = sp;
+
+        // Backfill: replay all stored base-stream messages through the
+        // fresh session in global timestamp order so a newly built
+        // session picks up the state the per-view pipelines already had
+        // from their own backfillInterleaved (e.g. after DROP+recreate
+        // or when a view is created after data has been inserted).
+        backfillSessionFromStore();
+        return true;
+    }
+
+    private void backfillSessionFromStore() {
+        // Collect stored messages for each base stream with its port.
+        List<long[]> eventKeys = new ArrayList<>();   // [timestamp, streamIndex]
+        List<String> eventPorts = new ArrayList<>();
+        List<List<Double>> eventValues = new ArrayList<>();
+
+        int streamIdx = 0;
+        for (Map.Entry<String, String> entry : sessionStreamPort.entrySet()) {
+            String stream = entry.getKey();
+            String port = entry.getValue();
+            for (Message msg : store.read(stream)) {
+                eventKeys.add(new long[]{msg.timestamp, streamIdx});
+                eventPorts.add(port);
+                eventValues.add(new ArrayList<>(msg.values));
+            }
+            streamIdx++;
+        }
+        if (eventKeys.isEmpty()) return;
+
+        // Sort by (timestamp, streamIndex) for deterministic replay.
+        Integer[] indices = new Integer[eventKeys.size()];
+        for (int i = 0; i < indices.length; i++) indices[i] = i;
+        java.util.Arrays.sort(indices, (a, b) -> {
+            long[] ea = eventKeys.get(a);
+            long[] eb = eventKeys.get(b);
+            if (ea[0] != eb[0]) return Long.compare(ea[0], eb[0]);
+            return Long.compare(ea[1], eb[1]);
+        });
+
+        for (int idx : indices) {
+            long ts = eventKeys.get(idx)[0];
+            String port = eventPorts.get(idx);
+            List<Double> values = eventValues.get(idx);
+            // Use single-row feed; backfill volume is typically small.
+            // Discard outputs — the per-view pipelines already surfaced
+            // them to subscribers/store when the data was first inserted.
+            runner.feed(sessionPipelineId, ts, values, port);
+        }
     }
 
     /**
@@ -626,9 +693,9 @@ public class RtBotSqlRuntime {
      * {@link #useConsolidatedSession} is on and the stream has
      * dependent views.
      */
-    private void feedSessionBuffer(String streamName, long[] timestamps,
-                                    double[][] columns, boolean useBuffer) {
-        ensureSessionDeployed();
+    private boolean feedSessionBuffer(String streamName, long[] timestamps,
+                                       double[][] columns, boolean useBuffer) {
+        if (!ensureSessionDeployed()) return false;
         String port = sessionStreamPort.getOrDefault(streamName, "i1");
         if (!"i1".equals(port)) {
             // Non-default port is rare (multi-base-stream session); fall
@@ -640,7 +707,7 @@ public class RtBotSqlRuntime {
                 dispatchSessionOutputs(runner.feed(sessionPipelineId,
                         timestamps[i], row, port));
             }
-            return;
+            return true;
         }
         // Hot path: binary output frame via pre-registered op-index map.
         int bytes = runner.feedBufferSessionI1(
@@ -658,24 +725,27 @@ public class RtBotSqlRuntime {
                     "feedBufferSessionI1 failed with return code " + bytes);
         }
         dispatchSessionBinary(sessionOutBuf, bytes);
+        return true;
     }
 
-    private void feedSessionRow3(String streamName, long timestamp,
-                                  double v0, double v1, double v2) {
-        ensureSessionDeployed();
+    private boolean feedSessionRow3(String streamName, long timestamp,
+                                     double v0, double v1, double v2) {
+        if (!ensureSessionDeployed()) return false;
         String port = sessionStreamPort.getOrDefault(streamName, "i1");
         List<OutputMessage> outputs =
                 runner.feed3(sessionPipelineId, timestamp, v0, v1, v2, port);
         dispatchSessionOutputs(outputs);
+        return true;
     }
 
-    private void feedSessionRow(String streamName, long timestamp,
-                                 List<Double> values) {
-        ensureSessionDeployed();
+    private boolean feedSessionRow(String streamName, long timestamp,
+                                    List<Double> values) {
+        if (!ensureSessionDeployed()) return false;
         String port = sessionStreamPort.getOrDefault(streamName, "i1");
         List<OutputMessage> outputs =
                 runner.feed(sessionPipelineId, timestamp, values, port);
         dispatchSessionOutputs(outputs);
+        return true;
     }
 
     /**
@@ -1037,6 +1107,21 @@ public class RtBotSqlRuntime {
         // Uses interleaved replay (all sources sorted by global timestamp)
         // to preserve temporal ordering that RTBot operators expect.
         backfillInterleaved(name, viewMeta, sourcePortMap, pipelineId);
+
+        // Invalidate any previously deployed consolidated-session so the
+        // next insert rebuilds it against the updated catalog.
+        invalidateSession();
+    }
+
+    private void invalidateSession() {
+        if (sessionPipelineId != null) {
+            try { runner.destroy(sessionPipelineId); } catch (Exception ignored) {}
+            sessionPipelineId = null;
+        }
+        sessionTerminalsByIndex = new SessionViewInfo[0];
+        sessionOpIdToInfo = Collections.emptyMap();
+        sessionStreamPort = Collections.emptyMap();
+        sessionFallbackActive = false;
     }
 
     /**
@@ -1104,6 +1189,9 @@ public class RtBotSqlRuntime {
             dependents.remove(name);
         }
         dependencies.remove(name);
+
+        // Catalog changed — force a session rebuild on the next insert.
+        invalidateSession();
     }
 
     /**
@@ -1478,8 +1566,22 @@ public class RtBotSqlRuntime {
      *
      * @return a map of state keys to serialized JSON values
      */
+    /** Key under which the consolidated-session pipeline state is stored. */
+    public static final String SESSION_STATE_KEY = "__session__";
+
     public Map<String, String> serializeState() {
         Map<String, String> state = new HashMap<>();
+        // When the consolidated session owns the live state (it handled
+        // the inserts), that single blob is authoritative. Per-view
+        // pipelines in session mode are never fed, so their state is
+        // only useful in the fallback path.
+        if (sessionPipelineId != null) {
+            try {
+                state.put(SESSION_STATE_KEY, runner.serialize(sessionPipelineId));
+            } catch (Exception ignored) {
+                // Skip on failure
+            }
+        }
         for (Map.Entry<String, String> entry : viewPipelines.entrySet()) {
             String pipelineId = entry.getValue();
             try {
@@ -1509,18 +1611,37 @@ public class RtBotSqlRuntime {
      * @param state map of state keys to serialized JSON values
      */
     public void restoreState(Map<String, String> state) {
+        String sessionBlob = state.get(SESSION_STATE_KEY);
+
         for (Map.Entry<String, String> entry : state.entrySet()) {
-            if (entry.getKey().startsWith("dict:")) {
-                // Restore dictionary
-                String dictKey = entry.getKey().substring(5);
+            String key = entry.getKey();
+            if (key.equals(SESSION_STATE_KEY)) {
+                // Handled below after this pass.
+                continue;
+            }
+            if (key.startsWith("dict:")) {
+                String dictKey = key.substring(5);
                 StringDictionary dict = StringDictionary.fromJson(entry.getValue());
                 catalog.registerDictionary(dictKey, dict);
             } else {
-                // Restore pipeline state
-                String viewName = entry.getKey();
-                String pipelineId = viewPipelines.get(viewName);
+                // Restore per-view pipeline state (only relevant on the
+                // fallback path; a no-op when session is active).
+                String pipelineId = viewPipelines.get(key);
                 if (pipelineId != null) {
                     runner.restore(pipelineId, entry.getValue());
+                }
+            }
+        }
+
+        // Session state (if present) owns the live data. Deploy the
+        // session and restore its blob before returning so subsequent
+        // inserts see the restored state.
+        if (sessionBlob != null && useConsolidatedSession) {
+            invalidateSession();
+            if (ensureSessionDeployed()) {
+                try {
+                    runner.restore(sessionPipelineId, sessionBlob);
+                } catch (Exception ignored) {
                 }
             }
         }
