@@ -263,6 +263,40 @@ public class LocalPipelineRunner implements PipelineRunner {
         return outputs;
     }
 
+    /**
+     * Register the ordered list of output operator ids for a
+     * consolidated-session pipeline. Required once before
+     * {@link #feedBufferSessionI1} is called against this pipeline.
+     */
+    public void registerSessionOutputs(String pipelineId, String[] opIds) {
+        Long handle = pipelines.get(pipelineId);
+        if (handle == null) {
+            throw new IllegalArgumentException("Unknown pipeline: " + pipelineId);
+        }
+        RtBotSqlCompiler.registerSessionOutputs(handle, opIds);
+    }
+
+    /**
+     * Consolidated-session buffered feed. Outputs are written into the
+     * caller-supplied direct {@link java.nio.ByteBuffer} as a compact
+     * binary frame. Returns bytes written, or a negative value equal to
+     * {@code -required_bytes} if {@code outBuffer} is too small (caller
+     * must grow and retry).
+     *
+     * @see RtBotSqlCompiler#feedPipelineBufferSessionI1
+     */
+    public int feedBufferSessionI1(String pipelineId,
+                                    long[] timestamps,
+                                    double[][] columns,
+                                    java.nio.ByteBuffer outBuffer) {
+        Long handle = pipelines.get(pipelineId);
+        if (handle == null) {
+            throw new IllegalArgumentException("Unknown pipeline: " + pipelineId);
+        }
+        return RtBotSqlCompiler.feedPipelineBufferSessionI1(
+                handle, timestamps, columns, outBuffer);
+    }
+
     @Override
     public List<OutputMessage> runOnce(String programJson, List<InputMessage> inputs) {
         long handle = RtBotSqlCompiler.createPipeline(programJson);

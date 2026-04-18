@@ -2,6 +2,8 @@ package dev.rtbot.sql;
 
 import com.google.gson.Gson;
 
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -54,10 +56,23 @@ public class RtBotSqlRuntime {
     // and forwarded to each view's appendAndPropagate.
     private boolean useConsolidatedSession = false;
     private String sessionPipelineId = null;
-    /** terminal operator id (in the merged graph) -> preresolved view info */
+    /** Preresolved view info indexed by op_index registered with the JNI. */
+    private SessionViewInfo[] sessionTerminalsByIndex = new SessionViewInfo[0];
+    /**
+     * Side-index keyed by operator id string. Used only by the JSON-output
+     * fallback paths ({@link #feedSessionRow3}, {@link #feedSessionRow},
+     * non-"i1"-port sessions). Hot path uses the index array.
+     */
     private Map<String, SessionViewInfo> sessionOpIdToInfo = Collections.emptyMap();
     /** base stream name -> port id on the session Input */
     private Map<String, String> sessionStreamPort = Collections.emptyMap();
+    /**
+     * Reusable direct buffer for {@link #feedSessionBuffer} outputs.
+     * Allocated lazily at first session deploy and grown on demand when
+     * the native side reports insufficient capacity.
+     */
+    private ByteBuffer sessionOutBuf = null;
+    private static final int SESSION_OUT_BUF_INITIAL_CAPACITY = 64 * 1024;
 
     /**
      * Preresolved view metadata keyed by the merged-graph terminal operator
@@ -525,6 +540,7 @@ public class RtBotSqlRuntime {
         if (sessionPipelineId != null) {
             try { runner.destroy(sessionPipelineId); } catch (Exception ignored) {}
             sessionPipelineId = null;
+            sessionTerminalsByIndex = new SessionViewInfo[0];
             sessionOpIdToInfo = Collections.emptyMap();
             sessionStreamPort = Collections.emptyMap();
         }
@@ -556,11 +572,15 @@ public class RtBotSqlRuntime {
         sessionPipelineId = runner.deploy(programJson, new ArrayList<>(),
                                            Collections.emptyMap());
 
-        // Build op_id -> preresolved SessionViewInfo for output demux.
-        // Precomputing viewType / keyIndex / storeOutput here eliminates
-        // the catalog.lookupView HashMap on the output hot path.
-        Map<String, SessionViewInfo> opToInfo = new HashMap<>();
+        // Build the opIdx-aligned terminal table and register the
+        // ordering with the JNI so native outputs reference indices
+        // (not strings) in the binary output frame.
         com.google.gson.JsonObject vt = obj.getAsJsonObject("view_terminals");
+        int count = vt == null ? 0 : vt.size();
+        String[] opIds = new String[count];
+        SessionViewInfo[] infos = new SessionViewInfo[count];
+        Map<String, SessionViewInfo> byId = new HashMap<>(count * 2);
+        int idx = 0;
         for (Map.Entry<String, com.google.gson.JsonElement> e : vt.entrySet()) {
             String viewName = e.getKey();
             String opId = e.getValue().getAsString();
@@ -571,10 +591,23 @@ public class RtBotSqlRuntime {
                     && ViewType.KEYED.name().equals(meta.viewType)
                     && meta.keyIndex >= 0;
             int keyIndex = keyed ? meta.keyIndex : -1;
-            opToInfo.put(opId, new SessionViewInfo(
-                    viewName, storeOutput, keyed, keyIndex));
+            SessionViewInfo info = new SessionViewInfo(
+                    viewName, storeOutput, keyed, keyIndex);
+            opIds[idx] = opId;
+            infos[idx] = info;
+            byId.put(opId, info);
+            idx++;
         }
-        this.sessionOpIdToInfo = opToInfo;
+        runner.registerSessionOutputs(sessionPipelineId, opIds);
+        this.sessionTerminalsByIndex = infos;
+        this.sessionOpIdToInfo = byId;
+
+        // Allocate the reusable output buffer once.
+        if (sessionOutBuf == null) {
+            sessionOutBuf = ByteBuffer
+                    .allocateDirect(SESSION_OUT_BUF_INITIAL_CAPACITY)
+                    .order(ByteOrder.nativeOrder());
+        }
 
         // Build base_stream -> port map for routing.
         Map<String, String> sp = new HashMap<>();
@@ -597,22 +630,34 @@ public class RtBotSqlRuntime {
                                     double[][] columns, boolean useBuffer) {
         ensureSessionDeployed();
         String port = sessionStreamPort.getOrDefault(streamName, "i1");
-        List<OutputMessage> outputs;
-        if ("i1".equals(port)) {
-            outputs = useBuffer
-                    ? runner.feedBufferI1(sessionPipelineId, timestamps, columns)
-                    : runner.feedBatchI1(sessionPipelineId, timestamps, columns);
-        } else {
-            // Non-default port: fall back to per-row feed with explicit port.
-            outputs = new ArrayList<>();
+        if (!"i1".equals(port)) {
+            // Non-default port is rare (multi-base-stream session); fall
+            // back to per-row feed + JSON output demux.
             int n = timestamps.length;
             for (int i = 0; i < n; i++) {
                 List<Double> row = new ArrayList<>(columns.length);
                 for (double[] col : columns) row.add(col[i]);
-                outputs.addAll(runner.feed(sessionPipelineId, timestamps[i], row, port));
+                dispatchSessionOutputs(runner.feed(sessionPipelineId,
+                        timestamps[i], row, port));
             }
+            return;
         }
-        dispatchSessionOutputs(outputs);
+        // Hot path: binary output frame via pre-registered op-index map.
+        int bytes = runner.feedBufferSessionI1(
+                sessionPipelineId, timestamps, columns, sessionOutBuf);
+        if (bytes < -1) {
+            int needed = -bytes;
+            int newCap = Math.max(needed, sessionOutBuf.capacity() * 2);
+            sessionOutBuf = ByteBuffer.allocateDirect(newCap)
+                    .order(ByteOrder.nativeOrder());
+            bytes = runner.feedBufferSessionI1(
+                    sessionPipelineId, timestamps, columns, sessionOutBuf);
+        }
+        if (bytes < 0) {
+            throw new SqlError(
+                    "feedBufferSessionI1 failed with return code " + bytes);
+        }
+        dispatchSessionBinary(sessionOutBuf, bytes);
     }
 
     private void feedSessionRow3(String streamName, long timestamp,
@@ -633,29 +678,57 @@ public class RtBotSqlRuntime {
         dispatchSessionOutputs(outputs);
     }
 
+    /**
+     * Non-default-port fallback: JSON outputs keyed by operator id
+     * string. Used only on multi-base-stream sessions that hit
+     * {@link #feedSessionBuffer}'s else-branch, and by
+     * {@link #feedSessionRow3} / {@link #feedSessionRow}.
+     */
     private void dispatchSessionOutputs(List<OutputMessage> outputs) {
-        // Hot path: one preresolved HashMap hit per output, then inlined
-        // store / key-tracking / subscriber notify. No
-        // catalog.lookupView, no subscriptions lookup via name-based
-        // appendAndPropagate detour. Session internal wiring has already
-        // routed between views, so propagation is unconditionally skipped.
         for (OutputMessage out : outputs) {
             SessionViewInfo info = sessionOpIdToInfo.get(out.operatorId);
             if (info == null) continue;
-
-            if (info.storeOutput && collectMode) {
-                store.append(info.viewName, out.timestamp, out.values);
-                if (info.keyed && info.keyIndex < out.values.size()) {
-                    catalog.addKey(info.viewName, out.values.get(info.keyIndex));
-                }
-            }
-
-            OutputListener listener = subscriptions.get(info.viewName);
-            if (listener != null) {
-                listener.onMessage(info.viewName, out.timestamp, out.values);
-            }
+            applySessionOutput(info, out.timestamp, out.values);
         }
     }
+
+    /**
+     * Parse the binary output frame written by
+     * {@link RtBotSqlCompiler#feedPipelineBufferSessionI1} and dispatch
+     * each message using the preregistered op-index table. No POJO
+     * allocation, no Gson, no string keys — just {@link ByteBuffer} reads
+     * plus one array index per message.
+     */
+    private void dispatchSessionBinary(ByteBuffer buf, int bytes) {
+        buf.order(ByteOrder.nativeOrder()).position(0).limit(bytes);
+        int nOut = buf.getInt();
+        for (int m = 0; m < nOut; m++) {
+            int opIdx = buf.getInt();
+            int nVals = buf.getInt();
+            long ts = buf.getLong();
+            List<Double> values = new ArrayList<>(nVals);
+            for (int v = 0; v < nVals; v++) values.add(buf.getDouble());
+            if (opIdx < 0 || opIdx >= sessionTerminalsByIndex.length) continue;
+            SessionViewInfo info = sessionTerminalsByIndex[opIdx];
+            if (info == null) continue;
+            applySessionOutput(info, ts, values);
+        }
+    }
+
+    private void applySessionOutput(SessionViewInfo info, long timestamp,
+                                     List<Double> values) {
+        if (info.storeOutput && collectMode) {
+            store.append(info.viewName, timestamp, values);
+            if (info.keyed && info.keyIndex < values.size()) {
+                catalog.addKey(info.viewName, values.get(info.keyIndex));
+            }
+        }
+        OutputListener listener = subscriptions.get(info.viewName);
+        if (listener != null) {
+            listener.onMessage(info.viewName, timestamp, values);
+        }
+    }
+
 
     /**
      * Enable or disable collect mode.
@@ -1471,6 +1544,7 @@ public class RtBotSqlRuntime {
         if (sessionPipelineId != null) {
             try { runner.destroy(sessionPipelineId); } catch (Exception ignored) {}
             sessionPipelineId = null;
+            sessionTerminalsByIndex = new SessionViewInfo[0];
             sessionOpIdToInfo = Collections.emptyMap();
             sessionStreamPort = Collections.emptyMap();
         }

@@ -165,6 +165,42 @@ public final class RtBotSqlCompiler {
             double[][] columns);
 
     /**
+     * Register the ordered list of output operator ids for a consolidated
+     * session pipeline. Must be called once after
+     * {@link #createPipeline(String)} and before any call to
+     * {@link #feedPipelineBufferSessionI1}. The ordering is caller-defined
+     * and the native side keys emitted outputs by index (not string) using
+     * this registration.
+     */
+    public static native void registerSessionOutputs(long handle, String[] opIds);
+
+    /**
+     * Consolidated-session buffered feed. Same column-major input shape as
+     * {@link #feedPipelineBufferI1}, but outputs are written into a
+     * caller-supplied direct {@link java.nio.ByteBuffer} as a compact
+     * binary frame (native byte order):
+     *
+     * <pre>
+     *   int32 num_outputs
+     *   per output:
+     *     int32 op_index     // index into {@link #registerSessionOutputs}
+     *     int32 num_values
+     *     int64 timestamp
+     *     float64 values[num_values]
+     * </pre>
+     *
+     * Returns bytes written on success. If the buffer is too small, returns
+     * a negative value equal to {@code -required_bytes}; caller must grow
+     * and retry. Returns {@code -1} if {@code outBuffer} is not a direct
+     * buffer.
+     */
+    public static native int feedPipelineBufferSessionI1(
+            long handle,
+            long[] timestamps,
+            double[][] columns,
+            java.nio.ByteBuffer outBuffer);
+
+    /**
      * Reset cumulative native feed-path profiling counters.
      */
     public static native void resetNativeFeedStats();
