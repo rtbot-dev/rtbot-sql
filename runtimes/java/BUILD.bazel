@@ -46,6 +46,14 @@ config_setting(
     ],
 )
 
+config_setting(
+    name = "is_windows_aarch64",
+    constraint_values = [
+        "@platforms//os:windows",
+        "@platforms//cpu:aarch64",
+    ],
+)
+
 # ---------------------------------------------------------------------------
 # JNI shared library — SQL compiler + pipeline execution
 #
@@ -132,6 +140,17 @@ genrule(
     ],
 )
 
+genrule(
+    name = "rtbot_sql_jni_resource_win_aarch64",
+    srcs = [":rtbot_sql_jni"],
+    outs = ["native/win-aarch64/rtbot_sql_jni.dll"],
+    cmd = "cp $< $@",
+    target_compatible_with = [
+        "@platforms//os:windows",
+        "@platforms//cpu:aarch64",
+    ],
+)
+
 # ---------------------------------------------------------------------------
 # Java runtime library — the reusable RTBot SQL Java wrapper
 # Package: dev.rtbot.sql
@@ -206,6 +225,18 @@ java_library(
 )
 
 java_library(
+    name = "rtbot-sql-java-native-win-aarch64",
+    srcs = [],
+    resources = [":rtbot_sql_jni_resource_win_aarch64"],
+    resource_strip_prefix = "runtimes/java",
+    target_compatible_with = [
+        "@platforms//os:windows",
+        "@platforms//cpu:aarch64",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+java_library(
     name = "rtbot-sql-java-native-empty",
     srcs = [],
     visibility = ["//visibility:public"],
@@ -219,6 +250,7 @@ alias(
         ":is_macos_x86_64": ":rtbot-sql-java-native-mac-x86_64",
         ":is_macos_aarch64": ":rtbot-sql-java-native-mac-aarch64",
         ":is_windows_x86_64": ":rtbot-sql-java-native-win-x86_64",
+        ":is_windows_aarch64": ":rtbot-sql-java-native-win-aarch64",
         "//conditions:default": ":rtbot-sql-java-native-empty",
     }),
 )
@@ -272,6 +304,25 @@ java_test(
     name = "bearing-load-test",
     srcs = ["src/test/java/dev/rtbot/sql/BearingLoadTest.java"],
     test_class = "dev.rtbot.sql.BearingLoadTest",
+    timeout = "long",
+    deps = [
+        ":rtbot-sql-java-runtime",
+        "@maven//:junit_junit",
+        "@maven//:com_google_code_gson_gson",
+    ],
+)
+
+# ---------------------------------------------------------------------------
+# Consolidated-session variant of the bearing load test. Same preset, but
+# the three views are merged into a single rtbot Program via
+# RtBotSqlCompiler.compileSessionJson() and fed through one JNI handle.
+#
+# Run:  bazel test //runtimes/java:bearing-load-session-test --test_output=all
+# ---------------------------------------------------------------------------
+java_test(
+    name = "bearing-load-session-test",
+    srcs = ["src/test/java/dev/rtbot/sql/BearingLoadSessionTest.java"],
+    test_class = "dev.rtbot.sql.BearingLoadSessionTest",
     timeout = "long",
     deps = [
         ":rtbot-sql-java-runtime",
