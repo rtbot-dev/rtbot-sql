@@ -53,9 +53,24 @@ class GraphBuilder {
 
   std::string to_json() const;
 
+  // Emit a program JSON for a multi-view consolidated session. Unlike
+  // to_json(), this does not require an Input/Output operator: the caller
+  // specifies the entry operator explicitly and declares a map of named
+  // outputs ({op_id → ports}) that Program will attach Collector sinks to
+  // (see Program.h:184-205).
+  std::string to_json_session(
+      const std::string& entry_op_id,
+      const std::map<std::string, std::vector<std::string>>& named_outputs)
+      const;
+
   // Validate the graph structure and return a list of error strings.
   // Returns empty vector if the graph is valid.
   std::vector<std::string> validate() const;
+
+  // Same as validate(), but does not require Input/Output operators to be
+  // present. Used for consolidated session graphs whose entry op and outputs
+  // are declared separately (see to_json_session).
+  std::vector<std::string> validate_session() const;
 
   // Parse a stored program JSON back into a builder ready for augmentation.
   // All operators (including Output) are loaded, but the connection TO the
