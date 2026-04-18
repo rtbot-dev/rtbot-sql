@@ -6,6 +6,17 @@ cc_library(
 )
 
 cc_library(
+    name = "batch_decoder",
+    hdrs = ["include/rtbot_sql/api/batch_decoder.h"],
+    srcs = ["src/batch_decoder.cpp"],
+    strip_include_prefix = "include",
+    visibility = ["//visibility:public"],
+    deps = [
+        "@rtbot//libs/api:rtbot-api",
+    ],
+)
+
+cc_library(
     name = "api_compiler",
     hdrs = ["include/rtbot_sql/api/compiler.h"],
     srcs = ["src/compiler.cpp"],
