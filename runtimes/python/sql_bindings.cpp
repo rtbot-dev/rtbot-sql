@@ -121,6 +121,100 @@ class NativePipeline {
     return all_outputs;
   }
 
+  // Zero-copy buffered feed: numpy's C-contiguous row-major layout is
+  // handed directly to Program::receive_buffer with no transpose. Pairs
+  // with operators that override receive_data_buffer for further wins.
+  std::vector<RuntimeOutputMessage> feed_buffer(
+      py::array_t<int64_t, py::array::c_style> timestamps,
+      py::array_t<double, py::array::c_style> values,
+      const std::string& port = "i1") {
+    auto ts_info = timestamps.request();
+    auto vals_info = values.request();
+    if (ts_info.ndim != 1 || vals_info.ndim != 2) {
+      throw std::invalid_argument(
+          "timestamps must be 1D, values must be 2D");
+    }
+    if (ts_info.shape[0] != vals_info.shape[0]) {
+      throw std::invalid_argument(
+          "timestamps and values must have the same number of rows");
+    }
+    const auto nrows = static_cast<std::size_t>(ts_info.shape[0]);
+    const auto ncols = static_cast<std::size_t>(vals_info.shape[1]);
+
+    static_assert(sizeof(std::int64_t) == sizeof(rtbot::timestamp_t),
+                  "int64 vs timestamp_t mismatch");
+    const auto* times = reinterpret_cast<const rtbot::timestamp_t*>(ts_info.ptr);
+    const auto* rows = static_cast<const double*>(vals_info.ptr);
+
+    auto batch = program_.receive_buffer(port, rows, nrows, ncols, times);
+    return decode_batch(batch);
+  }
+
+ private:
+  rtbot::Program program_;
+};
+
+// Consolidated-session pipeline — wraps rtbot::Program with the shared
+// SessionOutputRegistry so the Python runtime can feed once and receive
+// outputs that carry the op_id string (RuntimeOutputMessage); the Python
+// side already maps op_id -> view name via compile_session's
+// view_terminals map, so no extra index bookkeeping is needed.
+class NativeSessionPipeline {
+ public:
+  explicit NativeSessionPipeline(const std::string& program_json)
+      : program_(program_json) {}
+
+  ~NativeSessionPipeline() {
+    rtbot_sql::api::SessionOutputRegistry::instance().clear(&program_);
+  }
+
+  // Register the output operator ids that this session exposes. Matches
+  // the Java runtime's registerSessionOutputs — here we only need it so
+  // that the decoded output stream includes the right operator ids.
+  // (Python doesn't need the index-keyed binary path because pybind
+  // already returns structured RuntimeOutputMessage POJOs directly, no
+  // JSON round-trip.)
+  void register_outputs(const std::vector<std::string>& op_ids) {
+    rtbot_sql::api::SessionOutputRegistry::instance().register_outputs(
+        &program_, op_ids);
+  }
+
+  std::vector<RuntimeOutputMessage> feed_buffer(
+      py::array_t<int64_t, py::array::c_style> timestamps,
+      py::array_t<double, py::array::c_style> values,
+      const std::string& port = "i1") {
+    auto ts_info = timestamps.request();
+    auto vals_info = values.request();
+    if (ts_info.ndim != 1 || vals_info.ndim != 2) {
+      throw std::invalid_argument(
+          "timestamps must be 1D, values must be 2D");
+    }
+    if (ts_info.shape[0] != vals_info.shape[0]) {
+      throw std::invalid_argument(
+          "timestamps and values must have the same number of rows");
+    }
+    const auto nrows = static_cast<std::size_t>(ts_info.shape[0]);
+    const auto ncols = static_cast<std::size_t>(vals_info.shape[1]);
+
+    static_assert(sizeof(std::int64_t) == sizeof(rtbot::timestamp_t),
+                  "int64 vs timestamp_t mismatch");
+    const auto* times = reinterpret_cast<const rtbot::timestamp_t*>(ts_info.ptr);
+    const auto* rows = static_cast<const double*>(vals_info.ptr);
+
+    auto batch = program_.receive_buffer(port, rows, nrows, ncols, times);
+    return decode_batch(batch);
+  }
+
+  std::vector<RuntimeOutputMessage> feed(
+      std::uint64_t timestamp,
+      const std::vector<double>& values,
+      const std::string& port = "i1") {
+    auto msg = rtbot::create_message<rtbot::VectorNumberData>(
+        static_cast<rtbot::timestamp_t>(timestamp),
+        rtbot::VectorNumberData{values});
+    return decode_batch(program_.receive(std::move(msg), port));
+  }
+
  private:
   rtbot::Program program_;
 };
@@ -253,7 +347,24 @@ PYBIND11_MODULE(_rtbot_sql_native, m) {
            py::arg("timestamps"),
            py::arg("values"),
            py::arg("port") = "i1")
+      .def("feed_buffer", &NativePipeline::feed_buffer,
+           py::arg("timestamps"),
+           py::arg("values"),
+           py::arg("port") = "i1")
       .def("run", &NativePipeline::run, py::arg("inputs"));
+
+  py::class_<NativeSessionPipeline>(m, "NativeSessionPipeline")
+      .def(py::init<const std::string&>(), py::arg("program_json"))
+      .def("register_outputs", &NativeSessionPipeline::register_outputs,
+           py::arg("op_ids"))
+      .def("feed", &NativeSessionPipeline::feed,
+           py::arg("timestamp"),
+           py::arg("values"),
+           py::arg("port") = "i1")
+      .def("feed_buffer", &NativeSessionPipeline::feed_buffer,
+           py::arg("timestamps"),
+           py::arg("values"),
+           py::arg("port") = "i1");
 
   m.def(
       "compile_sql",
@@ -272,6 +383,31 @@ PYBIND11_MODULE(_rtbot_sql_native, m) {
       },
       "Preprocess and compile SQL in one step",
       py::arg("sql"), py::arg("catalog"), py::arg("ts_units_per_second"));
+
+  m.def(
+      "compile_session",
+      [](const rtbot_sql::CatalogSnapshot& catalog) {
+        auto r = rtbot_sql::api::compile_session_program(catalog);
+        py::dict out;
+        out["program_json"] = r.program_json;
+        out["view_terminals"] = r.view_terminals;
+        out["view_terminal_ports"] = r.view_terminal_ports;
+        out["materialized_views"] = r.materialized_views;
+        out["base_stream_inputs"] = r.base_stream_inputs;
+        out["base_stream_ports"] = r.base_stream_ports;
+        py::list errs;
+        for (const auto& e : r.errors) {
+          py::dict d;
+          d["message"] = e.message;
+          d["line"] = e.line;
+          d["column"] = e.column;
+          errs.append(d);
+        }
+        out["errors"] = errs;
+        return out;
+      },
+      "Consolidate every view in the catalog into a single rtbot Program",
+      py::arg("catalog"));
 
   m.def(
       "validate_sql",
