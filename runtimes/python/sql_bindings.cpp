@@ -9,6 +9,7 @@
 
 #include "rtbot/Message.h"
 #include "rtbot/Program.h"
+#include "rtbot_sql/api/batch_decoder.h"
 #include "rtbot_sql/api/compiler.h"
 #include "rtbot_sql/api/preprocessor.h"
 #include "rtbot_sql/api/types.h"
@@ -44,50 +45,22 @@ struct RuntimeOutputMessage {
   std::string port;
 };
 
+// Thin adapter around the shared rtbot_sql::api::decode_program_batch.
+// The shared helper handles iteration + stable sort; this function only
+// copies the decoded fields into the pybind-exposed POJO shape.
 std::vector<RuntimeOutputMessage> decode_batch(
     const rtbot::ProgramMsgBatch& batch) {
+  auto decoded = rtbot_sql::api::decode_program_batch(batch);
   std::vector<RuntimeOutputMessage> out;
-
-  for (const auto& [operator_id, operator_batch] : batch) {
-    for (const auto& [port, messages] : operator_batch) {
-      for (const auto& message : messages) {
-        if (auto* vec =
-                dynamic_cast<rtbot::Message<rtbot::VectorNumberData>*>(
-                    message.get())) {
-          RuntimeOutputMessage msg{};
-          msg.timestamp = static_cast<std::uint64_t>(vec->time);
-          if (vec->data.values) {
-            msg.values = *vec->data.values;
-          } else {
-            msg.values.clear();
-          }
-          msg.operator_id = operator_id;
-          msg.port = port;
-          out.push_back(msg);
-          continue;
-        }
-
-        if (auto* num =
-                dynamic_cast<rtbot::Message<rtbot::NumberData>*>(
-                    message.get())) {
-          RuntimeOutputMessage msg{};
-          msg.timestamp = static_cast<std::uint64_t>(num->time);
-          msg.values = {num->data.value};
-          msg.operator_id = operator_id;
-          msg.port = port;
-          out.push_back(msg);
-        }
-      }
-    }
+  out.reserve(decoded.size());
+  for (auto& m : decoded) {
+    RuntimeOutputMessage msg;
+    msg.timestamp = static_cast<std::uint64_t>(m.timestamp);
+    msg.values = std::move(m.values);
+    msg.operator_id = std::move(m.operator_id);
+    msg.port = std::move(m.port);
+    out.push_back(std::move(msg));
   }
-
-  std::stable_sort(out.begin(), out.end(),
-                   [](const RuntimeOutputMessage& a,
-                      const RuntimeOutputMessage& b) {
-                     return std::tie(a.timestamp, a.operator_id, a.port) <
-                            std::tie(b.timestamp, b.operator_id, b.port);
-                   });
-
   return out;
 }
 
