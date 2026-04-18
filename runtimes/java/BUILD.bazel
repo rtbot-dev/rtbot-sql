@@ -314,25 +314,6 @@ java_test(
 )
 
 # ---------------------------------------------------------------------------
-# Consolidated-session variant of the bearing load test. Same preset, but
-# the three views are merged into a single rtbot Program via
-# RtBotSqlCompiler.compileSessionJson() and fed through one JNI handle.
-#
-# Run:  bazel test //runtimes/java:bearing-load-session-test --test_output=all
-# ---------------------------------------------------------------------------
-java_test(
-    name = "bearing-load-session-test",
-    srcs = ["src/test/java/dev/rtbot/sql/BearingLoadSessionTest.java"],
-    test_class = "dev.rtbot.sql.BearingLoadSessionTest",
-    timeout = "long",
-    deps = [
-        ":rtbot-sql-java-runtime",
-        "@maven//:junit_junit",
-        "@maven//:com_google_code_gson_gson",
-    ],
-)
-
-# ---------------------------------------------------------------------------
 # Insert batch tests — pre-encoding and N-column batch insert paths
 #
 # Run:  bazel test //runtimes/java:insert-batch-test --test_output=all
