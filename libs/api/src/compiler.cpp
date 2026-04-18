@@ -1027,6 +1027,248 @@ CompilationResult compile_sql(const std::string& sql,
 }
 
 // ---------------------------------------------------------------------------
+// compile_session_program: consolidate all views in the catalog into one
+// rtbot Program. Each view's per-view program_json (still produced by
+// compile_sql at DDL time) is parsed, its Input/Output operators are
+// stripped, the body is inlined under a view-specific operator-id prefix,
+// and view-to-view edges are wired directly across the join. Exactly one
+// Input operator is retained per base stream. Materialized views are
+// exposed as named outputs so Program attaches a Collector to each.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Topologically order views by their FROM dependencies (views-on-views).
+// Returns a vector of view names in dependency order. If the graph has a
+// cycle, returns the subset that could be ordered and sets `cycle` to true.
+std::vector<std::string> topo_sort_views(const CatalogSnapshot& catalog,
+                                         bool& cycle) {
+  cycle = false;
+  std::map<std::string, int> indeg;
+  std::map<std::string, std::vector<std::string>> children;
+  for (const auto& [name, _] : catalog.views) {
+    indeg[name] = 0;
+  }
+  for (const auto& [name, view] : catalog.views) {
+    for (const auto& src : view.source_streams) {
+      if (catalog.views.count(src)) {
+        // src is an upstream view — src must be emitted before `name`.
+        indeg[name]++;
+        children[src].push_back(name);
+      }
+    }
+  }
+  std::vector<std::string> order;
+  std::vector<std::string> queue;
+  for (const auto& [name, deg] : indeg) {
+    if (deg == 0) queue.push_back(name);
+  }
+  while (!queue.empty()) {
+    std::string cur = queue.front();
+    queue.erase(queue.begin());
+    order.push_back(cur);
+    for (const auto& ch : children[cur]) {
+      if (--indeg[ch] == 0) queue.push_back(ch);
+    }
+  }
+  if (order.size() != catalog.views.size()) cycle = true;
+  return order;
+}
+
+}  // namespace
+
+SessionCompilationResult compile_session_program(
+    const CatalogSnapshot& catalog) {
+  SessionCompilationResult out{};
+
+  // 1. Topological order of views.
+  bool cycle = false;
+  auto order = topo_sort_views(catalog, cycle);
+  if (cycle) {
+    out.errors.push_back({"view dependency graph has a cycle", -1, -1});
+    return out;
+  }
+
+  // 2. Collect base streams referenced across all views.
+  std::vector<std::string> base_streams;
+  {
+    std::map<std::string, bool> seen;
+    for (const auto& [vname, view] : catalog.views) {
+      for (const auto& src : view.source_streams) {
+        if (catalog.streams.count(src) && !seen[src]) {
+          seen[src] = true;
+          base_streams.push_back(src);
+        }
+      }
+    }
+  }
+
+  // 3. Only one base stream supported for now — the session has a single
+  //    entry operator (see Program.h:138). Multi-stream support would need
+  //    either a splitter entry or Program multi-entry relaxation.
+  if (base_streams.size() > 1) {
+    out.errors.push_back(
+        {"multi-base-stream sessions not supported yet", -1, -1});
+    return out;
+  }
+
+  compiler::GraphBuilder merged;
+
+  // 4. One Input operator per base stream (single port "i1").
+  for (const auto& s : base_streams) {
+    std::string id = "input__" + s;
+    merged.add_operator(id, "Input");
+    out.base_stream_inputs[s] = id;
+    out.base_stream_ports[s] = "i1";
+  }
+
+  // view name → endpoint feeding its terminal in the merged graph.
+  std::map<std::string, compiler::Endpoint> view_terminal;
+  // terminal operator id → list of output ports to expose as Program
+  // outputs (currently always one port per materialized view).
+  std::map<std::string, std::vector<std::string>> named_outputs;
+
+  // 5. Merge each view's subgraph in topological order.
+  for (const auto& vname : order) {
+    const auto& view = catalog.views.at(vname);
+
+    if (view.source_streams.size() != 1) {
+      out.errors.push_back(
+          {"view '" + vname +
+               "' has multiple sources — not supported in session",
+           -1, -1});
+      return out;
+    }
+    if (view.program_json.empty()) {
+      out.errors.push_back(
+          {"view '" + vname + "' has no program_json", -1, -1});
+      return out;
+    }
+
+    // Source endpoint in the merged graph: either a base-stream Input or an
+    // upstream view's terminal.
+    const std::string& source = view.source_streams[0];
+    compiler::Endpoint source_ep;
+    if (out.base_stream_inputs.count(source)) {
+      source_ep = {out.base_stream_inputs[source], "o1"};
+    } else if (view_terminal.count(source)) {
+      source_ep = view_terminal[source];
+    } else {
+      out.errors.push_back(
+          {"view '" + vname + "' references unknown source '" + source +
+               "'",
+           -1, -1});
+      return out;
+    }
+
+    // Parse the view's stored program, strip the Output connection.
+    compiler::GraphBuilder per_view;
+    compiler::Endpoint pre_output_ep;
+    try {
+      auto parsed = compiler::GraphBuilder::from_json_for_augmentation(
+          view.program_json);
+      per_view = std::move(parsed.first);
+      pre_output_ep = std::move(parsed.second);
+    } catch (const std::exception& e) {
+      out.errors.push_back(
+          {"failed to parse view '" + vname + "' program: " + e.what(),
+           -1, -1});
+      return out;
+    }
+
+    // Locate the view-local Input operator (to strip and rewire).
+    std::string local_input;
+    for (const auto& op : per_view.operators()) {
+      if (op.type == "Input") {
+        local_input = op.id;
+        break;
+      }
+    }
+
+    const std::string prefix = vname + "__";
+
+    // Clone prototypes with view-prefixed ids (operator refs below get
+    // rewritten to the new prototype id). Inner operators in the prototype
+    // are in a separate scope and do not need renaming.
+    std::map<std::string, std::string> proto_rename;
+    for (const auto& proto : per_view.prototypes()) {
+      compiler::PrototypeDef cloned = proto;
+      cloned.id = prefix + proto.id;
+      proto_rename[proto.id] = cloned.id;
+      merged.add_prototype(cloned);
+    }
+
+    // Copy operators (skip Input/Output), prefixing ids and rewriting
+    // any prototype reference.
+    for (const auto& op : per_view.operators()) {
+      if (op.type == "Input" || op.type == "Output") continue;
+      compiler::OperatorDef cloned = op;
+      cloned.id = prefix + op.id;
+      auto proto_it = cloned.string_params.find("prototype");
+      if (proto_it != cloned.string_params.end()) {
+        auto r = proto_rename.find(proto_it->second);
+        if (r != proto_rename.end()) proto_it->second = r->second;
+      }
+      merged.add_operator(cloned.id, cloned.type, cloned.params,
+                          cloned.string_params, cloned.double_array_params,
+                          cloned.int_array_params);
+    }
+
+    // Copy connections, skipping those originating from the view's local
+    // Input (rewired below) and those to the dropped Output (already
+    // absent from per_view.connections()).
+    for (const auto& c : per_view.connections()) {
+      if (c.from_id == local_input) continue;
+      merged.connect({prefix + c.from_id, c.from_port},
+                     {prefix + c.to_id, c.to_port});
+    }
+
+    // Wire the view body's true entry points from the source endpoint.
+    for (const auto& c : per_view.connections()) {
+      if (c.from_id != local_input) continue;
+      merged.connect(source_ep, {prefix + c.to_id, c.to_port});
+    }
+
+    // Record terminal for dependents and session-level outputs.
+    compiler::Endpoint merged_terminal{prefix + pre_output_ep.operator_id,
+                                       pre_output_ep.port};
+    view_terminal[vname] = merged_terminal;
+    out.view_terminals[vname] = merged_terminal.operator_id;
+    out.view_terminal_ports[vname] = merged_terminal.port;
+
+    if (view.entity_type == EntityType::MATERIALIZED_VIEW) {
+      named_outputs[merged_terminal.operator_id].push_back(
+          merged_terminal.port);
+      out.materialized_views.push_back(vname);
+    }
+  }
+
+  // 6. Pick the session's single entry operator.
+  std::string entry_op_id;
+  if (!out.base_stream_inputs.empty()) {
+    entry_op_id = out.base_stream_inputs.begin()->second;
+  } else {
+    out.errors.push_back(
+        {"session has no base streams — cannot emit entry", -1, -1});
+    return out;
+  }
+
+  // 7. Validate the merged graph (without requiring Input/Output presence;
+  //    exactly one Input is always present here, but no Output is).
+  auto verrors = merged.validate_session();
+  if (!verrors.empty()) {
+    for (const auto& e : verrors) {
+      out.errors.push_back({"graph: " + e, -1, -1});
+    }
+    return out;
+  }
+
+  // 8. Emit JSON with explicit entry + named outputs.
+  out.program_json = merged.to_json_session(entry_op_id, named_outputs);
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // compile_sql_expanded: preprocess + compile loop with catalog updates
 // ---------------------------------------------------------------------------
 
