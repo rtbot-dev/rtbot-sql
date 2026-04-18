@@ -234,3 +234,11 @@ py_test(
     tags = ["manual"],
     deps = [":rtbot_sql"],
 )
+
+py_test(
+    name = "bearing_throughput_test",
+    srcs = ["test/bearing_throughput_test.py"],
+    main = "test/bearing_throughput_test.py",
+    timeout = "moderate",
+    deps = [":rtbot_sql"],
+)
