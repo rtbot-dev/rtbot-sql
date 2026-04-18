@@ -594,12 +594,15 @@ public class RtBotSqlRuntimeTest {
         runtime.insert("ticks", 2000L, Arrays.asList(20.0));
         runtime.insert("ticks", 3000L, Arrays.asList(30.0));
 
-        // Serialize the state
+        // Serialize the state — the consolidated session holds the
+        // single live Program blob under SESSION_STATE_KEY.
         Map<String, String> state = runtime.serializeState();
         assertFalse("State should not be empty", state.isEmpty());
-        assertTrue("State should contain avg_view", state.containsKey("avg_view"));
-        assertNotNull("Serialized state should be non-null", state.get("avg_view"));
-        assertFalse("Serialized state should be non-empty", state.get("avg_view").isEmpty());
+        assertTrue("State should contain the session blob",
+                   state.containsKey(RtBotSqlRuntime.SESSION_STATE_KEY));
+        String sessionBlob = state.get(RtBotSqlRuntime.SESSION_STATE_KEY);
+        assertNotNull("Session state should be non-null", sessionBlob);
+        assertFalse("Session state should be non-empty", sessionBlob.isEmpty());
 
         // Create a new runtime with the same schema and view
         RtBotSqlRuntime runtime2 = new RtBotSqlRuntime();
