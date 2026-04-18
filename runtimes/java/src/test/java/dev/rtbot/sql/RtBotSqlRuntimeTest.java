@@ -2184,10 +2184,12 @@ public class RtBotSqlRuntimeTest {
             // Pipeline trace for vibration (bin 0 flush):
             //   vibration:     (1050000, [20.0])  ← first sample in bin 1 triggers bin 0 flush
             //   vibration_bin: (1050000, [10.0])  ← bin 0 average emitted
-            //   vibration_rs:  <no output>        ← resampler initializes (needs 2 points)
+            //   vibration_rs:  (1000000, [10.0])  ← snap-first resampler snaps the first
+            //                                        message's value to the current grid point
             rt.insert("vibration", 1050000L, Arrays.asList(20.0));
             assertEquals("vibration_bin: bin 0 flushed", 1, vibBinListener.count());
-            assertEquals("Resampler init (first msg): no rs output", 0, vibRsListener.count());
+            assertEquals("Resampler snap-first: 1 rs output at bin 0 grid",
+                         1, vibRsListener.count());
 
             rt.insert("vibration", 1300000L, Arrays.asList(22.0));
             rt.insert("vibration", 1500000L, Arrays.asList(28.0));
@@ -2199,16 +2201,21 @@ public class RtBotSqlRuntimeTest {
             // Pipeline trace for bearing_temp (bin 0 flush):
             //   bearing_temp:     (1100000, [85.0])  ← first sample in bin 1 triggers bin 0 flush
             //   bearing_temp_bin: (1100000, [75.0])  ← bin 0 average emitted
-            //   bearing_temp_rs:  <no output>        ← resampler initializes (needs 2 points)
+            //   bearing_temp_rs:  (1000000, [75.0])  ← snap-first resampler snaps the first
+            //                                           message's value to the current grid point
             rt.insert("bearing_temp", 1100000L, Arrays.asList(85.0));
             assertEquals("bearing_temp_bin: bin 0 flushed", 1, tempBinListener.count());
-            assertEquals("Resampler init (first msg): no rs output", 0, tempRsListener.count());
+            assertEquals("Resampler snap-first: 1 rs output at bin 0 grid",
+                         1, tempRsListener.count());
 
             rt.insert("bearing_temp", 1400000L, Arrays.asList(90.0));
             rt.insert("bearing_temp", 1700000L, Arrays.asList(95.0));
 
-            // No combined output yet — resamplers only initialized
-            assertEquals("No combined output yet", 0, inputListener.count());
+            // Snap-first resamplers both already emitted at t=1,000,000 above,
+            // so the cross-join over vibration_rs x bearing_temp_rs fires the
+            // first combined output at t=1,000,000.
+            assertEquals("Combined output for bin 0 already fired",
+                         1, inputListener.count());
 
             // ---- Bin 2: crosses into bin 2, flushing bin 1 ----
             //
@@ -2218,10 +2225,10 @@ public class RtBotSqlRuntimeTest {
             // Pipeline trace for vibration (bin 1 flush → resampler emits):
             //   vibration:     (2100000, [30.0])    ← first sample in bin 2 triggers bin 1 flush
             //   vibration_bin: (2100000, [25.0])    ← bin 1 average emitted (2nd bin output)
-            //   vibration_rs:  (1000000, [10.0])    ← TIMESHIFT(-1000000) on resampled bin 0 output
+            //   vibration_rs:  (2000000, [25.0])    ← snap-first resampler emits at grid t=2,000,000
             rt.insert("vibration", 2100000L, Arrays.asList(30.0));
             assertEquals("vibration_bin: 2 flushes now", 2, vibBinListener.count());
-            assertEquals("vibration_rs emits at t=1000000", 1, vibRsListener.count());
+            assertEquals("vibration_rs 2nd emit at t=2,000,000", 2, vibRsListener.count());
 
             rt.insert("vibration", 2400000L, Arrays.asList(40.0));
             rt.insert("vibration", 2700000L, Arrays.asList(35.0));
@@ -2232,44 +2239,50 @@ public class RtBotSqlRuntimeTest {
             // Pipeline trace for bearing_temp (bin 1 flush → resampler emits → cross-join fires):
             //   bearing_temp:     (2200000, [96.0])   ← first sample in bin 2 triggers bin 1 flush
             //   bearing_temp_bin: (2200000, [90.0])   ← bin 1 average emitted (2nd bin output)
-            //   bearing_temp_rs:  (1000000, [75.0])   ← TIMESHIFT(-1000000) on resampled bin 0 output
-            //   input:            (1000000, [10.0, 75.0])  ← cross-join fires: both _rs now have t=1000000
+            //   bearing_temp_rs:  (2000000, [90.0])   ← snap-first resampler emits at grid t=2,000,000
+            //   input:            (2000000, [25.0, 90.0])  ← cross-join fires at t=2,000,000
             rt.insert("bearing_temp", 2200000L, Arrays.asList(96.0));
             assertEquals("bearing_temp_bin: 2 flushes now", 2, tempBinListener.count());
-            assertEquals("bearing_temp_rs emits at t=1000000", 1, tempRsListener.count());
+            assertEquals("bearing_temp_rs 2nd emit at t=2,000,000", 2, tempRsListener.count());
 
             rt.insert("bearing_temp", 2500000L, Arrays.asList(100.0));
             rt.insert("bearing_temp", 2800000L, Arrays.asList(104.0));
 
-            // -- First combined output: t=1000000, bin 0 averages --
-            assertEquals("First combined output", 1, inputListener.count());
+            // Snap-first resamplers cross-joined twice by now: at t=1,000,000
+            // (bin 0 averages) and t=2,000,000 (bin 1 averages).
+            assertEquals("Two combined outputs so far", 2, inputListener.count());
             assertEquals(1000000L, (long) inputListener.timestamps.get(0));
             assertEquals("vibration bin 0 avg", 10.0,
                          inputListener.values.get(0).get(0), 1e-9);
             assertEquals("bearing_temp bin 0 avg", 75.0,
                          inputListener.values.get(0).get(1), 1e-9);
-
-            // ---- Bin 3 trigger: flush bin 2 ----
-            //
-            // Pipeline trace (bin 2 flush → resampler emits → cross-join fires):
-            //   vibration:     (3100000, [999.0])     ← triggers bin 2 flush
-            //   vibration_bin: (3100000, [35.0])      ← bin 2 average
-            //   vibration_rs:  (2000000, [25.0])      ← TIMESHIFT on resampled bin 1 output
-            //
-            //   bearing_temp:     (3200000, [999.0])  ← triggers bin 2 flush
-            //   bearing_temp_bin: (3200000, [100.0])  ← bin 2 average
-            //   bearing_temp_rs:  (2000000, [90.0])   ← TIMESHIFT on resampled bin 1 output
-            //   input:            (2000000, [25.0, 90.0])  ← cross-join fires
-            rt.insert("vibration",    3100000L, Arrays.asList(999.0));
-            rt.insert("bearing_temp", 3200000L, Arrays.asList(999.0));
-
-            // -- Second combined output: t=2000000, bin 1 averages --
-            assertEquals("Two combined outputs total", 2, inputListener.count());
             assertEquals(2000000L, (long) inputListener.timestamps.get(1));
             assertEquals("vibration bin 1 avg", 25.0,
                          inputListener.values.get(1).get(0), 1e-9);
             assertEquals("bearing_temp bin 1 avg", 90.0,
                          inputListener.values.get(1).get(1), 1e-9);
+
+            // ---- Bin 3 trigger: flush bin 2 ----
+            //
+            // Pipeline trace (bin 2 flush → snap-first resampler emits → cross-join fires):
+            //   vibration:     (3100000, [999.0])     ← triggers bin 2 flush
+            //   vibration_bin: (3100000, [35.0])      ← bin 2 average
+            //   vibration_rs:  (3000000, [35.0])      ← snap-first emits at grid t=3,000,000
+            //
+            //   bearing_temp:     (3200000, [999.0])  ← triggers bin 2 flush
+            //   bearing_temp_bin: (3200000, [100.0])  ← bin 2 average
+            //   bearing_temp_rs:  (3000000, [100.0])  ← snap-first emits at grid t=3,000,000
+            //   input:            (3000000, [35.0, 100.0])  ← cross-join fires
+            rt.insert("vibration",    3100000L, Arrays.asList(999.0));
+            rt.insert("bearing_temp", 3200000L, Arrays.asList(999.0));
+
+            // -- Third combined output: t=3,000,000, bin 2 averages --
+            assertEquals("Three combined outputs total", 3, inputListener.count());
+            assertEquals(3000000L, (long) inputListener.timestamps.get(2));
+            assertEquals("vibration bin 2 avg", 35.0,
+                         inputListener.values.get(2).get(0), 1e-9);
+            assertEquals("bearing_temp bin 2 avg", 100.0,
+                         inputListener.values.get(2).get(1), 1e-9);
 
             // -- Print full trace --
             System.out.println("\n=== ALIGNED STREAM SUGAR SYNTAX — FULL TRACE ===");
