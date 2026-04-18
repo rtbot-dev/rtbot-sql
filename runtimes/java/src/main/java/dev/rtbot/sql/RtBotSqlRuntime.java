@@ -54,10 +54,31 @@ public class RtBotSqlRuntime {
     // and forwarded to each view's appendAndPropagate.
     private boolean useConsolidatedSession = false;
     private String sessionPipelineId = null;
-    /** terminal operator id (in the merged graph) -> view name */
-    private Map<String, String> sessionOpIdToView = Collections.emptyMap();
+    /** terminal operator id (in the merged graph) -> preresolved view info */
+    private Map<String, SessionViewInfo> sessionOpIdToInfo = Collections.emptyMap();
     /** base stream name -> port id on the session Input */
     private Map<String, String> sessionStreamPort = Collections.emptyMap();
+
+    /**
+     * Preresolved view metadata keyed by the merged-graph terminal operator
+     * id. Built once at {@link #ensureSessionDeployed} so the output
+     * dispatch hot path avoids repeated {@link InMemoryCatalog#lookupView}
+     * calls and HashMap churn for every emitted message.
+     */
+    private static final class SessionViewInfo {
+        final String viewName;
+        final boolean storeOutput;   // true for MATERIALIZED_VIEW (not plain VIEW)
+        final boolean keyed;         // true for KEYED view_type with valid keyIndex
+        final int keyIndex;          // -1 if not keyed
+
+        SessionViewInfo(String viewName, boolean storeOutput,
+                         boolean keyed, int keyIndex) {
+            this.viewName = viewName;
+            this.storeOutput = storeOutput;
+            this.keyed = keyed;
+            this.keyIndex = keyIndex;
+        }
+    }
 
     /** stream/view name -> active output listener (subscription registry) */
     private final Map<String, OutputListener> subscriptions = new ConcurrentHashMap<>();
@@ -504,7 +525,7 @@ public class RtBotSqlRuntime {
         if (sessionPipelineId != null) {
             try { runner.destroy(sessionPipelineId); } catch (Exception ignored) {}
             sessionPipelineId = null;
-            sessionOpIdToView = Collections.emptyMap();
+            sessionOpIdToInfo = Collections.emptyMap();
             sessionStreamPort = Collections.emptyMap();
         }
         this.useConsolidatedSession = enabled;
@@ -535,13 +556,25 @@ public class RtBotSqlRuntime {
         sessionPipelineId = runner.deploy(programJson, new ArrayList<>(),
                                            Collections.emptyMap());
 
-        // Build op_id -> view_name map for output demux.
-        Map<String, String> opToView = new HashMap<>();
+        // Build op_id -> preresolved SessionViewInfo for output demux.
+        // Precomputing viewType / keyIndex / storeOutput here eliminates
+        // the catalog.lookupView HashMap on the output hot path.
+        Map<String, SessionViewInfo> opToInfo = new HashMap<>();
         com.google.gson.JsonObject vt = obj.getAsJsonObject("view_terminals");
         for (Map.Entry<String, com.google.gson.JsonElement> e : vt.entrySet()) {
-            opToView.put(e.getValue().getAsString(), e.getKey());
+            String viewName = e.getKey();
+            String opId = e.getValue().getAsString();
+            ViewMeta meta = catalog.lookupView(viewName);
+            boolean storeOutput = meta != null
+                    && EntityType.MATERIALIZED_VIEW.name().equals(meta.entityType);
+            boolean keyed = meta != null
+                    && ViewType.KEYED.name().equals(meta.viewType)
+                    && meta.keyIndex >= 0;
+            int keyIndex = keyed ? meta.keyIndex : -1;
+            opToInfo.put(opId, new SessionViewInfo(
+                    viewName, storeOutput, keyed, keyIndex));
         }
-        this.sessionOpIdToView = opToView;
+        this.sessionOpIdToInfo = opToInfo;
 
         // Build base_stream -> port map for routing.
         Map<String, String> sp = new HashMap<>();
@@ -601,13 +634,26 @@ public class RtBotSqlRuntime {
     }
 
     private void dispatchSessionOutputs(List<OutputMessage> outputs) {
+        // Hot path: one preresolved HashMap hit per output, then inlined
+        // store / key-tracking / subscriber notify. No
+        // catalog.lookupView, no subscriptions lookup via name-based
+        // appendAndPropagate detour. Session internal wiring has already
+        // routed between views, so propagation is unconditionally skipped.
         for (OutputMessage out : outputs) {
-            String viewName = sessionOpIdToView.get(out.operatorId);
-            if (viewName == null) continue;
-            // Session's internal wiring has already routed between views;
-            // do not re-cascade into per-view pipelines.
-            appendAndPropagate(viewName, out.timestamp, out.values,
-                               /*propagate=*/false);
+            SessionViewInfo info = sessionOpIdToInfo.get(out.operatorId);
+            if (info == null) continue;
+
+            if (info.storeOutput && collectMode) {
+                store.append(info.viewName, out.timestamp, out.values);
+                if (info.keyed && info.keyIndex < out.values.size()) {
+                    catalog.addKey(info.viewName, out.values.get(info.keyIndex));
+                }
+            }
+
+            OutputListener listener = subscriptions.get(info.viewName);
+            if (listener != null) {
+                listener.onMessage(info.viewName, out.timestamp, out.values);
+            }
         }
     }
 
@@ -1425,7 +1471,7 @@ public class RtBotSqlRuntime {
         if (sessionPipelineId != null) {
             try { runner.destroy(sessionPipelineId); } catch (Exception ignored) {}
             sessionPipelineId = null;
-            sessionOpIdToView = Collections.emptyMap();
+            sessionOpIdToInfo = Collections.emptyMap();
             sessionStreamPort = Collections.emptyMap();
         }
     }
