@@ -162,6 +162,7 @@ struct Config {
   int progress_every = 10;
   bool pure_cpp = false;
   bool batch = false;
+  bool burst_native = false;
   bool count_operators = false;
   std::vector<std::string> presets = {
       "01_rms",
@@ -233,6 +234,11 @@ void print_help(const char* argv0) {
       << "                          (upper bound for this hardware; ignores --presets)\n"
       << "  --batch                 Feed the base program one burst per receive_batch\n"
       << "                          call (batched propagation; amortizes scheduling)\n"
+      << "  --burst-native          Bypass the base program entirely; compute the\n"
+      << "                          vibration_moments aggregate as a single-pass C++\n"
+      << "                          kernel over the burst and feed the 10-field result\n"
+      << "                          directly to downstream presets. Measures the\n"
+      << "                          burst-aggregate ceiling via the rtbot downstream graph.\n"
       << "  --count-operators       Compile each preset and print operator counts\n"
       << "                          (set RTBOT_DISABLE_FUSION=1 to compare without)\n"
       << "  --list-presets          Print available preset IDs and exit\n"
@@ -323,6 +329,11 @@ Config parse_args(int argc, char** argv) {
 
     if (arg == "--batch") {
       cfg.batch = true;
+      continue;
+    }
+
+    if (arg == "--burst-native") {
+      cfg.burst_native = true;
       continue;
     }
 
@@ -506,6 +517,41 @@ BurstMetrics compute_burst_metrics(const double* samples, std::size_t n) {
   m.impulse_factor = safe_div(peak, mean_abs);
   m.shape_factor = safe_div(rms, mean_abs);
   return m;
+}
+
+// Vectorized burst aggregator matching the vibration_moments view shape.
+// Writes 10 doubles in the order the SQL view emits them, so the downstream
+// preset pipelines consume the result unchanged. A single pass over the
+// amplitude buffer produces every field.
+inline void compute_vibration_moments_agg(const double* amplitude, std::size_t n,
+                                            double device_id, double channel_id,
+                                            double* out /* size 10 */) {
+  double sum = 0.0, sum2 = 0.0, sum3 = 0.0, sum4 = 0.0;
+  double sum_abs = 0.0, sum_sqrt_abs = 0.0;
+  double peak = 0.0;
+  for (std::size_t i = 0; i < n; ++i) {
+    const double x = amplitude[i];
+    const double ax = std::fabs(x);
+    const double x2 = x * x;
+    sum += x;
+    sum2 += x2;
+    sum3 += x2 * x;
+    sum4 += x2 * x2;
+    sum_abs += ax;
+    sum_sqrt_abs += std::sqrt(ax);
+    if (ax > peak) peak = ax;
+  }
+  const double dn = n == 0 ? 1.0 : static_cast<double>(n);
+  out[0] = device_id;
+  out[1] = channel_id;
+  out[2] = sum / dn;           // mean_value = AVG(amplitude)
+  out[3] = sum2 / dn;          // ex2 = AVG(amplitude^2)
+  out[4] = sum3 / dn;          // ex3 = AVG(amplitude^3)
+  out[5] = sum4 / dn;          // ex4 = AVG(amplitude^4)
+  out[6] = peak;               // peak_value = MAX(ABS(amplitude))
+  out[7] = sum_abs / dn;       // mean_abs = AVG(ABS(amplitude))
+  out[8] = sum_sqrt_abs / dn;  // mean_sqrt_abs = AVG(SQRT(ABS(amplitude)))
+  out[9] = static_cast<double>(n);  // sample_count = COUNT(*)
 }
 
 int run_pure_cpp(const Config& cfg) {
@@ -794,9 +840,47 @@ int main(int argc, char** argv) {
       dispatch_base_batch(batch);
     };
 
+    // Shared amplitude buffer reused across bursts for the burst-native path.
+    std::vector<double> amp_buf;
+    if (cfg.burst_native) {
+      amp_buf.resize(static_cast<std::size_t>(cfg.samples_per_burst));
+      for (int i = 0; i < cfg.samples_per_burst; ++i) {
+        amp_buf[static_cast<std::size_t>(i)] = synthetic_amplitude(i);
+      }
+    }
+
+    // Burst-native fast path: skip the base_program entirely. Compute the
+    // vibration_moments aggregate in one vectorized pass over the amplitude
+    // buffer, wrap the 10-field result in a VectorNumberData message, and
+    // feed it directly to each downstream preset pipeline. Exercises the
+    // burst-aggregate ceiling through rtbot's downstream graph.
+    auto feed_burst_native = [&](int bearing, rtbot::timestamp_t boundary_ts) {
+      double agg[10];
+      compute_vibration_moments_agg(amp_buf.data(), amp_buf.size(),
+                                     static_cast<double>(bearing), 1.0, agg);
+      // One burst of "samples" ingressed — charge the amplitude samples + the
+      // sentinel so the msg/s number is comparable with the other modes.
+      ingress_messages += static_cast<std::uint64_t>(cfg.samples_per_burst) + 1;
+      ++base_outputs;
+      ++program_receive_calls;  // the single aggregate emission
+      auto vec_msg = make_vector_message(
+          boundary_ts,
+          std::vector<double>(agg, agg + 10));
+      for (auto& pipeline : pipelines) {
+        ++pipeline->forwarded_messages;
+        auto output_batch = pipeline->program.receive(
+            make_vector_message(vec_msg->time, *vec_msg->data.values), "i1");
+        const auto produced = count_total_messages(output_batch);
+        pipeline->output_messages += produced;
+        materialized_outputs += produced;
+      }
+    };
+
     for (int burst = 1; burst <= cfg.bursts; ++burst) {
       for (int bearing = 1; bearing <= cfg.bearings; ++bearing) {
-        if (cfg.batch) {
+        if (cfg.burst_native) {
+          feed_burst_native(bearing, timestamp + cfg.samples_per_burst);
+        } else if (cfg.batch) {
           feed_burst_batched(bearing);
         } else {
           for (int sample = 0; sample < cfg.samples_per_burst; ++sample) {
