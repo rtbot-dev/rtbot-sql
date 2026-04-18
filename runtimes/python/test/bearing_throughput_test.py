@@ -74,9 +74,16 @@ def _generate_burst_amplitudes(num_samples: int) -> np.ndarray:
     return amps
 
 
-def _bool_env(name: str, default: bool = False) -> bool:
-    v = os.environ.get(name, "")
-    return v.strip().lower() in ("1", "true", "yes", "on")
+def _bool_env(name: str, *, default: bool = False) -> bool:
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    s = v.strip().lower()
+    if s in ("1", "true", "yes", "on"):
+        return True
+    if s in ("0", "false", "no", "off"):
+        return False
+    return default
 
 
 def _int_env(name: str, default: int) -> int:
@@ -95,7 +102,9 @@ class BearingThroughputTest(unittest.TestCase):
     NUM_BURSTS = _int_env("RTBOT_BENCHMARK_BURSTS", 300)
 
     def test_bearing_preset_throughput(self):
-        use_session = _bool_env("RTBOT_BENCHMARK_SESSION")
+        # Session mode is the default; RTBOT_BENCHMARK_SESSION=0 opts
+        # out to measure the per-view-cascade fallback path.
+        use_session = _bool_env("RTBOT_BENCHMARK_SESSION", default=True)
         sql = rtbot_sql.RtBotSql(use_consolidated_session=use_session)
         sql.execute(SQL_STREAM)
         sql.execute(SQL_BASE_VIEW)

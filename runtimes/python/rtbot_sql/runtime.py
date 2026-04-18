@@ -7,7 +7,7 @@ import re
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple  # noqa: F401
 
 from .catalog import InMemoryCatalog, StreamSchema, ViewMeta
 from .compiler import compile_select_to_program, compile_sql, native
@@ -57,7 +57,7 @@ def _extract_limit(sql: str) -> Optional[int]:
 
 
 class RtBotSql:
-  def __init__(self, *, use_consolidated_session: bool = False) -> None:
+  def __init__(self, *, use_consolidated_session: bool = True) -> None:
     self._catalog = InMemoryCatalog()
     self._store = InMemoryStreamStore()
     self._runner = LocalPipelineRunner()
@@ -72,12 +72,14 @@ class RtBotSql:
     self._time_formatter: Optional[Callable[[List[int]], List[Any]]] = None
     self._ts_units_per_second: int = 1_000_000
 
-    # Consolidated-session mode: when on, all registered views are
-    # compiled into one rtbot Program at first insert and data is fed
-    # through a single session pipeline. Mirrors the Java
-    # setUseConsolidatedSession path. Deploy-time only — DDL after the
-    # session is deployed is rejected.
+    # Consolidated-session mode: on by default. All registered views
+    # are compiled into a single rtbot Program at first insert. If
+    # compile_session fails (e.g. the catalog has a Stream JOIN Table
+    # view that session mode doesn't yet support) the runtime
+    # auto-falls-back to the per-view cascade; subsequent DDL
+    # invalidates the session so the next insert reattempts.
     self._use_consolidated_session: bool = bool(use_consolidated_session)
+    self._session_fallback_active: bool = False
     self._session_pipeline: Optional[Any] = None
     self._session_op_to_view: Dict[str, str] = {}
     self._session_stream_port: Dict[str, str] = {}
@@ -268,6 +270,9 @@ class RtBotSql:
       for out in outputs:
         self._append_and_propagate(name, out.timestamp, out.values)
 
+    # Catalog changed — the next insert must rebuild the session.
+    self._invalidate_session()
+
   def _handle_drop(self, result: native.CompilationResult) -> None:
     name = result.drop_entity_name
 
@@ -283,6 +288,7 @@ class RtBotSql:
       dependents.discard(name)
 
     self._dependencies.pop(name, None)
+    self._invalidate_session()
 
   def _feed_dependent_pipeline(
       self,
@@ -621,9 +627,9 @@ class RtBotSql:
         )
 
     # Consolidated-session hot path: one native call feeds the merged
-    # Program; demux by op id to each materialized view.
-    if self._use_consolidated_session:
-      self._ensure_session_deployed()
+    # Program; demux by op id to each view terminal. Falls through to
+    # the per-view cascade if compile_session isn't viable.
+    if self._use_consolidated_session and self._ensure_session_deployed():
       port = self._session_stream_port.get(stream_name, "i1")
       outputs = self._runner.feed_session_buffer(
           self._session_pipeline, ts_arr, val_arr, port=port,
@@ -734,11 +740,10 @@ class RtBotSql:
         self._store.append(stream_name, int(timestamps[i]), value_cols[i].tolist())
 
     # Consolidated-session hot path: one native call feeds the single
-    # merged Program; outputs are demuxed to each materialized view by
-    # operator id. Session internal wiring has already routed between
-    # views, so appendAndPropagate is called with propagate=False.
-    if self._use_consolidated_session:
-      self._ensure_session_deployed()
+    # merged Program; outputs are demuxed to each view terminal by
+    # operator id. Falls through to the per-view cascade if
+    # compile_session isn't viable (table JOIN, etc.).
+    if self._use_consolidated_session and self._ensure_session_deployed():
       port = self._session_stream_port.get(stream_name, "i1")
       outputs = self._runner.feed_session_buffer(
           self._session_pipeline, timestamps, value_cols, port=port,
@@ -802,19 +807,27 @@ class RtBotSql:
       return
     # Tear down any previously deployed session so the next insert
     # rebuilds from the current catalog.
-    self._session_pipeline = None
-    self._session_op_to_view = {}
-    self._session_stream_port = {}
+    self._invalidate_session()
     self._use_consolidated_session = enabled
 
-  def _ensure_session_deployed(self) -> None:
+  def _ensure_session_deployed(self) -> bool:
+    """Lazily compile and deploy the consolidated session. Returns True
+    if session is usable after this call, False if the catalog isn't
+    session-compatible (sets ``_session_fallback_active`` so later
+    inserts route through the per-view cascade).
+    """
     if self._session_pipeline is not None:
-      return
+      return True
+    if self._session_fallback_active:
+      return False
     snapshot = self._catalog.snapshot()
     result = native.compile_session(snapshot)
     errors = result.get("errors", [])
     if errors:
-      raise SqlError([e.get("message", str(e)) for e in errors])
+      # Catalog not representable as a session (table JOIN, unknown
+      # source, …). Fall back to the per-view cascade.
+      self._session_fallback_active = True
+      return False
 
     view_terminals = dict(result.get("view_terminals", {}))
     # op_id -> view_name (inverse of view_terminals).
@@ -827,6 +840,36 @@ class RtBotSql:
     self._session_pipeline = self._runner.deploy_session(
         result["program_json"], op_ids,
     )
+    self._backfill_session_from_store()
+    return True
+
+  def _backfill_session_from_store(self) -> None:
+    """Replay stored base-stream data through the fresh session so a
+    newly built session inherits the state the per-view pipelines
+    already had (e.g. after DROP+recreate or when a view is created
+    after inserts)."""
+    events: List[Tuple[int, int, str, List[float]]] = []
+    stream_idx = 0
+    for stream, port in self._session_stream_port.items():
+      for msg in self._store.read(stream):
+        events.append((int(msg.timestamp), stream_idx, port,
+                        [float(v) for v in msg.values]))
+      stream_idx += 1
+    if not events:
+      return
+    events.sort(key=lambda e: (e[0], e[1]))
+    for ts, _idx, port, values in events:
+      # Discard outputs — per-view pipelines already surfaced them
+      # to subscribers/store at original insert time.
+      self._session_pipeline.feed(ts, values, port)
+
+  def _invalidate_session(self) -> None:
+    """Tear down the consolidated session so the next insert rebuilds
+    it from the current catalog. Called after every DDL."""
+    self._session_pipeline = None
+    self._session_op_to_view = {}
+    self._session_stream_port = {}
+    self._session_fallback_active = False
 
   def _insert_dataframe_slow(
       self,
