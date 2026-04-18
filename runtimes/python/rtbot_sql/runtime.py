@@ -57,7 +57,7 @@ def _extract_limit(sql: str) -> Optional[int]:
 
 
 class RtBotSql:
-  def __init__(self) -> None:
+  def __init__(self, *, use_consolidated_session: bool = False) -> None:
     self._catalog = InMemoryCatalog()
     self._store = InMemoryStreamStore()
     self._runner = LocalPipelineRunner()
@@ -71,6 +71,16 @@ class RtBotSql:
     self._time_unit_override: Optional[str] = None
     self._time_formatter: Optional[Callable[[List[int]], List[Any]]] = None
     self._ts_units_per_second: int = 1_000_000
+
+    # Consolidated-session mode: when on, all registered views are
+    # compiled into one rtbot Program at first insert and data is fed
+    # through a single session pipeline. Mirrors the Java
+    # setUseConsolidatedSession path. Deploy-time only — DDL after the
+    # session is deployed is rejected.
+    self._use_consolidated_session: bool = bool(use_consolidated_session)
+    self._session_pipeline: Optional[Any] = None
+    self._session_op_to_view: Dict[str, str] = {}
+    self._session_stream_port: Dict[str, str] = {}
 
   def _next_timestamp(self) -> int:
     now = int(time.time() * 1000)
@@ -294,7 +304,14 @@ class RtBotSql:
     port = port_map.get(stream_name, "i1")
     return self._runner.feed(pipeline_id, timestamp, values, port=port)
 
-  def _append_and_propagate(self, stream_name: str, timestamp: int, values: List[float]) -> None:
+  def _append_and_propagate(
+      self,
+      stream_name: str,
+      timestamp: int,
+      values: List[float],
+      *,
+      propagate: bool = True,
+  ) -> None:
     # Only store output for streams and materialized views.
     # Plain VIEWs are building blocks — they propagate to dependents but
     # don't persist output (SELECT FROM VIEW uses Tier 3 ephemeral replay).
@@ -312,6 +329,9 @@ class RtBotSql:
           and 0 <= view.key_index < len(values)
       ):
         self._catalog.add_key(stream_name, float(values[view.key_index]))
+
+    if not propagate:
+      return
 
     for dependent in list(self._dependencies.get(stream_name, set())):
       outputs = self._feed_dependent_pipeline(dependent, stream_name, timestamp, values)
@@ -542,6 +562,113 @@ class RtBotSql:
         f"CREATE {kind} {view_name} AS /* sources: {sources} */;"
     )
 
+  def insert_buffer(
+      self,
+      stream_name: str,
+      timestamps: Any,
+      value_columns: Any,
+      *,
+      store_raw: bool = False,
+  ) -> InsertResult:
+    """Ingest a batch of rows from numpy arrays without a DataFrame wrapper.
+
+    Parameters are column-major inputs matched to the schema order of the
+    target stream:
+
+      - ``timestamps`` — 1D int64-coercible array of monotone timestamps.
+      - ``value_columns`` — 2D float64-coercible array of shape
+        ``(n_rows, n_cols)`` (row-major); ``n_cols`` must equal the
+        target stream's column count.
+
+    Mirrors the Java ``insertBuffer(String, long[], double[][])`` fast
+    path: data goes straight to the buffer API (``receive_buffer``) with
+    no DataFrame round-trip, no row-by-row Python iteration.
+    """
+    if not _HAS_NUMPY:
+      raise ImportError("insert_buffer requires numpy")
+
+    schema = self._catalog.lookup_stream(stream_name)
+    if schema is None:
+      raise SqlError([f"Unknown stream: {stream_name}"])
+
+    ts_arr = np.ascontiguousarray(timestamps, dtype=np.int64)
+    val_arr = np.ascontiguousarray(value_columns, dtype=np.float64)
+    if ts_arr.ndim != 1:
+      raise SqlError(["insert_buffer: timestamps must be 1D"])
+    if val_arr.ndim != 2:
+      raise SqlError(["insert_buffer: value_columns must be 2D"])
+    if ts_arr.shape[0] != val_arr.shape[0]:
+      raise SqlError([
+          "insert_buffer: row count mismatch between timestamps "
+          f"({ts_arr.shape[0]}) and value_columns ({val_arr.shape[0]})"
+      ])
+    if schema.columns and val_arr.shape[1] != len(schema.columns):
+      raise SqlError([
+          f"insert_buffer column count mismatch for {stream_name}: "
+          f"schema={len(schema.columns)}, got={val_arr.shape[1]}"
+      ])
+
+    row_count = int(ts_arr.shape[0])
+    if row_count == 0:
+      return InsertResult(rows=0, elapsed_s=0.0, rows_per_sec=0.0)
+
+    t0 = time.perf_counter()
+
+    if store_raw:
+      for i in range(row_count):
+        self._store.append(
+            stream_name, int(ts_arr[i]), val_arr[i].tolist(),
+        )
+
+    # Consolidated-session hot path: one native call feeds the merged
+    # Program; demux by op id to each materialized view.
+    if self._use_consolidated_session:
+      self._ensure_session_deployed()
+      port = self._session_stream_port.get(stream_name, "i1")
+      outputs = self._runner.feed_session_buffer(
+          self._session_pipeline, ts_arr, val_arr, port=port,
+      )
+      for out in outputs:
+        view_name = self._session_op_to_view.get(out.operator_id)
+        if view_name is None:
+          continue
+        self._append_and_propagate(
+            view_name, out.timestamp, out.values, propagate=False,
+        )
+      elapsed = time.perf_counter() - t0
+      rps = row_count / elapsed if elapsed > 0 else float('inf')
+      return InsertResult(rows=row_count, elapsed_s=elapsed, rows_per_sec=rps)
+
+    # Baseline: fan out to dependent views one-by-one through the buffer API.
+    dependents = list(self._dependencies.get(stream_name, set()))
+    for dep in dependents:
+      pipeline_id = self._view_pipelines.get(dep)
+      if pipeline_id is None:
+        continue
+      port_map = self._view_port_maps.get(dep, {})
+      port = port_map.get(stream_name, "i1")
+      view = self._catalog.lookup_view(dep)
+      is_multi_source = view is not None and len(view.source_streams) > 1
+
+      if not is_multi_source:
+        outputs = self._runner.feed_buffer(
+            pipeline_id, ts_arr, val_arr, port=port,
+        )
+        for out in outputs:
+          self._append_and_propagate(dep, out.timestamp, out.values)
+      else:
+        # Multi-source dep still needs row-by-row routing to the correct port.
+        for i in range(row_count):
+          ts_i = int(ts_arr[i])
+          vals_i = val_arr[i].tolist()
+          outputs = self._runner.feed(pipeline_id, ts_i, vals_i, port=port)
+          for out in outputs:
+            self._append_and_propagate(dep, out.timestamp, out.values)
+
+    elapsed = time.perf_counter() - t0
+    rps = row_count / elapsed if elapsed > 0 else float('inf')
+    return InsertResult(rows=row_count, elapsed_s=elapsed, rows_per_sec=rps)
+
   def insert_dataframe(
       self,
       stream_name: str,
@@ -606,6 +733,25 @@ class RtBotSql:
       for i in range(row_count):
         self._store.append(stream_name, int(timestamps[i]), value_cols[i].tolist())
 
+    # Consolidated-session hot path: one native call feeds the single
+    # merged Program; outputs are demuxed to each materialized view by
+    # operator id. Session internal wiring has already routed between
+    # views, so appendAndPropagate is called with propagate=False.
+    if self._use_consolidated_session:
+      self._ensure_session_deployed()
+      port = self._session_stream_port.get(stream_name, "i1")
+      outputs = self._runner.feed_session_buffer(
+          self._session_pipeline, timestamps, value_cols, port=port,
+      )
+      for out in outputs:
+        view_name = self._session_op_to_view.get(out.operator_id)
+        if view_name is None:
+          continue
+        self._append_and_propagate(
+            view_name, out.timestamp, out.values, propagate=False,
+        )
+      return row_count
+
     # Feed all dependent views. Single-source views use batch path (one C++
     # call). Multi-source views use row-by-row since each row must be routed
     # to the correct input port independently.
@@ -622,8 +768,11 @@ class RtBotSql:
       is_multi_source = view is not None and len(view.source_streams) > 1
 
       if not is_multi_source:
-        # Batch path: one C++ call for all rows
-        outputs = self._runner.feed_batch(pipeline_id, timestamps, value_cols, port=port)
+        # Buffer path: one C++ call; numpy row-major array is handed
+        # directly to Program::receive_buffer with no transpose.
+        outputs = self._runner.feed_buffer(
+            pipeline_id, timestamps, value_cols, port=port,
+        )
         for out in outputs:
           self._append_and_propagate(dep, out.timestamp, out.values)
       else:
@@ -636,6 +785,48 @@ class RtBotSql:
             self._append_and_propagate(dep, out.timestamp, out.values)
 
     return row_count
+
+  # --- Consolidated-session helpers ---------------------------------
+
+  def set_use_consolidated_session(self, enabled: bool) -> None:
+    """Enable or disable consolidated-session ingest mode.
+
+    When enabled, :meth:`insert_dataframe` routes through a single
+    merged rtbot Program built from every registered view; one native
+    call per batch, Collector-sink outputs demuxed by op id to each
+    materialized view. Deploy-time only — creating or dropping a view
+    after the session has been deployed raises an error.
+    """
+    enabled = bool(enabled)
+    if enabled == self._use_consolidated_session:
+      return
+    # Tear down any previously deployed session so the next insert
+    # rebuilds from the current catalog.
+    self._session_pipeline = None
+    self._session_op_to_view = {}
+    self._session_stream_port = {}
+    self._use_consolidated_session = enabled
+
+  def _ensure_session_deployed(self) -> None:
+    if self._session_pipeline is not None:
+      return
+    snapshot = self._catalog.snapshot()
+    result = native.compile_session(snapshot)
+    errors = result.get("errors", [])
+    if errors:
+      raise SqlError([e.get("message", str(e)) for e in errors])
+
+    view_terminals = dict(result.get("view_terminals", {}))
+    # op_id -> view_name (inverse of view_terminals).
+    self._session_op_to_view = {
+        op_id: view_name for view_name, op_id in view_terminals.items()
+    }
+    self._session_stream_port = dict(result.get("base_stream_ports", {}))
+
+    op_ids = list(view_terminals.values())
+    self._session_pipeline = self._runner.deploy_session(
+        result["program_json"], op_ids,
+    )
 
   def _insert_dataframe_slow(
       self,
