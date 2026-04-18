@@ -70,26 +70,30 @@ rtbot-sql/
 ## Compilation pipeline
 
 ```
-SQL statement
-    |
-    v
-Parser (libpg_query) --> AST
-    |
-    v
-Analyzer (scope resolution, name binding)
-    |
-    v
-Planner (tier classification)
-    |
-    v
-Compiler (expression, function, SELECT, WHERE, GROUP BY)
-    |
-    v
-Graph Builder
-    |
-    v
-Operator graph (JSON) --> three backends: Browser (WASM) | Python (native C++) | Redis (module)
+SQL statement(s)                         Catalog snapshot
+    |                                           |
+    v                                           v
+Parser (libpg_query) --> AST --> Analyzer (scope resolution) --> Planner (tier)
+                                                                       |
+                                                                       v
+                                                Compiler (expression / function / SELECT / WHERE / GROUP BY)
+                                                                       |
+                          +----------------------------+---------------+
+                          |                            |
+                          v                            v
+                per-statement CompilationResult    consolidated-session compile
+                (legacy per-view cascade)           compile_session_program(catalog)
+                                                            |
+                                                            v
+                                       single rtbot Program JSON with a shared Input
+                                       per base stream and a Collector sink per
+                                       materialized view terminal
+                                                            |
+                                                            v
+          three backends: Browser (WASM) | Python (native) | Java (JNI) | Redis (module)
 ```
+
+**Consolidated session is the default deployment target.** It compiles every view in the catalog into a single rtbot Program: topo-sorted view subgraphs are merged with a `<view>__<id>` prefix so ids stay unique, wired to one shared `Input` operator per base stream, and every view terminal is exposed via a `Collector` sink. Cycles between views are rejected with a `CycleDetected` error. Multi-base-stream views (cross-select) and table→changelog JOINs are supported: tables appear as additional session input ports.
 
 ### Execution tiers
 
@@ -154,17 +158,28 @@ Evaluator expression types: ColumnAccess, ConstantExpr, BinaryOpExpr, Comparison
 Top-level compilation interface (`include/rtbot_sql/api/compiler.h`):
 
 ```cpp
+// Compile one SQL statement in isolation (legacy per-view form).
 CompilationResult compile_sql(const string& sql, const CatalogSnapshot& catalog);
 
 ExpandedCompilationResult compile_sql_expanded(
     const string& sql, const CatalogSnapshot& catalog, int64_t ts_units_per_second);
+
+// Compile every view in the catalog into one rtbot Program. This is the
+// canonical path used by all runtimes (Python, Java, browser, Redis).
+SessionCompilationResult compile_session_program(const CatalogSnapshot& catalog);
 
 Tier2FilterResult apply_tier2_filter(
     const string& sql, const CatalogSnapshot& catalog,
     const vector<vector<double>>& input_rows, int limit = -1);
 ```
 
-**CompilationResult** contains: `program_json` (rtbot operator graph), `field_map` (column name -> vector position), `source_streams` (input streams), `view_type` (SCALAR/KEYED/TOPK), `select_tier`.
+**CompilationResult** contains: `program_json`, `field_map` (column name -> vector position), `source_streams`, `view_type` (SCALAR/KEYED/TOPK), `select_tier`.
+
+**SessionCompilationResult** contains: `program_json`, `view_terminals` (view → terminal operator id), `view_terminal_ports` (view → output port id), `materialized_views` (subset of terminals attached to Program output Collectors), `base_stream_inputs`/`base_stream_ports` (base-stream → shared Input operator + port), `errors`.
+
+Shared binary I/O infrastructure lives in `include/rtbot_sql/api/batch_decoder.h`:
+- `SessionOutputRegistry` — per-Program op_id → index map so runtimes can decode output frames by integer index rather than string lookup.
+- `BatchDecoder` — decodes the binary output frame format (`int32 num_outputs`, then per output: `int32 opIdx`, `int32 nVals`, `int64 ts`, `float64[nVals]`). Consumed unchanged by every runtime.
 
 Types defined in `include/rtbot_sql/api/types.h`:
 - ColumnType: DOUBLE, TEXT
@@ -181,7 +196,7 @@ Primary user-facing API in `rtbot_sql/__init__.py`:
 from rtbot_sql import RtBotSql
 
 sql = RtBotSql()
-sql.execute("CREATE STREAM sensors (temperature DOUBLE)")
+sql.execute("CREATE STREAM sensors (temperature DOUBLE, device_id TEXT)")
 sql.execute("""
   CREATE MATERIALIZED VIEW stats AS
     SELECT temperature,
@@ -189,20 +204,24 @@ sql.execute("""
            MOVING_STD(temperature, 50) AS std_temp
     FROM sensors
 """)
-result = sql.execute("SELECT * FROM stats WHERE ...")
+
+# Zero-copy fast path: pass timestamps + per-column numpy arrays directly.
+sql.insert_buffer("sensors", timestamps_ns, value_columns)
+
+# Convenience path that accepts a pandas DataFrame.
 sql.insert_dataframe("sensors", dataframe)
-sql.show_graph("stats")
-sql.explain("SELECT ...")
+
+result = sql.execute("SELECT * FROM stats WHERE ...")
 ```
 
-Key classes in `runtime.py`:
-- `RtBotSql` -- main user-facing API
+Key classes:
+- `RtBotSql` (`runtime.py`) -- main user-facing API
 - `InMemoryCatalog` -- Python-side schema registry
-- `InMemoryStreamStore` -- stores input data for replay
-- `LocalPipelineRunner` -- manages deployed pipelines via C++ NativePipeline
-- `PipelineOutput` -- result data from pipeline execution
+- `InMemoryStreamStore` -- stores input data for replay / backfill
+- `LocalPipelineRunner` (`pipeline_runner.py`) -- compiles the current catalog via `compile_session_program`, instantiates a single `NativeSessionPipeline` (pybind11), backfills it from the stream store, and dispatches incoming rows
+- `PipelineOutput` -- decoded session output frames (via the shared `BatchDecoder`)
 
-C++ bindings via pybind11 (`_rtbot_sql_native`). Supports fast batch path for pandas DataFrames.
+C++ bindings via pybind11 (`_rtbot_sql_native`): exposes `NativeSessionPipeline`, `compile_session`, and a zero-copy `feed_buffer` taking numpy arrays via `py::buffer.request()`. Legacy `NativePipeline.feed_batch` / `feed_buffer` / `run` / `InputVectorMessage` have been removed.
 
 ### CLI (`apps/cli/`)
 
@@ -214,11 +233,11 @@ echo "SELECT ... FROM trades" | dist/bin/apps/cli/rtbot-sql --catalog examples/c
 
 ### Browser/WASM (`runtimes/browser/`)
 
-Emscripten-compiled WASM interface.
+Emscripten-compiled WASM interface. Exposes `compileSessionJson(catalogJson)` which returns the same `SessionCompilationResult` shape as the native C++ API.
 
 ### Java (`runtimes/java/`)
 
-JNI bindings with JDK21.
+JNI bindings with JDK21. `RtBotSqlRuntime` is session-only: it caches `SessionViewInfo` at deploy time, feeds rows via `feedPipelineBufferSession(port_index, …)` (binary frame), and persists state under `SESSION_STATE_KEY` for serialize/restore. Legacy per-view cascade + `feedPipelineBatchI1` / `feedPipelineBufferI1` bindings have been removed. Backfill-from-store rewires a freshly deployed session to replay historical input.
 
 ### Redis (`runtimes/redis/` and `apps/redis-ext/`)
 
@@ -276,7 +295,10 @@ Sample catalog (`examples/catalog.json`):
 
 ## Operator types generated
 
-The compiler produces these rtbot operator types in the JSON graph: Input, Output, VectorExtract, VectorProject, VectorCompose, Join, Addition, Subtraction, Multiplication, Division, CumulativeSum, CountNumber, Average, MovingAverage, StandardDeviation, FIR, IIR, Resample, PeakDetect, FusedExpression (bytecode-optimized arithmetic + projection), KeyedPipeline (hash-based partitioned sub-graphs).
+The compiler produces these rtbot operator types in the JSON graph:
+Input (one per base stream in session mode, multi-port), VectorExtract, VectorProject, VectorCompose, Join, Addition, Subtraction, Multiplication, Division, CumulativeSum, CountNumber, Average, MovingAverage, StandardDeviation, FIR, IIR, Resample, PeakDetect, FusedExpression / FusedExpressionVector (bytecode-optimized arithmetic + projection, from `libs/fuse/` in rtbot), KeyedPipeline (hash-based partitioned sub-graphs).
+
+Session-mode programs do **not** emit `Output` operators — each materialized view terminal is attached to a Program-owned `Collector` sink so the runtime can read its output frames directly.
 
 ## Documentation
 
