@@ -1,16 +1,11 @@
 """Python-side throughput benchmark mirroring Java's BearingLoadTest.
 
 Measures msgs/sec of the rotating-machinery preset under
-insert_dataframe()-driven ingestion. Two modes are exposed via the
-RTBOT_BENCHMARK_SESSION env var (matching Java's -Drtbot.benchmark.session):
-
-  - baseline (default): per-view cascade through LocalPipelineRunner.
-  - consolidated session: single rtbot Program, one native feed per batch.
+insert_buffer()-driven ingestion through the consolidated-session
+runtime (single rtbot Program, one native feed per batch).
 
 Usage:
   bazel test //runtimes/python:bearing_throughput_test --test_output=all
-  bazel test //runtimes/python:bearing_throughput_test --test_output=all \
-      --test_env=RTBOT_BENCHMARK_SESSION=1
 """
 
 import gc

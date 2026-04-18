@@ -53,8 +53,9 @@ public class RtBotSqlRuntime {
     private SessionViewInfo[] sessionTerminalsByIndex = new SessionViewInfo[0];
     /**
      * Side-index keyed by operator id string. Used only by the JSON-output
-     * fallback paths ({@link #feedSessionRow3}, {@link #feedSessionRow},
-     * non-"i1"-port sessions). Hot path uses the index array.
+     * per-row insert paths ({@link #feedSessionRow3},
+     * {@link #feedSessionRow}) that consume JSON outputs. Hot path
+     * (buffered feed) uses the index-keyed array.
      */
     private Map<String, SessionViewInfo> sessionOpIdToInfo = Collections.emptyMap();
     /** base stream name -> port id on the session Input */
@@ -497,10 +498,10 @@ public class RtBotSqlRuntime {
         this.sessionStreamPort = sp;
 
         // Backfill: replay all stored base-stream messages through the
-        // fresh session in global timestamp order so a newly built
-        // session picks up the state the per-view pipelines already had
-        // from their own backfillInterleaved (e.g. after DROP+recreate
-        // or when a view is created after data has been inserted).
+        // freshly deployed session in global timestamp order so newly
+        // registered views inherit history from their source streams
+        // (e.g. after DROP+recreate or when a view is created after
+        // data has already been inserted).
         backfillSessionFromStore();
     }
 
@@ -1267,10 +1268,8 @@ public class RtBotSqlRuntime {
 
     public Map<String, String> serializeState() {
         Map<String, String> state = new HashMap<>();
-        // When the consolidated session owns the live state (it handled
-        // the inserts), that single blob is authoritative. Per-view
-        // pipelines in session mode are never fed, so their state is
-        // only useful in the fallback path.
+        // The consolidated session owns all live operator state; its
+        // single blob is the authoritative snapshot.
         if (sessionPipelineId != null) {
             try {
                 state.put(SESSION_STATE_KEY, runner.serialize(sessionPipelineId));

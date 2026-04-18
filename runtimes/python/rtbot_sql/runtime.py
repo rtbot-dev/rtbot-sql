@@ -714,10 +714,10 @@ class RtBotSql:
     self._backfill_session_from_store()
 
   def _backfill_session_from_store(self) -> None:
-    """Replay stored base-stream data through the fresh session so a
-    newly built session inherits the state the per-view pipelines
-    already had (e.g. after DROP+recreate or when a view is created
-    after inserts)."""
+    """Replay stored base-stream data through a freshly deployed
+    session so newly registered views inherit history from their
+    source streams (e.g. after DROP+recreate or when a view is
+    created after inserts)."""
     events: List[Tuple[int, int, str, List[float]]] = []
     stream_idx = 0
     for stream, port in self._session_stream_port.items():
