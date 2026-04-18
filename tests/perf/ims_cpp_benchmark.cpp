@@ -16,8 +16,11 @@
 
 #include <nlohmann/json.hpp>
 
+#include "rtbot/Collector.h"
 #include "rtbot/Message.h"
 #include "rtbot/Program.h"
+#include "rtbot/fuse/BurstAggregate.h"
+#include "rtbot/fuse/FusedOps.h"
 
 namespace {
 
@@ -163,6 +166,8 @@ struct Config {
   bool pure_cpp = false;
   bool batch = false;
   bool burst_native = false;
+  bool burst_aggregate = false;
+  bool burst_buffer = false;
   bool count_operators = false;
   std::vector<std::string> presets = {
       "01_rms",
@@ -239,6 +244,15 @@ void print_help(const char* argv0) {
       << "                          kernel over the burst and feed the 10-field result\n"
       << "                          directly to downstream presets. Measures the\n"
       << "                          burst-aggregate ceiling via the rtbot downstream graph.\n"
+      << "  --burst-aggregate       Replace the base program with a BurstAggregate operator\n"
+      << "                          driven by fused bytecode. Same semantics as\n"
+      << "                          --burst-native but exercises the real rtbot operator\n"
+      << "                          path (Message input, bytecode per-sample loop,\n"
+      << "                          emit-on-segment). Measures the productized path.\n"
+      << "  --burst-buffer          Same as --burst-aggregate but feeds BurstAggregate\n"
+      << "                          via the raw-buffer API (Operator::receive_data_buffer).\n"
+      << "                          Zero Message allocations on the hot path — measures\n"
+      << "                          the full ceiling through the productized operator.\n"
       << "  --count-operators       Compile each preset and print operator counts\n"
       << "                          (set RTBOT_DISABLE_FUSION=1 to compare without)\n"
       << "  --list-presets          Print available preset IDs and exit\n"
@@ -334,6 +348,16 @@ Config parse_args(int argc, char** argv) {
 
     if (arg == "--burst-native") {
       cfg.burst_native = true;
+      continue;
+    }
+
+    if (arg == "--burst-aggregate") {
+      cfg.burst_aggregate = true;
+      continue;
+    }
+
+    if (arg == "--burst-buffer") {
+      cfg.burst_buffer = true;
       continue;
     }
 
@@ -849,6 +873,71 @@ int main(int argc, char** argv) {
       }
     }
 
+    // Pre-build the raw-buffer input for --burst-buffer: a flat row-major
+    // buffer of [device_id, channel_id, amplitude] triples plus parallel
+    // timestamps. Reused across bursts to avoid per-iteration allocation
+    // noise in the measurement.
+    std::vector<double> raw_rows;
+    std::vector<rtbot::timestamp_t> raw_times;
+    if (cfg.burst_buffer) {
+      const std::size_t total_rows =
+          static_cast<std::size_t>(cfg.samples_per_burst) + 1;
+      raw_rows.resize(total_rows * 3);
+      raw_times.resize(total_rows);
+    }
+
+    // Burst-aggregate path: a real BurstAggregate operator driven by fused
+    // bytecode runs the aggregate + segment predicate directly in one pass
+    // per burst. We wire a Collector to capture its output and forward it
+    // to the preset pipelines — same downstream shape as the full SQL path.
+    std::shared_ptr<rtbot::BurstAggregate> burst_op;
+    std::shared_ptr<rtbot::Collector> burst_sink;
+    if (cfg.burst_aggregate || cfg.burst_buffer) {
+      using namespace rtbot::fused_op;
+      // Aggregate bytecode matching vibration_moments' SELECT list.
+      // State layout (derived by pack_bytecode + the shared-COUNT trick the
+      // compiler uses): slot 2 is the shared count slot that later STATE_LOADs
+      // read to avoid re-incrementing.
+      //
+      //   END 0: AVG(amp)                     → CUMSUM slot 0, COUNT slot 2
+      //   END 1: AVG(amp^2)                   → CUMSUM slot 3, STATE_LOAD 2
+      //   END 2: AVG(amp^3)                   → CUMSUM slot 5, STATE_LOAD 2
+      //   END 3: AVG(amp^4)                   → CUMSUM slot 7, STATE_LOAD 2
+      //   END 4: MAX(|amp|)                   → MAX_AGG slot 9
+      //   END 5: AVG(|amp|)                   → CUMSUM slot 10, STATE_LOAD 2
+      //   END 6: AVG(sqrt(|amp|))             → CUMSUM slot 12, STATE_LOAD 2
+      //   END 7: COUNT(*)                     → STATE_LOAD 2
+      std::vector<double> agg_bc = {
+          // AVG(amp)
+          INPUT, 2, CUMSUM, 0, COUNT, 2, DIV, END,
+          // AVG(amp^2)
+          INPUT, 2, INPUT, 2, MUL, CUMSUM, 3, STATE_LOAD, 2, DIV, END,
+          // AVG(amp^3)
+          INPUT, 2, INPUT, 2, INPUT, 2, MUL, MUL, CUMSUM, 5, STATE_LOAD, 2, DIV, END,
+          // AVG(amp^4)
+          INPUT, 2, INPUT, 2, INPUT, 2, INPUT, 2, MUL, MUL, MUL, CUMSUM, 7, STATE_LOAD, 2, DIV, END,
+          // MAX(|amp|)
+          INPUT, 2, ABS, MAX_AGG, 9, END,
+          // AVG(|amp|)
+          INPUT, 2, ABS, CUMSUM, 10, STATE_LOAD, 2, DIV, END,
+          // AVG(sqrt(|amp|))
+          INPUT, 2, ABS, SQRT, CUMSUM, 12, STATE_LOAD, 2, DIV, END,
+          // COUNT(*)
+          STATE_LOAD, 2, END,
+      };
+      // Segment predicate: ABS(amplitude) > 0.
+      std::vector<double> seg_bc = {INPUT, 2, ABS, CONST, 0, GT, END};
+      std::vector<double> seg_consts = {0.0};
+      burst_op = rtbot::make_burst_aggregate(
+          "burst_agg", std::move(agg_bc), {},
+          std::move(seg_bc), std::move(seg_consts),
+          /*key_columns=*/{0, 1},
+          /*num_agg_outputs=*/8,
+          /*num_input_cols=*/3);
+      burst_sink = rtbot::make_vector_number_collector("burst_sink");
+      burst_op->connect(burst_sink, 0, 0);
+    }
+
     // Burst-native fast path: skip the base_program entirely. Compute the
     // vibration_moments aggregate in one vectorized pass over the amplitude
     // buffer, wrap the 10-field result in a VectorNumberData message, and
@@ -876,9 +965,103 @@ int main(int argc, char** argv) {
       }
     };
 
+    // Feeder for --burst-aggregate: constructs the burst + sentinel as a
+    // vector of Message<VectorNumberData>, hands the batch to BurstAggregate,
+    // then forwards its emitted aggregate messages to the preset pipelines.
+    auto feed_burst_aggregate = [&](int bearing) {
+      std::vector<std::unique_ptr<rtbot::BaseMessage>> batch;
+      batch.reserve(static_cast<std::size_t>(cfg.samples_per_burst) + 1);
+      for (int sample = 0; sample < cfg.samples_per_burst; ++sample) {
+        batch.push_back(make_vector_message(
+            timestamp + sample,
+            {static_cast<double>(bearing), 1.0, synthetic_amplitude(sample)}));
+      }
+      batch.push_back(make_vector_message(
+          timestamp + cfg.samples_per_burst,
+          {static_cast<double>(bearing), 1.0, 0.0}));
+
+      ingress_messages += batch.size();
+      ++program_receive_calls;
+
+      burst_op->receive_data_batch(batch, /*port_index=*/0, /*debug=*/false);
+      burst_op->execute(false);
+
+      auto& q = burst_sink->get_data_queue(0);
+      while (!q.empty()) {
+        auto* vm = dynamic_cast<rtbot::Message<rtbot::VectorNumberData>*>(q.front().get());
+        if (!vm) {
+          q.pop_front();
+          continue;
+        }
+        ++base_outputs;
+        for (auto& pipeline : pipelines) {
+          ++pipeline->forwarded_messages;
+          auto output_batch = pipeline->program.receive(
+              make_vector_message(vm->time, *vm->data.values), "i1");
+          const auto produced = count_total_messages(output_batch);
+          pipeline->output_messages += produced;
+          materialized_outputs += produced;
+        }
+        q.pop_front();
+      }
+    };
+
+    // Feeder for --burst-buffer: fills the pre-allocated raw row buffer with
+    // the burst + sentinel, then hands it directly to BurstAggregate via
+    // receive_data_buffer. Zero Message allocations anywhere in the hot
+    // path — the downstream forward to preset pipelines is the only Message
+    // creation per burst (one aggregate message in, two to four preset
+    // outputs out).
+    auto feed_burst_buffer = [&](int bearing) {
+      const std::size_t n = static_cast<std::size_t>(cfg.samples_per_burst);
+      // Fill rows: [device_id, channel_id, amplitude].
+      for (std::size_t s = 0; s < n; ++s) {
+        raw_rows[s * 3 + 0] = static_cast<double>(bearing);
+        raw_rows[s * 3 + 1] = 1.0;
+        raw_rows[s * 3 + 2] = synthetic_amplitude(static_cast<int>(s));
+        raw_times[s] = timestamp + static_cast<rtbot::timestamp_t>(s);
+      }
+      // Sentinel row closes the segment.
+      raw_rows[n * 3 + 0] = static_cast<double>(bearing);
+      raw_rows[n * 3 + 1] = 1.0;
+      raw_rows[n * 3 + 2] = 0.0;
+      raw_times[n] = timestamp + static_cast<rtbot::timestamp_t>(n);
+
+      ingress_messages += n + 1;
+      ++program_receive_calls;
+
+      burst_op->receive_data_buffer(raw_rows.data(), n + 1, 3,
+                                      raw_times.data(), /*port=*/0,
+                                      /*debug=*/false);
+      burst_op->execute(false);
+
+      auto& q = burst_sink->get_data_queue(0);
+      while (!q.empty()) {
+        auto* vm = dynamic_cast<rtbot::Message<rtbot::VectorNumberData>*>(q.front().get());
+        if (!vm) {
+          q.pop_front();
+          continue;
+        }
+        ++base_outputs;
+        for (auto& pipeline : pipelines) {
+          ++pipeline->forwarded_messages;
+          auto output_batch = pipeline->program.receive(
+              make_vector_message(vm->time, *vm->data.values), "i1");
+          const auto produced = count_total_messages(output_batch);
+          pipeline->output_messages += produced;
+          materialized_outputs += produced;
+        }
+        q.pop_front();
+      }
+    };
+
     for (int burst = 1; burst <= cfg.bursts; ++burst) {
       for (int bearing = 1; bearing <= cfg.bearings; ++bearing) {
-        if (cfg.burst_native) {
+        if (cfg.burst_buffer) {
+          feed_burst_buffer(bearing);
+        } else if (cfg.burst_aggregate) {
+          feed_burst_aggregate(bearing);
+        } else if (cfg.burst_native) {
           feed_burst_native(bearing, timestamp + cfg.samples_per_burst);
         } else if (cfg.batch) {
           feed_burst_batched(bearing);

@@ -5,6 +5,7 @@ cc_binary(
         "//libs/api:api_compiler",
         "@json-cpp//:lib",
         "@rtbot//libs/api:rtbot-api",
+        "@rtbot//libs/fuse:rtbot-fuse",
     ],
 )
 
