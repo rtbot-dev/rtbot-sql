@@ -195,7 +195,9 @@ class RtBotSql:
               f"expected number for DOUBLE column '{col.name}', got str")
         encoded.append(float(val))
 
+    self._ensure_session_deployed()
     self._append_and_propagate(stream_name, timestamp, encoded)
+    self._feed_session_row(stream_name, timestamp, encoded)
 
   def decode_row(self, stream_name: str, values: list) -> list:
     """Decode a row of double values, converting TEXT column IDs back to strings.
