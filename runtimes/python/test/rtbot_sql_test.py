@@ -705,7 +705,7 @@ class AlignedStreamSugarTest(unittest.TestCase):
         (50000, 8.0), (200000, 12.0), (400000, 10.0),
         (600000, 14.0), (900000, 6.0),
     ]:
-      rt._append_and_propagate("vibration", ts, [val])
+      rt.insert_mixed("vibration", ts, [val])
 
     # bearing_temp stream inputs (bin 0, t < 1_000_000µs):
     #   (t=100000µs, [68.0]), (t=300000µs, [72.0]), (t=500000µs, [74.0]),
@@ -715,7 +715,7 @@ class AlignedStreamSugarTest(unittest.TestCase):
         (100000, 68.0), (300000, 72.0), (500000, 74.0),
         (700000, 78.0), (850000, 76.0), (950000, 82.0),
     ]:
-      rt._append_and_propagate("bearing_temp", ts, [val])
+      rt.insert_mixed("bearing_temp", ts, [val])
 
     # vibration stream inputs (bin 1, 1_000_000 ≤ t < 2_000_000µs):
     #   (t=1050000µs, [20.0]), (t=1300000µs, [22.0]),
@@ -731,7 +731,7 @@ class AlignedStreamSugarTest(unittest.TestCase):
         (1050000, 20.0), (1300000, 22.0),
         (1500000, 28.0), (1800000, 30.0),
     ]:
-      rt._append_and_propagate("vibration", ts, [val])
+      rt.insert_mixed("vibration", ts, [val])
 
     # bearing_temp stream inputs (bin 1, 1_000_000 ≤ t < 2_000_000µs):
     #   (t=1100000µs, [85.0]), (t=1400000µs, [90.0]), (t=1700000µs, [95.0])
@@ -748,7 +748,7 @@ class AlignedStreamSugarTest(unittest.TestCase):
     for ts, val in [
         (1100000, 85.0), (1400000, 90.0), (1700000, 95.0),
     ]:
-      rt._append_and_propagate("bearing_temp", ts, [val])
+      rt.insert_mixed("bearing_temp", ts, [val])
 
     # vibration bin 2 (2_000_000 ≤ t < 3_000_000µs):
     #   (t=2100000µs, [30.0]), (t=2400000µs, [40.0]), (t=2700000µs, [35.0])
@@ -762,7 +762,7 @@ class AlignedStreamSugarTest(unittest.TestCase):
     for ts, val in [
         (2100000, 30.0), (2400000, 40.0), (2700000, 35.0),
     ]:
-      rt._append_and_propagate("vibration", ts, [val])
+      rt.insert_mixed("vibration", ts, [val])
 
     # bearing_temp bin 2 (2_000_000 ≤ t < 3_000_000µs):
     #   (t=2200000µs, [96.0]), (t=2500000µs, [100.0]), (t=2800000µs, [104.0])
@@ -779,17 +779,21 @@ class AlignedStreamSugarTest(unittest.TestCase):
     for ts, val in [
         (2200000, 96.0), (2500000, 100.0), (2800000, 104.0),
     ]:
-      rt._append_and_propagate("bearing_temp", ts, [val])
+      rt.insert_mixed("bearing_temp", ts, [val])
 
     # Bin 3 triggers flush of bin 2 for both streams:
     #   vibration: (t=3100000µs, [999.0]) → flushes bin-2 avg=35.0
     #   bearing_temp: (t=3200000µs, [999.0]) → flushes bin-2 avg=100.0
-    rt._append_and_propagate("vibration", 3100000, [999.0])
-    rt._append_and_propagate("bearing_temp", 3200000, [999.0])
+    rt.insert_mixed("vibration", 3100000, [999.0])
+    rt.insert_mixed("bearing_temp", 3200000, [999.0])
 
     # -- Read from store and assert combined output ---------------------
+    # Bin 3 trigger samples flushed both streams' bin-2 aggregates, so we
+    # expect one combined output per closed bin (0, 1, 2).
     messages = rt._store.read("input")
-    self.assertEqual(len(messages), 2, "Expected exactly 2 combined outputs (bin 0 + bin 1)")
+    self.assertEqual(
+        len(messages), 3,
+        "Expected 3 combined outputs (bin 0 + bin 1 + bin 2)")
 
     # First message: bin 0 result at the 1-second boundary
     #   (t=1000000µs, [10.0, 75.0])
@@ -802,6 +806,13 @@ class AlignedStreamSugarTest(unittest.TestCase):
     self.assertEqual(messages[1].timestamp, 2000000)
     self.assertAlmostEqual(messages[1].values[0], 25.0, places=5)
     self.assertAlmostEqual(messages[1].values[1], 90.0, places=5)
+
+    # Third message: bin 2 result at the 3-second boundary, flushed by the
+    # bin-3 trigger samples fed above.
+    #   (t=3000000µs, [35.0, 100.0])
+    self.assertEqual(messages[2].timestamp, 3000000)
+    self.assertAlmostEqual(messages[2].values[0], 35.0, places=5)
+    self.assertAlmostEqual(messages[2].values[1], 100.0, places=5)
 
   def test_set_timescale_changes_units(self):
     """SET TIMESCALE ms changes bin width from µs to ms.
@@ -832,7 +843,7 @@ class AlignedStreamSugarTest(unittest.TestCase):
     #   (t=50ms, [20.0]), (t=300ms, [24.0]), (t=700ms, [26.0])
     #   → AVG = (20+24+26)/3 = 23.333...
     for ts, val in [(50, 20.0), (300, 24.0), (700, 26.0)]:
-      rt._append_and_propagate("temp", ts, [val])
+      rt.insert_mixed("temp", ts, [val])
 
     # temp stream inputs (bin 1, 1000 ≤ t < 2000ms):
     #   (t=1100ms, [30.0]), (t=1500ms, [36.0])
@@ -844,7 +855,7 @@ class AlignedStreamSugarTest(unittest.TestCase):
     # temp_rs output (after RESAMPLE_CONSTANT + TIMESHIFT):
     #   Resampler init — first input, no output yet
     for ts, val in [(1100, 30.0), (1500, 36.0)]:
-      rt._append_and_propagate("temp", ts, [val])
+      rt.insert_mixed("temp", ts, [val])
 
     # temp stream inputs (bin 2, 2000 ≤ t < 3000ms):
     #   (t=2100ms, [40.0]), (t=2500ms, [50.0])
@@ -856,7 +867,7 @@ class AlignedStreamSugarTest(unittest.TestCase):
     # temp_rs output (resampler second input → produces first output):
     #   (t=1000ms, [23.333...])  ← bin 0 avg, TIMESHIFT(-1000) corrected
     for ts, val in [(2100, 40.0), (2500, 50.0)]:
-      rt._append_and_propagate("temp", ts, [val])
+      rt.insert_mixed("temp", ts, [val])
 
     # Bin 3 trigger → flushes bin 2:
     #   temp: (t=3100ms, [999.0]) → flushes bin-2 avg=45.0
@@ -867,11 +878,13 @@ class AlignedStreamSugarTest(unittest.TestCase):
     # sensor output:
     #   (t=1000ms, [23.333...])  ← from bin 0
     #   (t=2000ms, [33.0])       ← from bin 1
-    rt._append_and_propagate("temp", 3100, [999.0])
+    rt.insert_mixed("temp", 3100, [999.0])
 
     # -- Assert output at ms-scale timestamps ---------------------------
     messages = rt._store.read("sensor")
-    self.assertEqual(len(messages), 2, "Expected exactly 2 outputs (bin 0 + bin 1)")
+    self.assertEqual(
+        len(messages), 3,
+        "Expected 3 outputs (bin 0 + bin 1 + bin 2)")
 
     # First message: bin 0 at 1000ms boundary
     self.assertEqual(messages[0].timestamp, 1000)
@@ -880,6 +893,11 @@ class AlignedStreamSugarTest(unittest.TestCase):
     # Second message: bin 1 at 2000ms boundary
     self.assertEqual(messages[1].timestamp, 2000)
     self.assertAlmostEqual(messages[1].values[0], 33.0, places=5)
+
+    # Third message: bin 2 at 3000ms boundary, flushed by the bin-3
+    # trigger sample at t=3100ms.
+    self.assertEqual(messages[2].timestamp, 3000)
+    self.assertAlmostEqual(messages[2].values[0], 45.0, places=5)
 
 
 if __name__ == "__main__":
