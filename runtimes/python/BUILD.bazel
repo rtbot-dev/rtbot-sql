@@ -240,5 +240,9 @@ py_test(
     srcs = ["test/bearing_throughput_test.py"],
     main = "test/bearing_throughput_test.py",
     timeout = "moderate",
+    # Throughput benchmark — requires numpy (not a hermetic Bazel dep) and
+    # takes far longer than a normal unit test. Run manually:
+    #   bazel test //runtimes/python:bearing_throughput_test --test_output=all
+    tags = ["manual"],
     deps = [":rtbot_sql"],
 )
