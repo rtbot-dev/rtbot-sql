@@ -1,5 +1,3 @@
-load("@aspect_rules_swc//swc:defs.bzl", "swc")
-load("@bazel_skylib//lib:partial.bzl", "partial")
 load("@emsdk//emscripten_toolchain:wasm_rules.bzl", "wasm_cc_binary")
 load("@aspect_rules_js//npm:defs.bzl", "npm_package")
 load("@aspect_rules_ts//ts:defs.bzl", "ts_config", "ts_project")
@@ -73,10 +71,6 @@ ts_project(
     composite = True,
     declaration = True,
     root_dir = "src",
-    transpiler = partial.make(
-        swc,
-        swcrc = "//:.swcrc",
-    ),
     tsconfig = ":tsconfig",
     deps = [
         "//:node_modules/@types/jest",
