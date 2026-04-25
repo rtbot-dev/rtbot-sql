@@ -218,10 +218,8 @@ Endpoint compile_having_predicate(const parser::ast::Expr& expr,
     auto* left_const = std::get_if<ConstantMarker>(&left);
     auto* right_const = std::get_if<ConstantMarker>(&right);
 
-    if (left_const && right_const) {
-      throw std::runtime_error(
-          "comparison of two constants is not supported in HAVING");
-    }
+    // Two-constant HAVING comparison rejected by analyzer::validate_predicate
+    // before compilation.
 
     // stream OP constant
     if (right_const) {

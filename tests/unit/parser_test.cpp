@@ -100,6 +100,82 @@ TEST(Parser, FreeResultClearsState) {
 }
 
 // ---------------------------------------------------------------------------
+// Source location tests
+// ---------------------------------------------------------------------------
+
+TEST(Parser, SyntaxErrorPopulatesSingleLineLocation) {
+  // "SELEKT" is invalid; libpg_query reports cursorpos at column 1
+  auto r = parse("SELEKT FROM x");
+  ASSERT_FALSE(r.ok());
+  ASSERT_FALSE(r.errors.empty());
+  EXPECT_GE(r.errors[0].loc.line, 1);
+  EXPECT_GE(r.errors[0].loc.column, 1);
+  free_result(r);
+}
+
+TEST(Parser, SyntaxErrorPopulatesMultiLineLocation) {
+  // Error on line 2; cursorpos > 0 must produce line >= 1.
+  auto r = parse("SELECT 1\nFROOM x");
+  ASSERT_FALSE(r.ok());
+  ASSERT_FALSE(r.errors.empty());
+  // Line at least 1; if libpg_query reports cursorpos > newline byte (8),
+  // the resolved line should be 2.
+  EXPECT_GE(r.errors[0].loc.line, 1);
+  free_result(r);
+}
+
+TEST(Parser, SuccessfulParseHasNoErrorLocations) {
+  auto r = parse("SELECT 1 FROM x");
+  EXPECT_TRUE(r.ok());
+  EXPECT_TRUE(r.errors.empty());
+  free_result(r);
+}
+
+TEST(Parser, SyntaxErrorPopulatesEndLocation) {
+  // SELEKT is invalid; libpg_query points cursorpos at it.
+  auto r = parse("SELEKT FROM x");
+  ASSERT_FALSE(r.ok());
+  ASSERT_FALSE(r.errors.empty());
+  // Both start AND end positions must be populated for a span renderer
+  // (editor selection, error underline) to work.
+  EXPECT_GE(r.errors[0].loc.line, 1);
+  EXPECT_GE(r.errors[0].loc.column, 1);
+  EXPECT_GE(r.errors[0].loc.end_line, 1);
+  EXPECT_GE(r.errors[0].loc.end_column, 1);
+  // The end must come after (or equal to) the start.
+  EXPECT_TRUE(r.errors[0].loc.end_line > r.errors[0].loc.line ||
+              (r.errors[0].loc.end_line == r.errors[0].loc.line &&
+               r.errors[0].loc.end_column >= r.errors[0].loc.column));
+  free_result(r);
+}
+
+TEST(Parser, SyntaxErrorEndSpansToken) {
+  // Force libpg_query to point cursorpos at "BANANA" (a non-keyword used
+  // where a keyword was expected). The end should land one char past 'A'.
+  auto r = parse("BANANA");
+  ASSERT_FALSE(r.ok());
+  ASSERT_FALSE(r.errors.empty());
+  // BANANA starts at column 1; if the cursor points at it, end_column
+  // should be 7 (1 + 6 chars).
+  if (r.errors[0].loc.column == 1) {
+    EXPECT_EQ(r.errors[0].loc.end_column, 7)
+        << "expected token end after BANANA";
+  }
+  free_result(r);
+}
+
+TEST(Parser, MultiLineSyntaxErrorEndOnSameLine) {
+  // The token at the error site shouldn't span multiple lines (tokens
+  // are single-line in SQL). Verify end_line == line for the simple case.
+  auto r = parse("SELECT 1\nFROOM x");
+  ASSERT_FALSE(r.ok());
+  ASSERT_FALSE(r.errors.empty());
+  EXPECT_EQ(r.errors[0].loc.line, r.errors[0].loc.end_line)
+      << "single-token error span should not cross lines";
+  free_result(r);
+}
+
+// ---------------------------------------------------------------------------
 // AST-level tests using convert_parse_tree
 // ---------------------------------------------------------------------------
 

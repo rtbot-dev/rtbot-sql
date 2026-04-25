@@ -38,6 +38,7 @@ cc_test(
     name = "expression_test",
     srcs = ["expression_test.cpp"],
     deps = [
+        "//libs/api:api_compiler",
         "//libs/compiler",
         "@com_google_googletest//:gtest_main",
     ],
@@ -56,6 +57,7 @@ cc_test(
     name = "function_test",
     srcs = ["function_test.cpp"],
     deps = [
+        "//libs/api:api_compiler",
         "//libs/compiler",
         "@com_google_googletest//:gtest_main",
     ],
@@ -102,6 +104,7 @@ cc_test(
     name = "tier_test",
     srcs = ["tier_test.cpp"],
     deps = [
+        "//libs/api:api_compiler",
         "//libs/planner",
         "@com_google_googletest//:gtest_main",
     ],
@@ -176,6 +179,27 @@ cc_test(
     srcs = ["preprocessor_test.cpp"],
     deps = [
         "//libs/api:api_preprocessor",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "analyzer_test",
+    srcs = ["analyzer_test.cpp"],
+    deps = [
+        "//libs/analyzer",
+        "//libs/api:api_compiler",
+        "//libs/parser",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "const_fold_test",
+    srcs = ["const_fold_test.cpp"],
+    deps = [
+        "//libs/analyzer",
+        "//libs/parser",
         "@com_google_googletest//:gtest_main",
     ],
 )

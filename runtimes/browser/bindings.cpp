@@ -194,8 +194,11 @@ json result_to_json(const CompilationResult& r) {
   // Errors
   json errs = json::array();
   for (const auto& e : r.errors) {
-    errs.push_back(
-        {{"message", e.message}, {"line", e.line}, {"column", e.column}});
+    errs.push_back({{"message", e.message},
+                    {"line", e.line},
+                    {"column", e.column},
+                    {"end_line", e.end_line},
+                    {"end_column", e.end_column}});
   }
   j["errors"] = errs;
 
@@ -290,8 +293,11 @@ std::string validate_sql(const std::string& sql) {
     j["valid"] = parse_result.ok();
     json errs = json::array();
     for (const auto& e : parse_result.errors) {
-      errs.push_back(
-          {{"message", e}, {"line", -1}, {"column", -1}});
+      errs.push_back({{"message", e.message},
+                      {"line", e.loc.line},
+                      {"column", e.loc.column},
+                      {"end_line", e.loc.end_line},
+                      {"end_column", e.loc.end_column}});
     }
     j["errors"] = errs;
     parser::free_result(parse_result);
@@ -299,7 +305,11 @@ std::string validate_sql(const std::string& sql) {
   } catch (const std::exception& e) {
     json j;
     j["valid"] = false;
-    j["errors"] = {{{"message", e.what()}, {"line", -1}, {"column", -1}}};
+    j["errors"] = {{{"message", e.what()},
+                    {"line", -1},
+                    {"column", -1},
+                    {"end_line", -1},
+                    {"end_column", -1}}};
     return j.dump();
   }
 }
@@ -317,8 +327,11 @@ std::string compile_session_json(const std::string& catalog_json) {
     j["base_stream_ports"] = r.base_stream_ports;
     json errs = json::array();
     for (const auto& e : r.errors) {
-      errs.push_back(
-          {{"message", e.message}, {"line", e.line}, {"column", e.column}});
+      errs.push_back({{"message", e.message},
+                      {"line", e.line},
+                      {"column", e.column},
+                      {"end_line", e.end_line},
+                      {"end_column", e.end_column}});
     }
     j["errors"] = errs;
     return j.dump();

@@ -2,6 +2,8 @@
 
 #include <gtest/gtest.h>
 
+#include "rtbot_sql/api/compiler.h"
+
 namespace rtbot_sql::planner {
 namespace {
 
@@ -166,11 +168,19 @@ TEST_F(TierTest, MultiFromIsTier3) {
   EXPECT_EQ(classify_select(stmt, catalog), SelectTier::TIER3_EPHEMERAL);
 }
 
-// Test 10: SELECT * FROM trades (no LIMIT) → Error
-TEST_F(TierTest, UnboundedStreamThrows) {
-  SelectStmt stmt;
-  stmt.from_table = "trades";
-  EXPECT_THROW(classify_select(stmt, catalog), std::runtime_error);
+// Test 10: SELECT * FROM trades (no LIMIT) → Error.
+// The "stream requires LIMIT" rule is now enforced by the analyzer, so we
+// drive this through compile_sql rather than calling classify_select
+// directly (which no longer throws on this input).
+TEST(TierAnalyzerTest, UnboundedStreamRejected) {
+  rtbot_sql::CatalogSnapshot c;
+  rtbot_sql::StreamSchema schema;
+  schema.name = "trades";
+  schema.columns = {{"price", 0, rtbot_sql::ColumnType::DOUBLE}};
+  c.streams["trades"] = schema;
+
+  auto r = rtbot_sql::api::compile_sql("SELECT price FROM trades", c);
+  EXPECT_TRUE(r.has_errors());
 }
 
 }  // namespace

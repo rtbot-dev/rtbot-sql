@@ -46,10 +46,8 @@ Endpoint compile_comparison(const parser::ast::ComparisonExpr& cmp,
   auto* left_const = std::get_if<ConstantMarker>(&left);
   auto* right_const = std::get_if<ConstantMarker>(&right);
 
-  if (left_const && right_const) {
-    throw std::runtime_error(
-        "comparison of two constants is not supported in WHERE");
-  }
+  // Two-constant comparison rejected by analyzer::validate_predicate
+  // before compilation.
 
   // stream OP constant
   if (right_const) {
@@ -159,11 +157,9 @@ Endpoint compile_predicate(const parser::ast::Expr& expr,
           compile_expression(cmp.right, input_endpoint, scope, builder,
                              nullptr, source_endpoints);
 
+      // Precondition: analyzer::validate_predicate rejects NOT(comparison)
+      // when the comparison's right side isn't a literal Constant.
       auto* right_const = std::get_if<ConstantMarker>(&right);
-      if (!right_const) {
-        throw std::runtime_error(
-            "NOT optimization requires constant on right side");
-      }
 
       auto rtbot_type = comparison_to_rtbot(inverted_op);
       auto id = builder.next_id("cmp");
@@ -172,19 +168,20 @@ Endpoint compile_predicate(const parser::ast::Expr& expr,
       return {id, "o1"};
     }
 
-    throw std::runtime_error("NOT is only supported on comparison expressions");
+    // Precondition: analyzer::validate_predicate rejects NOT on
+    // non-Comparison operands before compilation.
+    __builtin_unreachable();
   }
 
   // BetweenExpr → desugar to GTE(low) AND LTE(high)
   if (auto* btw_ptr = std::get_if<std::unique_ptr<BetweenExpr>>(&expr)) {
     const auto& btw = **btw_ptr;
 
+    // Preconditions: analyzer::validate_predicate rejects BETWEEN on a
+    // constant expression and BETWEEN with non-Constant bounds.
     auto expr_result =
         compile_expression(btw.expr, input_endpoint, scope, builder, nullptr,
                            source_endpoints);
-    if (std::holds_alternative<ConstantMarker>(expr_result)) {
-      throw std::runtime_error("BETWEEN on constant expression not supported");
-    }
     auto& stream_ep = std::get<Endpoint>(expr_result);
 
     auto low_result =
@@ -195,9 +192,6 @@ Endpoint compile_predicate(const parser::ast::Expr& expr,
                            source_endpoints);
     auto* low_const = std::get_if<ConstantMarker>(&low_result);
     auto* high_const = std::get_if<ConstantMarker>(&high_result);
-    if (!low_const || !high_const) {
-      throw std::runtime_error("BETWEEN bounds must be constants");
-    }
 
     // CompareGTE(low)
     auto gte_id = builder.next_id("cmp");

@@ -12,10 +12,10 @@ namespace {
 
 int resolve_column_index(const parser::ast::ColumnRef& ref,
                          const StreamSchema& schema) {
+  // Precondition: analyzer::analyze_select rejects unknown columns before
+  // the Tier 2 evaluator compiles its predicates.
   auto idx = schema.column_index(ref.column_name);
-  if (!idx.has_value()) {
-    throw std::runtime_error("unknown column: " + ref.column_name);
-  }
+  if (!idx.has_value()) __builtin_unreachable();
   return *idx;
 }
 
@@ -107,9 +107,9 @@ std::unique_ptr<CompiledExpr> compile_for_eval(
       throw std::runtime_error(
           "function not supported in scan-time evaluation: " + func.name);
     }
-    if (func.args.size() != 1) {
-      throw std::runtime_error(func.name + " requires exactly 1 argument");
-    }
+    // Precondition: analyzer::validate_function_call rejects bad arity for
+    // unary math functions before the Tier 2 evaluator runs.
+    if (func.args.size() != 1) __builtin_unreachable();
     return std::make_unique<UnaryFuncExpr>(std::move(math_fn),
                                            compile_for_eval(func.args[0], schema));
   }

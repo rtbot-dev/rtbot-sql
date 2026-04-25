@@ -2,10 +2,27 @@
 
 #include <gtest/gtest.h>
 
+#include "rtbot_sql/api/compiler.h"
 #include "rtbot_sql/compiler/expression_compiler.h"
 
 namespace rtbot_sql::compiler {
 namespace {
+
+// For tests that exercise semantic errors caught by the analyzer rather
+// than by direct calls to compile_function. Built once per test inline.
+rtbot_sql::CatalogSnapshot trades_catalog() {
+  rtbot_sql::CatalogSnapshot c;
+  rtbot_sql::StreamSchema schema;
+  schema.name = "trades";
+  schema.columns = {
+      {"instrument_id", 0, rtbot_sql::ColumnType::DOUBLE},
+      {"price", 1, rtbot_sql::ColumnType::DOUBLE},
+      {"quantity", 2, rtbot_sql::ColumnType::DOUBLE},
+      {"account_id", 3, rtbot_sql::ColumnType::DOUBLE},
+  };
+  c.streams["trades"] = schema;
+  return c;
+}
 
 using namespace parser::ast;
 
@@ -188,39 +205,42 @@ TEST_F(FunctionTest, StddevProducesStandardDeviation) {
   expect_conn(builder, ext.id, "o1", sd.id, "i1");
 }
 
-// Unknown function → error
-TEST_F(FunctionTest, UnknownFunctionThrows) {
-  std::vector<Expr> args;
-  args.push_back(col("price"));
-  EXPECT_THROW(compile_function("UNKNOWN_FUNC", args, input, scope, builder),
-               std::runtime_error);
+// Unknown function → error (driven through the analyzer via compile_sql,
+// since the user-facing path catches this before compile_function runs).
+TEST(FunctionAnalyzerTest, UnknownFunctionRejected) {
+  auto catalog = trades_catalog();
+  auto r = rtbot_sql::api::compile_sql(
+      "CREATE MATERIALIZED VIEW v AS SELECT UNKNOWN_FUNC(price) FROM trades",
+      catalog);
+  EXPECT_TRUE(r.has_errors());
 }
 
 // Wrong arg count for SUM → error
-TEST_F(FunctionTest, SumWrongArgCountThrows) {
-  std::vector<Expr> args;  // empty
-  EXPECT_THROW(compile_function("SUM", args, input, scope, builder),
-               std::runtime_error);
+TEST(FunctionAnalyzerTest, SumWrongArgCountRejected) {
+  auto catalog = trades_catalog();
+  auto r = rtbot_sql::api::compile_sql(
+      "CREATE MATERIALIZED VIEW v AS SELECT SUM() FROM trades", catalog);
+  EXPECT_TRUE(r.has_errors());
 }
 
 // Non-constant window size → error
-TEST_F(FunctionTest, NonConstantWindowThrows) {
-  std::vector<Expr> args;
-  args.push_back(col("price"));
-  args.push_back(col("quantity"));  // not a constant
-  EXPECT_THROW(
-      compile_function("MOVING_AVERAGE", args, input, scope, builder),
-      std::runtime_error);
+TEST(FunctionAnalyzerTest, NonConstantWindowRejected) {
+  auto catalog = trades_catalog();
+  auto r = rtbot_sql::api::compile_sql(
+      "CREATE MATERIALIZED VIEW v AS "
+      "SELECT MOVING_AVERAGE(price, quantity) FROM trades",
+      catalog);
+  EXPECT_TRUE(r.has_errors());
 }
 
 // Negative window size → error
-TEST_F(FunctionTest, NegativeWindowThrows) {
-  std::vector<Expr> args;
-  args.push_back(col("price"));
-  args.push_back(num(-5));
-  EXPECT_THROW(
-      compile_function("MOVING_AVERAGE", args, input, scope, builder),
-      std::runtime_error);
+TEST(FunctionAnalyzerTest, NegativeWindowRejected) {
+  auto catalog = trades_catalog();
+  auto r = rtbot_sql::api::compile_sql(
+      "CREATE MATERIALIZED VIEW v AS "
+      "SELECT MOVING_AVERAGE(price, -5) FROM trades",
+      catalog);
+  EXPECT_TRUE(r.has_errors());
 }
 
 // Aggregate functions dispatch correctly from compile_expression
@@ -301,16 +321,20 @@ TEST_F(FunctionTest, MovingMaxProducesWindowMinMax) {
 }
 
 // MOVING_MIN/MOVING_MAX wrong argument count → error
-TEST_F(FunctionTest, MovingMinWrongArgCountThrows) {
-  std::vector<Expr> args;  // empty — missing both expr and window_size
-  EXPECT_THROW(compile_function("MOVING_MIN", args, input, scope, builder),
-               std::runtime_error);
+TEST(FunctionAnalyzerTest, MovingMinWrongArgCountRejected) {
+  auto catalog = trades_catalog();
+  auto r = rtbot_sql::api::compile_sql(
+      "CREATE MATERIALIZED VIEW v AS SELECT MOVING_MIN() FROM trades",
+      catalog);
+  EXPECT_TRUE(r.has_errors());
 }
 
-TEST_F(FunctionTest, MovingMaxWrongArgCountThrows) {
-  std::vector<Expr> args;  // empty — missing both expr and window_size
-  EXPECT_THROW(compile_function("MOVING_MAX", args, input, scope, builder),
-               std::runtime_error);
+TEST(FunctionAnalyzerTest, MovingMaxWrongArgCountRejected) {
+  auto catalog = trades_catalog();
+  auto r = rtbot_sql::api::compile_sql(
+      "CREATE MATERIALIZED VIEW v AS SELECT MOVING_MAX() FROM trades",
+      catalog);
+  EXPECT_TRUE(r.has_errors());
 }
 
 // DIFF(quantity) → VectorExtract + Difference
@@ -334,10 +358,11 @@ TEST_F(FunctionTest, DiffProducesDifference) {
 }
 
 // DIFF wrong arg count → error
-TEST_F(FunctionTest, DiffWrongArgCountThrows) {
-  std::vector<Expr> args;  // empty
-  EXPECT_THROW(compile_function("DIFF", args, input, scope, builder),
-               std::runtime_error);
+TEST(FunctionAnalyzerTest, DiffWrongArgCountRejected) {
+  auto catalog = trades_catalog();
+  auto r = rtbot_sql::api::compile_sql(
+      "CREATE MATERIALIZED VIEW v AS SELECT DIFF() FROM trades", catalog);
+  EXPECT_TRUE(r.has_errors());
 }
 
 // MIN(price) → VectorExtract + MinTracker
@@ -361,10 +386,11 @@ TEST_F(FunctionTest, MinProducesMinTracker) {
 }
 
 // MIN wrong arg count → error
-TEST_F(FunctionTest, MinWrongArgCountThrows) {
-  std::vector<Expr> args;  // empty
-  EXPECT_THROW(compile_function("MIN", args, input, scope, builder),
-               std::runtime_error);
+TEST(FunctionAnalyzerTest, MinWrongArgCountRejected) {
+  auto catalog = trades_catalog();
+  auto r = rtbot_sql::api::compile_sql(
+      "CREATE MATERIALIZED VIEW v AS SELECT MIN() FROM trades", catalog);
+  EXPECT_TRUE(r.has_errors());
 }
 
 // MAX(price) → VectorExtract + MaxTracker
@@ -388,10 +414,11 @@ TEST_F(FunctionTest, MaxProducesMaxTracker) {
 }
 
 // MAX wrong arg count → error
-TEST_F(FunctionTest, MaxWrongArgCountThrows) {
-  std::vector<Expr> args;  // empty
-  EXPECT_THROW(compile_function("MAX", args, input, scope, builder),
-               std::runtime_error);
+TEST(FunctionAnalyzerTest, MaxWrongArgCountRejected) {
+  auto catalog = trades_catalog();
+  auto r = rtbot_sql::api::compile_sql(
+      "CREATE MATERIALIZED VIEW v AS SELECT MAX() FROM trades", catalog);
+  EXPECT_TRUE(r.has_errors());
 }
 
 }  // namespace

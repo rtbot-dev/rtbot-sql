@@ -38,19 +38,14 @@ Endpoint ensure_endpoint(ExprResult result, const Endpoint& input_endpoint,
 }
 
 // Extract a constant integer argument (for window sizes).
-int require_constant_int(const std::string& func_name,
+//
+// Precondition: validated by analyzer::validate_function_call upstream.
+// Callers reach this only with a literal Constant whose integer value is
+// > 0; non-conforming inputs are rejected before compilation.
+int require_constant_int(const std::string& /*func_name*/,
                          const parser::ast::Expr& expr,
-                         const std::string& param_name) {
-  if (auto* c = std::get_if<parser::ast::Constant>(&expr)) {
-    int val = static_cast<int>(c->value);
-    if (val != c->value || val <= 0) {
-      throw std::runtime_error(func_name + ": " + param_name +
-                               " must be a positive integer");
-    }
-    return val;
-  }
-  throw std::runtime_error(func_name + ": " + param_name +
-                           " must be a constant integer");
+                         const std::string& /*param_name*/) {
+  return static_cast<int>(std::get<parser::ast::Constant>(expr).value);
 }
 
 }  // namespace
@@ -79,10 +74,11 @@ Endpoint compile_function(const std::string& name,
 
   // --- Cumulative aggregates ---
 
+  // Arity / arg-shape preconditions for every branch below are enforced by
+  // analyzer::validate_function_call. The compiler trusts those and skips
+  // re-validating here.
+
   if (upper == "SUM") {
-    if (args.size() != 1) {
-      throw std::runtime_error("SUM requires exactly 1 argument");
-    }
     auto expr_ep = ensure_endpoint(
         compile_expression(args[0], input_endpoint, scope, builder, cache,
                            source_endpoints),
@@ -94,10 +90,6 @@ Endpoint compile_function(const std::string& name,
   }
 
   if (upper == "COUNT") {
-    if (!args.empty()) {
-      throw std::runtime_error(
-          "COUNT(*) takes no arguments (use COUNT(*), not COUNT(expr))");
-    }
     auto clock_ep = scalar_clock(input_endpoint, builder);
     auto cnt_id = builder.next_id("count");
     builder.add_operator(cnt_id, "CountNumber");
@@ -106,9 +98,6 @@ Endpoint compile_function(const std::string& name,
   }
 
   if (upper == "AVG") {
-    if (args.size() != 1) {
-      throw std::runtime_error("AVG requires exactly 1 argument");
-    }
     auto expr_ep = ensure_endpoint(
         compile_expression(args[0], input_endpoint, scope, builder, cache,
                            source_endpoints),
@@ -129,9 +118,6 @@ Endpoint compile_function(const std::string& name,
   }
 
   if (upper == "MIN") {
-    if (args.size() != 1) {
-      throw std::runtime_error("MIN requires exactly 1 argument");
-    }
     auto expr_ep = ensure_endpoint(
         compile_expression(args[0], input_endpoint, scope, builder, cache,
                            source_endpoints),
@@ -143,9 +129,6 @@ Endpoint compile_function(const std::string& name,
   }
 
   if (upper == "MAX") {
-    if (args.size() != 1) {
-      throw std::runtime_error("MAX requires exactly 1 argument");
-    }
     auto expr_ep = ensure_endpoint(
         compile_expression(args[0], input_endpoint, scope, builder, cache,
                            source_endpoints),
@@ -159,10 +142,6 @@ Endpoint compile_function(const std::string& name,
   // --- Windowed functions ---
 
   if (upper == "MOVING_AVERAGE") {
-    if (args.size() != 2) {
-      throw std::runtime_error(
-          "MOVING_AVERAGE requires 2 arguments: (expr, window_size)");
-    }
     int window = require_constant_int("MOVING_AVERAGE", args[1], "window_size");
     auto expr_ep = ensure_endpoint(
         compile_expression(args[0], input_endpoint, scope, builder, cache,
@@ -176,10 +155,6 @@ Endpoint compile_function(const std::string& name,
   }
 
   if (upper == "MOVING_SUM") {
-    if (args.size() != 2) {
-      throw std::runtime_error(
-          "MOVING_SUM requires 2 arguments: (expr, window_size)");
-    }
     int window = require_constant_int("MOVING_SUM", args[1], "window_size");
     auto expr_ep = ensure_endpoint(
         compile_expression(args[0], input_endpoint, scope, builder, cache,
@@ -193,10 +168,6 @@ Endpoint compile_function(const std::string& name,
   }
 
   if (upper == "MOVING_COUNT") {
-    if (args.size() != 1) {
-      throw std::runtime_error(
-          "MOVING_COUNT requires 1 argument: (window_size)");
-    }
     int window = require_constant_int("MOVING_COUNT", args[0], "window_size");
     // scalar_clock → ConstantNumber(1) → MovingSum(N)
     auto clock_ep = scalar_clock(input_endpoint, builder);
@@ -212,10 +183,6 @@ Endpoint compile_function(const std::string& name,
   }
 
   if (upper == "MOVING_STD") {
-    if (args.size() != 2) {
-      throw std::runtime_error(
-          "MOVING_STD requires 2 arguments: (expr, window_size)");
-    }
     int window = require_constant_int("MOVING_STD", args[1], "window_size");
     auto expr_ep = ensure_endpoint(
         compile_expression(args[0], input_endpoint, scope, builder, cache,
@@ -230,10 +197,6 @@ Endpoint compile_function(const std::string& name,
 
   // STDDEV is an alias for MOVING_STD
   if (upper == "STDDEV") {
-    if (args.size() != 2) {
-      throw std::runtime_error(
-          "STDDEV requires 2 arguments: (expr, window_size)");
-    }
     int window = require_constant_int("STDDEV", args[1], "window_size");
     auto expr_ep = ensure_endpoint(
         compile_expression(args[0], input_endpoint, scope, builder, cache,
@@ -249,10 +212,6 @@ Endpoint compile_function(const std::string& name,
   // --- Windowed min/max ---
 
   if (upper == "MOVING_MIN") {
-    if (args.size() != 2) {
-      throw std::runtime_error(
-          "MOVING_MIN requires 2 arguments: (expr, window_size)");
-    }
     int window = require_constant_int("MOVING_MIN", args[1], "window_size");
     auto expr_ep = ensure_endpoint(
         compile_expression(args[0], input_endpoint, scope, builder, cache,
@@ -267,10 +226,6 @@ Endpoint compile_function(const std::string& name,
   }
 
   if (upper == "MOVING_MAX") {
-    if (args.size() != 2) {
-      throw std::runtime_error(
-          "MOVING_MAX requires 2 arguments: (expr, window_size)");
-    }
     int window = require_constant_int("MOVING_MAX", args[1], "window_size");
     auto expr_ep = ensure_endpoint(
         compile_expression(args[0], input_endpoint, scope, builder, cache,
@@ -287,9 +242,6 @@ Endpoint compile_function(const std::string& name,
   // --- DSP functions (stubs — generate operators, detailed testing in Phase 2) ---
 
   if (upper == "DIFF") {
-    if (args.size() != 1) {
-      throw std::runtime_error("DIFF requires exactly 1 argument");
-    }
     auto expr_ep = ensure_endpoint(
         compile_expression(args[0], input_endpoint, scope, builder, cache,
                            source_endpoints),
@@ -301,14 +253,7 @@ Endpoint compile_function(const std::string& name,
   }
 
   if (upper == "FIR") {
-    if (args.size() != 2) {
-      throw std::runtime_error(
-          "FIR requires 2 arguments: (expr, ARRAY[coefficients])");
-    }
-    auto* arr = std::get_if<parser::ast::ArrayLiteral>(&args[1]);
-    if (!arr) {
-      throw std::runtime_error("FIR: second argument must be an array literal");
-    }
+    auto* arr = &std::get<parser::ast::ArrayLiteral>(args[1]);
     auto expr_ep = ensure_endpoint(
         compile_expression(args[0], input_endpoint, scope, builder, cache,
                            source_endpoints),
@@ -322,16 +267,8 @@ Endpoint compile_function(const std::string& name,
   }
 
   if (upper == "IIR") {
-    if (args.size() != 3) {
-      throw std::runtime_error(
-          "IIR requires 3 arguments: (expr, ARRAY[a_coeffs], ARRAY[b_coeffs])");
-    }
-    auto* a_arr = std::get_if<parser::ast::ArrayLiteral>(&args[1]);
-    auto* b_arr = std::get_if<parser::ast::ArrayLiteral>(&args[2]);
-    if (!a_arr || !b_arr) {
-      throw std::runtime_error(
-          "IIR: second and third arguments must be array literals");
-    }
+    auto* a_arr = &std::get<parser::ast::ArrayLiteral>(args[1]);
+    auto* b_arr = &std::get<parser::ast::ArrayLiteral>(args[2]);
     auto expr_ep = ensure_endpoint(
         compile_expression(args[0], input_endpoint, scope, builder, cache,
                            source_endpoints),
@@ -346,10 +283,6 @@ Endpoint compile_function(const std::string& name,
   }
 
   if (upper == "RESAMPLE") {
-    if (args.size() != 2) {
-      throw std::runtime_error(
-          "RESAMPLE requires 2 arguments: (expr, interval)");
-    }
     int interval = require_constant_int("RESAMPLE", args[1], "interval");
     auto expr_ep = ensure_endpoint(
         compile_expression(args[0], input_endpoint, scope, builder, cache,
@@ -363,10 +296,6 @@ Endpoint compile_function(const std::string& name,
   }
 
   if (upper == "PEAK_DETECT") {
-    if (args.size() != 2) {
-      throw std::runtime_error(
-          "PEAK_DETECT requires 2 arguments: (expr, window_size)");
-    }
     int window = require_constant_int("PEAK_DETECT", args[1], "window_size");
     auto expr_ep = ensure_endpoint(
         compile_expression(args[0], input_endpoint, scope, builder, cache,
@@ -379,7 +308,10 @@ Endpoint compile_function(const std::string& name,
     return {pd_id, "o1"};
   }
 
-  throw std::runtime_error("unknown function: " + name);
+  // Precondition: analyzer::validate_function_call rejects unknown function
+  // names before compilation. Direct callers of compile_function() must
+  // guarantee `name` is recognized.
+  __builtin_unreachable();
 }
 
 }  // namespace rtbot_sql::compiler

@@ -226,7 +226,9 @@ PYBIND11_MODULE(_rtbot_sql_native, m) {
       .def(py::init<>())
       .def_readwrite("message", &CompilationError::message)
       .def_readwrite("line", &CompilationError::line)
-      .def_readwrite("column", &CompilationError::column);
+      .def_readwrite("column", &CompilationError::column)
+      .def_readwrite("end_line", &CompilationError::end_line)
+      .def_readwrite("end_column", &CompilationError::end_column);
 
   py::class_<CompilationResult>(m, "CompilationResult")
       .def(py::init<>())
@@ -308,6 +310,8 @@ PYBIND11_MODULE(_rtbot_sql_native, m) {
           d["message"] = e.message;
           d["line"] = e.line;
           d["column"] = e.column;
+          d["end_line"] = e.end_line;
+          d["end_column"] = e.end_column;
           errs.append(d);
         }
         out["errors"] = errs;
@@ -326,9 +330,11 @@ PYBIND11_MODULE(_rtbot_sql_native, m) {
         py::list errors;
         for (const auto& error : parsed.errors) {
           py::dict err;
-          err["message"] = error;
-          err["line"] = -1;
-          err["column"] = -1;
+          err["message"] = error.message;
+          err["line"] = error.loc.line;
+          err["column"] = error.loc.column;
+          err["end_line"] = error.loc.end_line;
+          err["end_column"] = error.loc.end_column;
           errors.append(err);
         }
 

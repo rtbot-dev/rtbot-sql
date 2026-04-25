@@ -30,7 +30,9 @@ StreamSchema resolve_schema(const std::string& source,
   auto table = catalog.lookup_table(source);
   if (table.has_value()) return {table->name, table->columns};
 
-  throw std::runtime_error("cannot resolve schema for: " + source);
+  // Precondition: analyzer::analyze_select rejects unknown sources before
+  // the planner runs.
+  __builtin_unreachable();
 }
 
 // Default alias for an expression.
@@ -60,17 +62,10 @@ SelectPlan plan_select(const parser::ast::SelectStmt& stmt,
           auto* col = std::get_if<parser::ast::ColumnRef>(
               &stmt.select_list[i].expr);
           if (col) {
+            // Precondition: analyzer::analyze_select rejects unknown columns
+            // before plan_select runs.
             auto idx = schema.column_index(col->column_name);
-            if (!idx.has_value()) {
-              std::string avail;
-              for (const auto& c : schema.columns) {
-                if (!avail.empty()) avail += ", ";
-                avail += c.name;
-              }
-              throw std::runtime_error(
-                  "Column '" + col->column_name + "' not found in '" +
-                  stmt.from_table + "'. Available: " + avail);
-            }
+            if (!idx.has_value()) __builtin_unreachable();
             std::string alias = stmt.select_list[i].alias.value_or(
                 col->column_name);
             plan.field_map[alias] = *idx;
@@ -157,9 +152,12 @@ SelectPlan plan_select(const parser::ast::SelectStmt& stmt,
           if (upper == "COUNT") {
             agg.col_index = -1;  // COUNT(*) — no column needed
           } else {
-            if (func.args.size() != 1) {
-              throw std::runtime_error(upper + " requires exactly 1 argument");
-            }
+            // Preconditions: analyzer rejects bad arity and unknown columns
+            // before plan_select runs. The "argument must be a column
+            // reference" check is cross-key-aggregation specific and
+            // remains a compile-time check (analyzer doesn't know whether
+            // the source is a keyed view).
+            if (func.args.size() != 1) __builtin_unreachable();
             auto* col_ref =
                 std::get_if<parser::ast::ColumnRef>(&func.args[0]);
             if (!col_ref) {
@@ -167,9 +165,7 @@ SelectPlan plan_select(const parser::ast::SelectStmt& stmt,
                   upper + ": argument must be a column reference");
             }
             auto idx = schema.column_index(col_ref->column_name);
-            if (!idx.has_value()) {
-              throw std::runtime_error("unknown column: " + col_ref->column_name);
-            }
+            if (!idx.has_value()) __builtin_unreachable();
             agg.col_index = *idx;
           }
 
