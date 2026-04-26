@@ -41,6 +41,73 @@ class CompilerBindingTest(unittest.TestCase):
     self.assertEqual(result.entity_name, "trades")
 
 
+class ErrorLocationBindingTest(unittest.TestCase):
+  """Verify the Python binding exposes line/column AND end_line/end_column.
+
+  Without these tests, a regression in sql_bindings.cpp (e.g. removing
+  d["end_line"] = e.end_line) would silently land — there's no other check
+  that the language-level consumer actually receives the new fields.
+  """
+
+  def _compile_with_errors(self, sql: str):
+    snapshot = compiler.native.CatalogSnapshot()
+    compilation = compiler.native.compile_sql(sql, snapshot, 1_000_000)
+    self.assertIn("results", compilation)
+    self.assertGreater(len(compilation["results"]), 0)
+    result = compilation["results"][0]
+    self.assertGreater(len(result.errors), 0,
+                       f"expected errors for SQL: {sql!r}")
+    return result.errors
+
+  def test_compilation_error_exposes_end_fields(self):
+    # Semantic error: unknown source.
+    errors = self._compile_with_errors("SELECT * FROM nonexistent_stream LIMIT 10")
+    err = errors[0]
+    # Both start and end positions must be exposed by the binding.
+    self.assertGreaterEqual(err.line, 1)
+    self.assertGreaterEqual(err.column, 1)
+    self.assertGreaterEqual(err.end_line, 1)
+    self.assertGreaterEqual(err.end_column, 1)
+    # End must come after (or at) start.
+    self.assertTrue(
+        err.end_line > err.line
+        or (err.end_line == err.line and err.end_column >= err.column))
+
+  def test_syntax_error_exposes_end_fields(self):
+    errors = self._compile_with_errors("SELEKT FROM x")
+    err = errors[0]
+    self.assertGreaterEqual(err.end_line, 1)
+    self.assertGreaterEqual(err.end_column, 1)
+
+  def test_converter_error_exposes_end_fields(self):
+    # BETWEEN is rejected at AST conversion — the new ConverterError path
+    # must surface its location through the binding.
+    errors = self._compile_with_errors(
+        "SELECT 1 FROM x WHERE x BETWEEN 1 AND 10 LIMIT 1")
+    # Find the BETWEEN error.
+    between_err = next(
+        (e for e in errors if "BETWEEN" in e.message), None)
+    self.assertIsNotNone(between_err, "expected BETWEEN error")
+    self.assertGreaterEqual(between_err.line, 1)
+    self.assertGreaterEqual(between_err.column, 1)
+    self.assertGreaterEqual(between_err.end_line, 1)
+    self.assertGreaterEqual(between_err.end_column, 1)
+
+  def test_validate_sql_dict_includes_end_fields(self):
+    # validate_sql is a separate entry point (parser-only, no compile).
+    # Verify its dict output also carries end_line / end_column.
+    out = compiler.native.validate_sql("SELEKT FROM x")
+    self.assertFalse(out["valid"])
+    self.assertGreater(len(out["errors"]), 0)
+    err = out["errors"][0]
+    self.assertIn("line", err)
+    self.assertIn("column", err)
+    self.assertIn("end_line", err)
+    self.assertIn("end_column", err)
+    self.assertGreaterEqual(err["end_line"], 1)
+    self.assertGreaterEqual(err["end_column"], 1)
+
+
 class RuntimeLifecycleTest(unittest.TestCase):
   def test_create_stream_alias(self):
     sql = rtbot_sql.RtBotSql()
