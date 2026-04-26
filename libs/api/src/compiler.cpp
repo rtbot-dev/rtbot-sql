@@ -914,7 +914,11 @@ CompilationResult compile_sql(const std::string& sql,
   auto json_result = pg_query_parse(normalized.c_str());
   if (json_result.error) {
     auto src = parser::make_source_text(normalized);
-    auto loc = parser::compute_location(src, json_result.error->cursorpos);
+    // cursorpos is 1-based (PostgreSQL convention); compute_location
+    // expects 0-based byte offsets — convert here.
+    int cursorpos = json_result.error->cursorpos;
+    int byte_offset = cursorpos > 0 ? cursorpos - 1 : -1;
+    auto loc = parser::compute_location(src, byte_offset);
     CompilationResult r{};
     r.errors.push_back({json_result.error->message
                             ? json_result.error->message

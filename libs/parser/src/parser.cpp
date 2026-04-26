@@ -13,7 +13,13 @@ ParseResult parse(const std::string& sql) {
     err.message = pr.result.error->message ? pr.result.error->message
                                            : "unknown parse error";
     SourceText src = make_source_text(sql);
-    err.loc = compute_location(src, pr.result.error->cursorpos);
+    // libpg_query's `cursorpos` follows PostgreSQL convention: 1-based
+    // character position (0 means "no position available"). compute_location
+    // takes a 0-based byte offset (matching libpg_query's `.location` field
+    // on AST nodes), so we convert here.
+    int cursorpos = pr.result.error->cursorpos;
+    int byte_offset = cursorpos > 0 ? cursorpos - 1 : -1;
+    err.loc = compute_location(src, byte_offset);
     pr.errors.push_back(std::move(err));
   }
 

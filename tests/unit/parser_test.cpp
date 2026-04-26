@@ -164,6 +164,18 @@ TEST(Parser, SyntaxErrorEndSpansToken) {
   free_result(r);
 }
 
+TEST(Parser, SyntaxErrorColumnIsZeroBasedFromCursorpos) {
+  // libpg_query's cursorpos is 1-based (PostgreSQL convention). Verify
+  // we convert to 0-based correctly: for "BANANA" the parse error should
+  // point at column 1, not column 2 (off-by-one regression check).
+  auto r = parse("BANANA");
+  ASSERT_FALSE(r.ok());
+  ASSERT_FALSE(r.errors.empty());
+  EXPECT_EQ(r.errors[0].loc.column, 1)
+      << "syntax error column was off — likely a 1-based vs 0-based mismatch";
+  free_result(r);
+}
+
 TEST(Parser, MultiLineSyntaxErrorEndOnSameLine) {
   // The token at the error site shouldn't span multiple lines (tokens
   // are single-line in SQL). Verify end_line == line for the simple case.
