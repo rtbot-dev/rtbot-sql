@@ -58,6 +58,8 @@ export interface CompilationError {
   message: string;
   line: number;
   column: number;
+  end_line: number;
+  end_column: number;
 }
 
 export interface CompilationResult {

@@ -276,10 +276,29 @@ std::string compile_sql_json(const std::string& sql,
     j["new_ts_units_per_second"] = expanded.new_ts_units_per_second;
     return j.dump();
   } catch (const std::exception& e) {
+    // Best-effort: try to parse so we can report a real source span.
+    int line = -1, column = -1, end_line = -1, end_column = -1;
+    try {
+      auto pr = parser::parse(normalize_sql(sql));
+      if (!pr.errors.empty()) {
+        const auto& loc = pr.errors[0].loc;
+        line = loc.line;
+        column = loc.column;
+        end_line = loc.end_line;
+        end_column = loc.end_column;
+      }
+      parser::free_result(pr);
+    } catch (...) {
+      // Ignore — fall back to sentinel locations.
+    }
     json j;
     json results_arr = json::array();
-    results_arr.push_back(
-        {{"errors", {{{"message", e.what()}, {"line", -1}, {"column", -1}}}}});
+    results_arr.push_back({{"errors",
+                            {{{"message", e.what()},
+                              {"line", line},
+                              {"column", column},
+                              {"end_line", end_line},
+                              {"end_column", end_column}}}}});
     j["results"] = results_arr;
     j["new_ts_units_per_second"] = -1;
     return j.dump();

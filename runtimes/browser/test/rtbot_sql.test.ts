@@ -26,7 +26,20 @@ function wrapExpanded(result: CompilationResult): string {
   return JSON.stringify(expanded);
 }
 
-function wrapExpandedErrors(errors: { message: string; line: number; column: number }[]): string {
+function wrapExpandedErrors(
+  errors: {
+    message: string;
+    line: number;
+    column: number;
+    end_line?: number;
+    end_column?: number;
+  }[],
+): string {
+  const fullErrors = errors.map((e) => ({
+    ...e,
+    end_line: e.end_line ?? e.line,
+    end_column: e.end_column ?? e.column + 1,
+  }));
   const result: CompilationResult = {
     statement_type: "CREATE_STREAM",
     entity_name: "",
@@ -41,7 +54,7 @@ function wrapExpandedErrors(errors: { message: string; line: number; column: num
     table_schema: { name: "", columns: [], changelog_stream: "", key_columns: [] },
     drop_entity_name: "",
     drop_entity_type: "STREAM",
-    errors,
+    errors: fullErrors,
   };
   return wrapExpanded(result);
 }
@@ -161,7 +174,7 @@ function createMockWasm(): RtBotSqlWasmModule {
         valid,
         errors: valid
           ? []
-          : [{ message: "syntax error", line: -1, column: -1 }],
+          : [{ message: "syntax error", line: -1, column: -1, end_line: -1, end_column: -1 }],
       };
       return JSON.stringify(result);
     },
