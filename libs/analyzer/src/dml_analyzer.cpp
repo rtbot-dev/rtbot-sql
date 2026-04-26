@@ -3,16 +3,18 @@
 #include <string>
 #include <vector>
 
+#include "rtbot_sql/analyzer/expr_span.h"
 #include "rtbot_sql/analyzer/expr_validator.h"
 
 namespace rtbot_sql::analyzer {
 
 void analyze_insert(const parser::ast::InsertStmt& stmt,
-                    const CatalogSnapshot& catalog, DiagnosticBag& bag) {
+                    const CatalogSnapshot& catalog, DiagnosticBag& bag,
+                    std::string_view sql) {
   // Walk every value expression so unknown-function / arity diagnostics in
   // VALUES (e.g. INSERT INTO t VALUES (NOT_A_FUNC(x))) get surfaced.
   for (const auto& v : stmt.values) {
-    validate_expression(v, bag);
+    validate_expression(v, bag, /*scope=*/nullptr, /*aliases=*/nullptr, sql);
   }
 
   // Look up columns from streams or tables (mirrors handle_insert lookup).
@@ -71,7 +73,7 @@ void analyze_insert(const parser::ast::InsertStmt& stmt,
   for (std::size_t i = 0; i < stmt.values.size(); ++i) {
     const auto& col = columns[i];
     const auto& value = stmt.values[i];
-    parser::ast::SourceLocation vloc = parser::ast::loc_of(value);
+    parser::ast::SourceLocation vloc = expr_span(value, sql);
 
     if (auto* c = std::get_if<parser::ast::Constant>(&value)) {
       (void)c;
@@ -94,10 +96,12 @@ void analyze_insert(const parser::ast::InsertStmt& stmt,
 }
 
 void analyze_delete(const parser::ast::DeleteStmt& stmt,
-                    const CatalogSnapshot& catalog, DiagnosticBag& bag) {
+                    const CatalogSnapshot& catalog, DiagnosticBag& bag,
+                    std::string_view sql) {
   // Walk WHERE expression so any unknown-function / arity diagnostics fire.
   if (stmt.where_clause) {
-    validate_expression(*stmt.where_clause, bag);
+    validate_expression(*stmt.where_clause, bag, /*scope=*/nullptr,
+                        /*aliases=*/nullptr, sql);
   }
 
   auto it = catalog.tables.find(stmt.table_name);
@@ -130,7 +134,8 @@ void analyze_delete(const parser::ast::DeleteStmt& stmt,
     key_const = std::get_if<parser::ast::Constant>(&(*cmp)->left);
   }
   if (!key_const) {
-    bag.error("DELETE WHERE value must be a constant", (*cmp)->loc);
+    bag.error("DELETE WHERE value must be a constant",
+              expr_span(*stmt.where_clause, sql));
   }
 }
 

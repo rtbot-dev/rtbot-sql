@@ -2,6 +2,7 @@
 
 #include <set>
 #include <string>
+#include <string_view>
 
 #include "rtbot_sql/analyzer/diagnostic.h"
 #include "rtbot_sql/analyzer/scope.h"
@@ -27,7 +28,8 @@ namespace rtbot_sql::analyzer {
 // substitutes the alias's defining expression before final compilation.
 void validate_expression(const parser::ast::Expr& expr, DiagnosticBag& bag,
                          const Scope* scope = nullptr,
-                         const std::set<std::string>* aliases = nullptr);
+                         const std::set<std::string>* aliases = nullptr,
+                         std::string_view sql = {});
 
 // Validate a predicate expression in WHERE/HAVING context.
 //
@@ -49,6 +51,7 @@ void validate_expression(const parser::ast::Expr& expr, DiagnosticBag& bag,
 void validate_predicate(const parser::ast::Expr& expr, DiagnosticBag& bag,
                         const std::string& context = "WHERE",
                         const Scope* scope = nullptr,
-                        const std::set<std::string>* aliases = nullptr);
+                        const std::set<std::string>* aliases = nullptr,
+                        std::string_view sql = {});
 
 }  // namespace rtbot_sql::analyzer

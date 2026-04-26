@@ -2,6 +2,7 @@
 
 #include <variant>
 
+#include "rtbot_sql/analyzer/expr_span.h"
 #include "rtbot_sql/analyzer/function_signatures.h"
 
 namespace rtbot_sql::analyzer {
@@ -9,35 +10,39 @@ namespace rtbot_sql::analyzer {
 namespace {
 
 void visit(const parser::ast::Expr& expr, DiagnosticBag& bag,
-           const Scope* scope, const std::set<std::string>* aliases);
+           const Scope* scope, const std::set<std::string>* aliases,
+           std::string_view sql);
 
 void visit_func_call(const parser::ast::FuncCall& fc, DiagnosticBag& bag,
                      const Scope* scope,
-                     const std::set<std::string>* aliases) {
-  validate_function_call(fc, bag);
+                     const std::set<std::string>* aliases,
+                     std::string_view sql) {
+  validate_function_call(fc, bag, sql);
   for (const auto& arg : fc.args) {
-    visit(arg, bag, scope, aliases);
+    visit(arg, bag, scope, aliases, sql);
   }
 }
 
 void visit_case_expr(const parser::ast::CaseExpr& ce, DiagnosticBag& bag,
                      const Scope* scope,
-                     const std::set<std::string>* aliases) {
+                     const std::set<std::string>* aliases,
+                     std::string_view sql) {
   // Mirrors the throw at libs/compiler/src/expression_compiler.cpp:426.
   if (ce.when_clauses.empty()) {
     bag.error("CASE expression has no WHEN clauses", ce.loc);
   }
   for (const auto& clause : ce.when_clauses) {
-    visit(clause.condition, bag, scope, aliases);
-    visit(clause.result, bag, scope, aliases);
+    visit(clause.condition, bag, scope, aliases, sql);
+    visit(clause.result, bag, scope, aliases, sql);
   }
-  if (ce.else_result) visit(*ce.else_result, bag, scope, aliases);
+  if (ce.else_result) visit(*ce.else_result, bag, scope, aliases, sql);
 }
 
 void visit(const parser::ast::Expr& expr, DiagnosticBag& bag,
-           const Scope* scope, const std::set<std::string>* aliases) {
+           const Scope* scope, const std::set<std::string>* aliases,
+           std::string_view sql) {
   std::visit(
-      [&bag, scope, aliases](const auto& v) {
+      [&bag, scope, aliases, sql](const auto& v) {
         using T = std::decay_t<decltype(v)>;
         if constexpr (std::is_same_v<T, parser::ast::ColumnRef>) {
           // Resolve when a scope is available. Mirrors the throw at
@@ -59,40 +64,40 @@ void visit(const parser::ast::Expr& expr, DiagnosticBag& bag,
                                  T,
                                  std::unique_ptr<parser::ast::BinaryExpr>>) {
           if (v) {
-            visit(v->left, bag, scope, aliases);
-            visit(v->right, bag, scope, aliases);
+            visit(v->left, bag, scope, aliases, sql);
+            visit(v->right, bag, scope, aliases, sql);
           }
         } else if constexpr (std::is_same_v<
                                  T,
                                  std::unique_ptr<parser::ast::ComparisonExpr>>) {
           if (v) {
-            visit(v->left, bag, scope, aliases);
-            visit(v->right, bag, scope, aliases);
+            visit(v->left, bag, scope, aliases, sql);
+            visit(v->right, bag, scope, aliases, sql);
           }
         } else if constexpr (std::is_same_v<
                                  T, std::unique_ptr<parser::ast::FuncCall>>) {
-          if (v) visit_func_call(*v, bag, scope, aliases);
+          if (v) visit_func_call(*v, bag, scope, aliases, sql);
         } else if constexpr (std::is_same_v<
                                  T,
                                  std::unique_ptr<parser::ast::LogicalExpr>>) {
           if (v) {
-            visit(v->left, bag, scope, aliases);
-            visit(v->right, bag, scope, aliases);
+            visit(v->left, bag, scope, aliases, sql);
+            visit(v->right, bag, scope, aliases, sql);
           }
         } else if constexpr (std::is_same_v<
                                  T, std::unique_ptr<parser::ast::NotExpr>>) {
-          if (v) visit(v->operand, bag, scope, aliases);
+          if (v) visit(v->operand, bag, scope, aliases, sql);
         } else if constexpr (std::is_same_v<
                                  T,
                                  std::unique_ptr<parser::ast::BetweenExpr>>) {
           if (v) {
-            visit(v->expr, bag, scope, aliases);
-            visit(v->low, bag, scope, aliases);
-            visit(v->high, bag, scope, aliases);
+            visit(v->expr, bag, scope, aliases, sql);
+            visit(v->low, bag, scope, aliases, sql);
+            visit(v->high, bag, scope, aliases, sql);
           }
         } else if constexpr (std::is_same_v<
                                  T, std::unique_ptr<parser::ast::CaseExpr>>) {
-          if (v) visit_case_expr(*v, bag, scope, aliases);
+          if (v) visit_case_expr(*v, bag, scope, aliases, sql);
         }
       },
       expr);
@@ -102,19 +107,21 @@ void visit(const parser::ast::Expr& expr, DiagnosticBag& bag,
 
 void validate_expression(const parser::ast::Expr& expr, DiagnosticBag& bag,
                          const Scope* scope,
-                         const std::set<std::string>* aliases) {
-  visit(expr, bag, scope, aliases);
+                         const std::set<std::string>* aliases,
+                         std::string_view sql) {
+  visit(expr, bag, scope, aliases, sql);
 }
 
 void validate_predicate(const parser::ast::Expr& expr, DiagnosticBag& bag,
                         const std::string& context, const Scope* scope,
-                        const std::set<std::string>* aliases) {
+                        const std::set<std::string>* aliases,
+                        std::string_view sql) {
   using namespace parser::ast;
 
   // Always run the recursive expression validator so function-arity errors
   // and CASE-shape errors inside the predicate are surfaced regardless of
   // the predicate-shape outcome.
-  validate_expression(expr, bag, scope, aliases);
+  validate_expression(expr, bag, scope, aliases, sql);
 
   // Comparison: both sides cannot be literal constants.
   // Mirrors the throw at libs/compiler/src/where_compiler.cpp:50 and
@@ -135,8 +142,8 @@ void validate_predicate(const parser::ast::Expr& expr, DiagnosticBag& bag,
   // Logical (AND/OR): recurse into both sides as predicates.
   if (auto* log_ptr = std::get_if<std::unique_ptr<LogicalExpr>>(&expr)) {
     const auto& log = **log_ptr;
-    validate_predicate(log.left, bag, context, scope, aliases);
-    validate_predicate(log.right, bag, context, scope, aliases);
+    validate_predicate(log.left, bag, context, scope, aliases, sql);
+    validate_predicate(log.right, bag, context, scope, aliases, sql);
     return;
   }
 
@@ -172,7 +179,26 @@ void validate_predicate(const parser::ast::Expr& expr, DiagnosticBag& bag,
     bool low_const = std::get_if<Constant>(&btw.low) != nullptr;
     bool high_const = std::get_if<Constant>(&btw.high) != nullptr;
     if (!low_const || !high_const) {
-      bag.error("BETWEEN bounds must be constants", btw.loc);
+      // Span just the bounds — the diagnostic is about them, not the
+      // BETWEEN'd expression.
+      parser::ast::SourceLocation bounds_loc;
+      auto low_span = expr_span(btw.low, sql);
+      auto high_span = expr_span(btw.high, sql);
+      bounds_loc = low_span;
+      if (high_span.line >= 1 && high_span.column >= 1) {
+        if (bounds_loc.line < 1) {
+          bounds_loc = high_span;
+        } else {
+          if (high_span.end_line > bounds_loc.end_line ||
+              (high_span.end_line == bounds_loc.end_line &&
+               high_span.end_column > bounds_loc.end_column)) {
+            bounds_loc.end_line = high_span.end_line;
+            bounds_loc.end_column = high_span.end_column;
+          }
+        }
+      }
+      if (bounds_loc.line < 1) bounds_loc = btw.loc;
+      bag.error("BETWEEN bounds must be constants", bounds_loc);
     }
     return;
   }

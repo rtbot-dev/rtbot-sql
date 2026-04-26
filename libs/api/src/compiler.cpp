@@ -954,7 +954,7 @@ CompilationResult compile_sql(const std::string& sql,
   // compilation runs. As Phase C migrations land, more checks fire here
   // (with locations) instead of throwing during compilation.
   {
-    auto diags = analyzer::analyze_statement(stmt, catalog);
+    auto diags = analyzer::analyze_statement(stmt, catalog, normalized);
     if (!diags.empty()) {
       CompilationResult r{};
       for (const auto& d : diags) {

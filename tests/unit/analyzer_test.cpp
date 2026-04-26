@@ -869,11 +869,156 @@ TEST(AnalyzerSpanTest, FunctionArityNumberLiteralEndsAfterDigit) {
 
 TEST(AnalyzerSpanTest, MultiCharNumberLiteralFullySpanned) {
   auto c = stream_catalog();
-  // Verify a multi-digit literal is fully spanned (12345 → 5 chars).
+  // Verify a multi-digit literal is fully spanned (12345.6 → 7 chars).
+  // The fractional part trips "must be a positive integer".
   expect_span_matches(
       "CREATE MATERIALIZED VIEW v AS "
       "SELECT MOVING_AVERAGE(memory, 12345.6) FROM memory_usage",
       c, "must be a positive integer", "12345.6");
+}
+
+// ---------------------------------------------------------------------------
+// Whole-expression spans on constant-arg errors.
+// expr_span unions every per-node .loc and extends across each FuncCall's
+// closing ')'. These tests prove the span covers the *entire* offending
+// expression rather than just its first token.
+// ---------------------------------------------------------------------------
+
+TEST(AnalyzerSpanTest, PowerExponentMultiTokenSpan) {
+  auto c = stream_catalog();
+  expect_span_matches(
+      "CREATE MATERIALIZED VIEW v AS "
+      "SELECT POWER(memory, cpu + 1) FROM memory_usage",
+      c, "POWER exponent must be a constant", "cpu + 1");
+}
+
+TEST(AnalyzerSpanTest, TimeshiftShiftMultiTokenSpan) {
+  auto c = stream_catalog();
+  expect_span_matches(
+      "CREATE MATERIALIZED VIEW v AS "
+      "SELECT TIMESHIFT(memory, cpu + 1) FROM memory_usage",
+      c, "TIMESHIFT shift must be a constant", "cpu + 1");
+}
+
+TEST(AnalyzerSpanTest, ResampleConstantIntervalMultiTokenSpan) {
+  auto c = stream_catalog();
+  expect_span_matches(
+      "CREATE MATERIALIZED VIEW v AS "
+      "SELECT RESAMPLE_CONSTANT(memory, cpu + 1) FROM memory_usage",
+      c, "RESAMPLE_CONSTANT interval must be a constant", "cpu + 1");
+}
+
+TEST(AnalyzerSpanTest, ResampleConstantSnapFirstMultiTokenSpan) {
+  auto c = stream_catalog();
+  expect_span_matches(
+      "CREATE MATERIALIZED VIEW v AS "
+      "SELECT RESAMPLE_CONSTANT(memory, 1000, cpu + 1) FROM memory_usage",
+      c, "RESAMPLE_CONSTANT snap_first must be a constant", "cpu + 1");
+}
+
+TEST(AnalyzerSpanTest, WindowSizeConstantIntMultiTokenSpan) {
+  auto c = stream_catalog();
+  expect_span_matches(
+      "CREATE MATERIALIZED VIEW v AS "
+      "SELECT MOVING_SUM(memory, cpu + 1) FROM memory_usage",
+      c, "must be a constant integer", "cpu + 1");
+}
+
+TEST(AnalyzerCoverageTest, WindowSizeAcceptsFoldedIntegerExpression) {
+  auto c = stream_catalog();
+  // 2*3 folds to 6 — accepted as window_size.
+  auto r = compile_sql(
+      "CREATE MATERIALIZED VIEW v AS "
+      "SELECT MOVING_SUM(memory, 2*3) FROM memory_usage",
+      c);
+  EXPECT_FALSE(r.has_errors());
+}
+
+TEST(AnalyzerCoverageTest, WindowSizeAcceptsFoldedMathFunction) {
+  auto c = stream_catalog();
+  // FLOOR(7.7) folds to 7 — accepted (7 == int(7)).
+  auto r = compile_sql(
+      "CREATE MATERIALIZED VIEW v AS "
+      "SELECT MOVING_SUM(memory, FLOOR(7.7)) FROM memory_usage",
+      c);
+  EXPECT_FALSE(r.has_errors());
+}
+
+TEST(AnalyzerCoverageTest, WindowSizeMixedDivisionFoldsToInteger) {
+  auto c = stream_catalog();
+  // 6/2 + 1 folds to 4.0 — integer-valued, positive, accepted. The
+  // compiler's require_constant_int re-folds via analyzer::try_fold and
+  // produces window=4.
+  auto r = compile_sql(
+      "CREATE MATERIALIZED VIEW v AS "
+      "SELECT MOVING_SUM(memory, 6/2 + 1) FROM memory_usage",
+      c);
+  EXPECT_FALSE(r.has_errors());
+}
+
+TEST(AnalyzerCoverageTest, WindowSizeFractionalFoldRejected) {
+  auto c = stream_catalog();
+  // 2.5 folds but isn't integer-valued — flagged as "must be a positive
+  // integer" (mirrors the pre-existing literal-fractional behaviour).
+  auto r = compile_sql(
+      "CREATE MATERIALIZED VIEW v AS "
+      "SELECT MOVING_SUM(memory, 2.5) FROM memory_usage",
+      c);
+  ASSERT_TRUE(r.has_errors());
+  bool found = false;
+  for (const auto& e : r.errors) {
+    if (e.message.find("must be a positive integer") != std::string::npos) {
+      found = true;
+      break;
+    }
+  }
+  EXPECT_TRUE(found);
+}
+
+TEST(AnalyzerSpanTest, WindowSizeFractionalFoldSpansWholeExpression) {
+  auto c = stream_catalog();
+  // 7/2 + 1 folds to 4.5 (float division). Span must cover the whole
+  // expression, not just the first token.
+  expect_span_matches(
+      "CREATE MATERIALIZED VIEW v AS "
+      "SELECT MOVING_SUM(memory, 7/2 + 1) FROM memory_usage",
+      c, "must be a positive integer", "7/2 + 1");
+}
+
+TEST(AnalyzerSpanTest, PowerExponentFuncCallArgSpansClosingParen) {
+  // Exercises the FuncCall closing-`)` extension: ABS(cpu) is a non-foldable
+  // expression (cpu is a column ref). The span should cover the inner call
+  // including its closing paren — `ABS(cpu)`, not `ABS(cpu`.
+  auto c = stream_catalog();
+  expect_span_matches(
+      "CREATE MATERIALIZED VIEW v AS "
+      "SELECT POWER(memory, ABS(cpu)) FROM memory_usage",
+      c, "POWER exponent must be a constant", "ABS(cpu)");
+}
+
+TEST(AnalyzerSpanTest, InsertValuesMustBeConstantMultiTokenSpan) {
+  CatalogSnapshot c;
+  TableSchema mini;
+  mini.name = "mini";
+  mini.columns = {{"x", 0, ColumnType::DOUBLE}};
+  mini.key_columns = {0};
+  c.tables["mini"] = mini;
+  expect_span_matches("INSERT INTO mini VALUES (cpu + 1)", c,
+                      "INSERT values must be constants", "cpu + 1");
+}
+
+TEST(AnalyzerSpanTest, DeleteWhereValueMustBeConstantSpansWholeComparison) {
+  CatalogSnapshot c;
+  TableSchema t;
+  t.name = "lookup";
+  t.columns = {{"id", 0, ColumnType::DOUBLE},
+               {"name", 1, ColumnType::TEXT}};
+  t.key_columns = {0};
+  c.tables["lookup"] = t;
+  // Both sides are ColumnRefs; neither is a literal Constant. The whole
+  // comparison should be flagged.
+  expect_span_matches("DELETE FROM lookup WHERE id = id", c,
+                      "DELETE WHERE value must be a constant", "id = id");
 }
 
 TEST(AnalyzerEndLocationTest, EndExclusiveOfLastChar) {

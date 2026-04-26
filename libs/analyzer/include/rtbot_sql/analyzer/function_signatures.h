@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <string_view>
 
 #include "rtbot_sql/analyzer/diagnostic.h"
 #include "rtbot_sql/parser/ast.h"
@@ -21,6 +22,7 @@ bool is_known_function(const std::string& name);
 // in libs/compiler/src/expression_compiler.cpp (POWER, TIMESHIFT, TS,
 // RESAMPLE_CONSTANT, unary math).
 void validate_function_call(const parser::ast::FuncCall& fc,
-                            DiagnosticBag& bag);
+                            DiagnosticBag& bag,
+                            std::string_view sql = {});
 
 }  // namespace rtbot_sql::analyzer

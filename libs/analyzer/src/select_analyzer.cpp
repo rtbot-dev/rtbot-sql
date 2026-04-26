@@ -307,7 +307,7 @@ bool source_exists(const std::string& name, const CatalogSnapshot& catalog) {
 
 void analyze_select(const parser::ast::SelectStmt& stmt,
                     const CatalogSnapshot& catalog, DiagnosticBag& bag,
-                    bool top_level) {
+                    bool top_level, std::string_view sql) {
   // Source existence: catch "unknown source" at the top-level FROM before
   // any expression validation so users see the most relevant error first.
   // Mirrors libs/planner/src/classifier.cpp:163. Use the FROM source's
@@ -352,7 +352,7 @@ void analyze_select(const parser::ast::SelectStmt& stmt,
     if (item.alias.has_value()) item_aliases.erase(*item.alias);
     const std::set<std::string>* item_aliases_ptr =
         item_aliases.empty() ? nullptr : &item_aliases;
-    validate_expression(item.expr, bag, scope, item_aliases_ptr);
+    validate_expression(item.expr, bag, scope, item_aliases_ptr, sql);
   }
 
   // JOIN ON conditions: validate the expression tree (function arity etc.)
@@ -362,7 +362,7 @@ void analyze_select(const parser::ast::SelectStmt& stmt,
   for (const auto& join : stmt.join_clauses) {
     if (join.on_condition) {
       validate_expression(*join.on_condition, bag, /*scope=*/nullptr,
-                          /*aliases=*/nullptr);
+                          /*aliases=*/nullptr, sql);
     }
   }
 
@@ -382,12 +382,12 @@ void analyze_select(const parser::ast::SelectStmt& stmt,
       bag.error("aggregate function not allowed in WHERE clause; use HAVING",
                 parser::ast::loc_of(*stmt.where_clause));
     }
-    validate_predicate(*stmt.where_clause, bag, "WHERE", scope, aliases);
+    validate_predicate(*stmt.where_clause, bag, "WHERE", scope, aliases, sql);
   }
 
   // GROUP BY
   for (const auto& g : stmt.group_by) {
-    validate_expression(g, bag, scope, aliases);
+    validate_expression(g, bag, scope, aliases, sql);
   }
 
   // GROUP BY with multi-FROM is not yet supported.
@@ -517,12 +517,12 @@ void analyze_select(const parser::ast::SelectStmt& stmt,
 
   // HAVING — predicate-shape rules apply with HAVING-context wording.
   if (stmt.having) {
-    validate_predicate(*stmt.having, bag, "HAVING", scope, aliases);
+    validate_predicate(*stmt.having, bag, "HAVING", scope, aliases, sql);
   }
 
   // ORDER BY items
   for (const auto& ob : stmt.order_by) {
-    validate_expression(ob.expr, bag, scope, aliases);
+    validate_expression(ob.expr, bag, scope, aliases, sql);
   }
 
   // SELECT FROM VIEW (non-materialized) requires LIMIT.

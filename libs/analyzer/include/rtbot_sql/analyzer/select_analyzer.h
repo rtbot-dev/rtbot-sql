@@ -1,5 +1,7 @@
 #pragma once
 
+#include <string_view>
+
 #include "rtbot_sql/analyzer/diagnostic.h"
 #include "rtbot_sql/api/types.h"
 #include "rtbot_sql/parser/ast.h"
@@ -17,6 +19,6 @@ namespace rtbot_sql::analyzer {
 // don't need bounding.
 void analyze_select(const parser::ast::SelectStmt& stmt,
                     const CatalogSnapshot& catalog, DiagnosticBag& bag,
-                    bool top_level = true);
+                    bool top_level = true, std::string_view sql = {});
 
 }  // namespace rtbot_sql::analyzer

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <string_view>
+
 #include "rtbot_sql/analyzer/diagnostic.h"
 #include "rtbot_sql/api/types.h"
 #include "rtbot_sql/parser/ast.h"
@@ -12,13 +14,15 @@ namespace rtbot_sql::analyzer {
 // unknown stream/table, value-count mismatch, type mismatches between
 // column type and provided constant, non-constant values.
 void analyze_insert(const parser::ast::InsertStmt& stmt,
-                    const CatalogSnapshot& catalog, DiagnosticBag& bag);
+                    const CatalogSnapshot& catalog, DiagnosticBag& bag,
+                    std::string_view sql = {});
 
 // Validate DELETE FROM <table> WHERE <key> = <const>.
 //
 // Mirrors handle_delete in libs/api/src/compiler.cpp:550-589.
 void analyze_delete(const parser::ast::DeleteStmt& stmt,
-                    const CatalogSnapshot& catalog, DiagnosticBag& bag);
+                    const CatalogSnapshot& catalog, DiagnosticBag& bag,
+                    std::string_view sql = {});
 
 // Validate DROP <kind> <name>.
 //

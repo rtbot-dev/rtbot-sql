@@ -4,6 +4,7 @@
 #include <string>
 
 #include "rtbot_sql/analyzer/const_fold.h"
+#include "rtbot_sql/analyzer/expr_span.h"
 
 namespace rtbot_sql::analyzer {
 
@@ -44,24 +45,24 @@ bool is_scalar_builtin(const std::string& u) {
          u == "RESAMPLE_CONSTANT";
 }
 
-// Validate that `arg` is a literal numeric Constant whose integer value is
-// strictly positive. Mirrors require_constant_int in function_compiler.cpp,
-// which only accepts literal Constants (not folded expressions).
+// Validate that `arg` constant-folds to a positive integer value. Folded
+// expressions like `2*3` and `FLOOR(7.7)` are accepted because the result
+// is an integer; `2.5` and `cpu+1` are rejected.
 void check_const_int_positive(const parser::ast::FuncCall& fc, std::size_t idx,
                               const std::string& param_name,
-                              DiagnosticBag& bag) {
+                              DiagnosticBag& bag, std::string_view sql) {
   if (idx >= fc.args.size()) return;
   const auto& arg = fc.args[idx];
-  parser::ast::SourceLocation loc = parser::ast::loc_of(arg);
-  if (auto* c = std::get_if<parser::ast::Constant>(&arg)) {
-    int v = static_cast<int>(c->value);
-    if (v != c->value || v <= 0) {
-      bag.error(fc.name + ": " + param_name + " must be a positive integer",
-                loc);
-    }
+  parser::ast::SourceLocation loc = expr_span(arg, sql);
+  auto folded = try_fold(arg);
+  if (!folded) {
+    bag.error(fc.name + ": " + param_name + " must be a constant integer", loc);
     return;
   }
-  bag.error(fc.name + ": " + param_name + " must be a constant integer", loc);
+  int v = static_cast<int>(*folded);
+  if (v != *folded || v <= 0) {
+    bag.error(fc.name + ": " + param_name + " must be a positive integer", loc);
+  }
 }
 
 // Validate that `arg` is an ArrayLiteral. Mirrors the FIR/IIR array checks
@@ -83,7 +84,7 @@ bool is_known_function(const std::string& name) {
 }
 
 void validate_function_call(const parser::ast::FuncCall& fc,
-                            DiagnosticBag& bag) {
+                            DiagnosticBag& bag, std::string_view sql) {
   std::string u = upper(fc.name);
 
   // --- Cumulative aggregates (function_compiler.cpp) ---
@@ -129,7 +130,7 @@ void validate_function_call(const parser::ast::FuncCall& fc,
                 fc.loc);
       return;
     }
-    check_const_int_positive(fc, 1, "window_size", bag);
+    check_const_int_positive(fc, 1, "window_size", bag, sql);
     return;
   }
   if (u == "MOVING_SUM") {
@@ -138,7 +139,7 @@ void validate_function_call(const parser::ast::FuncCall& fc,
                 fc.loc);
       return;
     }
-    check_const_int_positive(fc, 1, "window_size", bag);
+    check_const_int_positive(fc, 1, "window_size", bag, sql);
     return;
   }
   if (u == "MOVING_COUNT") {
@@ -146,7 +147,7 @@ void validate_function_call(const parser::ast::FuncCall& fc,
       bag.error("MOVING_COUNT requires 1 argument: (window_size)", fc.loc);
       return;
     }
-    check_const_int_positive(fc, 0, "window_size", bag);
+    check_const_int_positive(fc, 0, "window_size", bag, sql);
     return;
   }
   if (u == "MOVING_STD") {
@@ -155,7 +156,7 @@ void validate_function_call(const parser::ast::FuncCall& fc,
                 fc.loc);
       return;
     }
-    check_const_int_positive(fc, 1, "window_size", bag);
+    check_const_int_positive(fc, 1, "window_size", bag, sql);
     return;
   }
   if (u == "STDDEV") {
@@ -163,7 +164,7 @@ void validate_function_call(const parser::ast::FuncCall& fc,
       bag.error("STDDEV requires 2 arguments: (expr, window_size)", fc.loc);
       return;
     }
-    check_const_int_positive(fc, 1, "window_size", bag);
+    check_const_int_positive(fc, 1, "window_size", bag, sql);
     return;
   }
   if (u == "MOVING_MIN") {
@@ -172,7 +173,7 @@ void validate_function_call(const parser::ast::FuncCall& fc,
                 fc.loc);
       return;
     }
-    check_const_int_positive(fc, 1, "window_size", bag);
+    check_const_int_positive(fc, 1, "window_size", bag, sql);
     return;
   }
   if (u == "MOVING_MAX") {
@@ -181,7 +182,7 @@ void validate_function_call(const parser::ast::FuncCall& fc,
                 fc.loc);
       return;
     }
-    check_const_int_positive(fc, 1, "window_size", bag);
+    check_const_int_positive(fc, 1, "window_size", bag, sql);
     return;
   }
 
@@ -226,7 +227,7 @@ void validate_function_call(const parser::ast::FuncCall& fc,
       bag.error("RESAMPLE requires 2 arguments: (expr, interval)", fc.loc);
       return;
     }
-    check_const_int_positive(fc, 1, "interval", bag);
+    check_const_int_positive(fc, 1, "interval", bag, sql);
     return;
   }
   if (u == "PEAK_DETECT") {
@@ -235,7 +236,7 @@ void validate_function_call(const parser::ast::FuncCall& fc,
                 fc.loc);
       return;
     }
-    check_const_int_positive(fc, 1, "window_size", bag);
+    check_const_int_positive(fc, 1, "window_size", bag, sql);
     return;
   }
 
@@ -256,7 +257,7 @@ void validate_function_call(const parser::ast::FuncCall& fc,
     // must constant-fold (POWER(x, 2*3) is fine; POWER(x, col) is not).
     if (!try_fold(fc.args[1])) {
       bag.error("POWER exponent must be a constant",
-                parser::ast::loc_of(fc.args[1]));
+                expr_span(fc.args[1], sql));
     }
     return;
   }
@@ -268,7 +269,7 @@ void validate_function_call(const parser::ast::FuncCall& fc,
     // Mirrors libs/compiler/src/expression_compiler.cpp:317.
     if (!try_fold(fc.args[1])) {
       bag.error("TIMESHIFT shift must be a constant",
-                parser::ast::loc_of(fc.args[1]));
+                expr_span(fc.args[1], sql));
     }
     return;
   }
@@ -280,11 +281,11 @@ void validate_function_call(const parser::ast::FuncCall& fc,
     // Mirrors libs/compiler/src/expression_compiler.cpp:342, 354.
     if (!try_fold(fc.args[1])) {
       bag.error("RESAMPLE_CONSTANT interval must be a constant",
-                parser::ast::loc_of(fc.args[1]));
+                expr_span(fc.args[1], sql));
     }
     if (fc.args.size() == 3 && !try_fold(fc.args[2])) {
       bag.error("RESAMPLE_CONSTANT snap_first must be a constant",
-                parser::ast::loc_of(fc.args[2]));
+                expr_span(fc.args[2], sql));
     }
     return;
   }

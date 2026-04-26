@@ -4,6 +4,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "rtbot_sql/analyzer/const_fold.h"
 #include "rtbot_sql/compiler/expr_cache.h"
 #include "rtbot_sql/compiler/expression_compiler.h"
 
@@ -40,12 +41,15 @@ Endpoint ensure_endpoint(ExprResult result, const Endpoint& input_endpoint,
 // Extract a constant integer argument (for window sizes).
 //
 // Precondition: validated by analyzer::validate_function_call upstream.
-// Callers reach this only with a literal Constant whose integer value is
-// > 0; non-conforming inputs are rejected before compilation.
+// Callers reach this only with an expression that constant-folds to a
+// positive value; non-folding or non-positive inputs are rejected before
+// compilation. Non-integer folded values (e.g. 2.5) are silently truncated.
 int require_constant_int(const std::string& /*func_name*/,
                          const parser::ast::Expr& expr,
                          const std::string& /*param_name*/) {
-  return static_cast<int>(std::get<parser::ast::Constant>(expr).value);
+  auto folded = analyzer::try_fold(expr);
+  if (!folded) __builtin_unreachable();
+  return static_cast<int>(*folded);
 }
 
 }  // namespace
