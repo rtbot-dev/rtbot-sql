@@ -4,6 +4,8 @@
 
 #include <limits>
 
+#include "rtbot_sql/api/compiler.h"
+
 namespace rtbot_sql::compiler {
 namespace {
 
@@ -295,10 +297,16 @@ TEST_F(ExpressionTest, MathFunctionConstantFolding) {
   EXPECT_TRUE(builder.connections().empty());
 }
 
-// Unknown column throws
-TEST_F(ExpressionTest, UnknownColumnThrows) {
-  EXPECT_THROW(compile_expression(col("nonexistent"), input, scope, builder),
-               std::runtime_error);
+// Unknown column rejected by the analyzer (driven through compile_sql).
+TEST(ExpressionAnalyzerTest, UnknownColumnRejected) {
+  rtbot_sql::CatalogSnapshot c;
+  rtbot_sql::StreamSchema schema;
+  schema.name = "trades";
+  schema.columns = {{"price", 0, rtbot_sql::ColumnType::DOUBLE}};
+  c.streams["trades"] = schema;
+  auto r = rtbot_sql::api::compile_sql(
+      "CREATE MATERIALIZED VIEW v AS SELECT nonexistent FROM trades", c);
+  EXPECT_TRUE(r.has_errors());
 }
 
 // Qualified column reference: t.price
@@ -425,16 +433,18 @@ TEST_F(ExpressionTest, TSFunctionCaseInsensitive) {
   EXPECT_EQ(builder.operators()[0].type, "TimestampExtract");
 }
 
-// TS(123) should fail — no arguments allowed
-TEST_F(ExpressionTest, TSFunctionWithArgsThrows) {
-  auto f = std::make_unique<FuncCall>();
-  f->name = "TS";
-  f->args.push_back(num(123.0));
-  Expr expr = std::move(f);
-
-  EXPECT_THROW(
-      compile_expression(std::move(expr), input, scope, builder),
-      std::runtime_error);
+// TS(123) should fail — no arguments allowed.
+// Driven through compile_sql since the analyzer catches this on the
+// user-facing path.
+TEST(ExpressionAnalyzerTest, TSFunctionWithArgsRejected) {
+  rtbot_sql::CatalogSnapshot c;
+  rtbot_sql::StreamSchema schema;
+  schema.name = "trades";
+  schema.columns = {{"price", 0, rtbot_sql::ColumnType::DOUBLE}};
+  c.streams["trades"] = schema;
+  auto r = rtbot_sql::api::compile_sql(
+      "CREATE MATERIALIZED VIEW v AS SELECT TS(123) FROM trades", c);
+  EXPECT_TRUE(r.has_errors());
 }
 
 // RESAMPLE_CONSTANT(price, 1000000) → VectorExtract(1) → ResamplerConstant(interval=1000000, t0=0)
@@ -474,48 +484,49 @@ TEST_F(ExpressionTest, ResampleConstantCaseInsensitive) {
   EXPECT_EQ(builder.operators()[1].params.at("t0"), 0.0);
 }
 
-// RESAMPLE_CONSTANT with wrong arg count throws
-TEST_F(ExpressionTest, ResampleConstantWrongArgCountThrows) {
+// RESAMPLE_CONSTANT with wrong arg count rejected by the analyzer.
+TEST(ExpressionAnalyzerTest, ResampleConstantWrongArgCountRejected) {
+  rtbot_sql::CatalogSnapshot c;
+  rtbot_sql::StreamSchema schema;
+  schema.name = "trades";
+  schema.columns = {{"price", 0, rtbot_sql::ColumnType::DOUBLE}};
+  c.streams["trades"] = schema;
   // Zero args
-  {
-    auto f = std::make_unique<FuncCall>();
-    f->name = "RESAMPLE_CONSTANT";
-    Expr expr = std::move(f);
-    EXPECT_THROW(
-        compile_expression(std::move(expr), input, scope, builder),
-        std::runtime_error);
-  }
+  EXPECT_TRUE(rtbot_sql::api::compile_sql(
+                  "CREATE MATERIALIZED VIEW v AS "
+                  "SELECT RESAMPLE_CONSTANT() FROM trades",
+                  c)
+                  .has_errors());
   // One arg
-  {
-    GraphBuilder b2;
-    EXPECT_THROW(
-        compile_expression(func("RESAMPLE_CONSTANT", col("price")),
-                           input, scope, b2),
-        std::runtime_error);
-  }
+  EXPECT_TRUE(rtbot_sql::api::compile_sql(
+                  "CREATE MATERIALIZED VIEW v AS "
+                  "SELECT RESAMPLE_CONSTANT(price) FROM trades",
+                  c)
+                  .has_errors());
   // Four args
-  {
-    GraphBuilder b3;
-    auto f = std::make_unique<FuncCall>();
-    f->name = "RESAMPLE_CONSTANT";
-    f->args.push_back(col("price"));
-    f->args.push_back(num(1000.0));
-    f->args.push_back(num(1.0));
-    f->args.push_back(num(0.0));
-    Expr expr = std::move(f);
-    EXPECT_THROW(
-        compile_expression(std::move(expr), input, scope, b3),
-        std::runtime_error);
-  }
+  EXPECT_TRUE(rtbot_sql::api::compile_sql(
+                  "CREATE MATERIALIZED VIEW v AS "
+                  "SELECT RESAMPLE_CONSTANT(price, 1000, 1, 0) FROM trades",
+                  c)
+                  .has_errors());
 }
 
-// RESAMPLE_CONSTANT(price, quantity) — non-constant interval should throw
-TEST_F(ExpressionTest, ResampleConstantNonConstantIntervalThrows) {
-  EXPECT_THROW(
-      compile_expression(
-          func2("RESAMPLE_CONSTANT", col("price"), col("quantity")),
-          input, scope, builder),
-      std::runtime_error);
+// RESAMPLE_CONSTANT(price, quantity) — non-constant interval rejected by
+// the analyzer.
+TEST(ExpressionAnalyzerTest, ResampleConstantNonConstantIntervalRejected) {
+  rtbot_sql::CatalogSnapshot c;
+  rtbot_sql::StreamSchema schema;
+  schema.name = "trades";
+  schema.columns = {
+      {"price", 0, rtbot_sql::ColumnType::DOUBLE},
+      {"quantity", 1, rtbot_sql::ColumnType::DOUBLE},
+  };
+  c.streams["trades"] = schema;
+  auto r = rtbot_sql::api::compile_sql(
+      "CREATE MATERIALIZED VIEW v AS "
+      "SELECT RESAMPLE_CONSTANT(price, quantity) FROM trades",
+      c);
+  EXPECT_TRUE(r.has_errors());
 }
 
 // RESAMPLE_CONSTANT(price * 2, 1000) — expression as first arg works
@@ -579,47 +590,48 @@ TEST_F(ExpressionTest, TimeShiftCaseInsensitive) {
   EXPECT_EQ(builder.operators()[1].params.at("shift"), -500.0);
 }
 
-// TIMESHIFT with wrong arg count throws
-TEST_F(ExpressionTest, TimeShiftWrongArgCountThrows) {
+// TIMESHIFT with wrong arg count rejected by the analyzer.
+TEST(ExpressionAnalyzerTest, TimeShiftWrongArgCountRejected) {
+  rtbot_sql::CatalogSnapshot c;
+  rtbot_sql::StreamSchema schema;
+  schema.name = "trades";
+  schema.columns = {{"price", 0, rtbot_sql::ColumnType::DOUBLE}};
+  c.streams["trades"] = schema;
   // Zero args
-  {
-    auto f = std::make_unique<FuncCall>();
-    f->name = "TIMESHIFT";
-    Expr expr = std::move(f);
-    EXPECT_THROW(
-        compile_expression(std::move(expr), input, scope, builder),
-        std::runtime_error);
-  }
+  EXPECT_TRUE(rtbot_sql::api::compile_sql(
+                  "CREATE MATERIALIZED VIEW v AS "
+                  "SELECT TIMESHIFT() FROM trades",
+                  c)
+                  .has_errors());
   // One arg
-  {
-    GraphBuilder b2;
-    EXPECT_THROW(
-        compile_expression(func("TIMESHIFT", col("price")),
-                           input, scope, b2),
-        std::runtime_error);
-  }
+  EXPECT_TRUE(rtbot_sql::api::compile_sql(
+                  "CREATE MATERIALIZED VIEW v AS "
+                  "SELECT TIMESHIFT(price) FROM trades",
+                  c)
+                  .has_errors());
   // Three args
-  {
-    GraphBuilder b3;
-    auto f = std::make_unique<FuncCall>();
-    f->name = "TIMESHIFT";
-    f->args.push_back(col("price"));
-    f->args.push_back(num(-1000.0));
-    f->args.push_back(num(0.0));
-    Expr expr = std::move(f);
-    EXPECT_THROW(
-        compile_expression(std::move(expr), input, scope, b3),
-        std::runtime_error);
-  }
+  EXPECT_TRUE(rtbot_sql::api::compile_sql(
+                  "CREATE MATERIALIZED VIEW v AS "
+                  "SELECT TIMESHIFT(price, -1000, 0) FROM trades",
+                  c)
+                  .has_errors());
 }
 
-// TIMESHIFT(price, quantity) — non-constant shift should throw
-TEST_F(ExpressionTest, TimeShiftNonConstantShiftThrows) {
-  EXPECT_THROW(
-      compile_expression(
-          func2("TIMESHIFT", col("price"), col("quantity")),
-          input, scope, builder),
-      std::runtime_error);
+// TIMESHIFT(price, quantity) — non-constant shift rejected by the analyzer.
+TEST(ExpressionAnalyzerTest, TimeShiftNonConstantShiftRejected) {
+  rtbot_sql::CatalogSnapshot c;
+  rtbot_sql::StreamSchema schema;
+  schema.name = "trades";
+  schema.columns = {
+      {"price", 0, rtbot_sql::ColumnType::DOUBLE},
+      {"quantity", 1, rtbot_sql::ColumnType::DOUBLE},
+  };
+  c.streams["trades"] = schema;
+  auto r = rtbot_sql::api::compile_sql(
+      "CREATE MATERIALIZED VIEW v AS "
+      "SELECT TIMESHIFT(price, quantity) FROM trades",
+      c);
+  EXPECT_TRUE(r.has_errors());
 }
 
 // TIMESHIFT(RESAMPLE_CONSTANT(price, 1000), -1000) — composition

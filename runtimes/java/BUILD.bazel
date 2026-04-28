@@ -327,3 +327,20 @@ java_test(
         "@maven//:junit_junit",
     ],
 )
+
+# ---------------------------------------------------------------------------
+# Error location binding test — verify line/column AND end_line/end_column
+# reach the Java-level consumer through the JSON serializers in
+# rtbot_sql_jni.cpp. Without this, a regression in the binding's error
+# serializer would silently land.
+# ---------------------------------------------------------------------------
+java_test(
+    name = "error-location-binding-test",
+    srcs = ["src/test/java/dev/rtbot/sql/ErrorLocationBindingTest.java"],
+    test_class = "dev.rtbot.sql.ErrorLocationBindingTest",
+    deps = [
+        ":rtbot-sql-java-runtime",
+        "@maven//:junit_junit",
+        "@maven//:com_google_code_gson_gson",
+    ],
+)

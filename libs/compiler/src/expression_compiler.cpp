@@ -196,12 +196,13 @@ ExprResult compile_expression(const parser::ast::Expr& expr,
     }
   };
 
-  // ColumnRef → VectorExtract
+  // ColumnRef → VectorExtract.
+  // Precondition: analyzer::validate_expression resolved the column against
+  // its scope and rejected unknown / ambiguous references before
+  // compilation. Direct callers of compile_expression() must guarantee
+  // the reference is resolvable.
   if (auto* col = std::get_if<ColumnRef>(&expr)) {
     auto result = scope.resolve(*col);
-    if (auto* err = std::get_if<std::string>(&result)) {
-      throw std::runtime_error(*err);
-    }
     auto& binding = std::get<analyzer::ColumnBinding>(result);
     Endpoint source_ep = input_endpoint;
     if (source_endpoints) {
@@ -273,9 +274,6 @@ ExprResult compile_expression(const parser::ast::Expr& expr,
     std::transform(upper_name.begin(), upper_name.end(), upper_name.begin(),
                    ::toupper);
     if (upper_name == "TS") {
-      if (!func.args.empty()) {
-        throw std::runtime_error("TS() takes no arguments");
-      }
       auto id = builder.next_id("ts");
       builder.add_operator(id, "TimestampExtract");
       builder.connect(input_endpoint, {id, "i1"});
@@ -286,17 +284,14 @@ ExprResult compile_expression(const parser::ast::Expr& expr,
 
     // POWER(expr, n) — special case with exponent parameter
     if (upper_name == "POWER") {
-      if (func.args.size() != 2) {
-        throw std::runtime_error("POWER requires exactly 2 arguments");
-      }
       auto base = compile_expression(func.args[0], input_endpoint, scope,
                                      builder, cache, source_endpoints);
+      // Precondition: analyzer::validate_function_call rejects POWER calls
+      // whose exponent doesn't constant-fold.
       auto exp_result = compile_expression(func.args[1], input_endpoint, scope,
                                             builder, cache, source_endpoints);
       auto* exp_const = std::get_if<ConstantMarker>(&exp_result);
-      if (!exp_const) {
-        throw std::runtime_error("POWER exponent must be a constant");
-      }
+      if (!exp_const) __builtin_unreachable();
 
       // If base is also constant, fold
       if (auto* base_const = std::get_if<ConstantMarker>(&base)) {
@@ -313,20 +308,14 @@ ExprResult compile_expression(const parser::ast::Expr& expr,
 
     // TIMESHIFT(expr, shift) — shift message timestamps by a constant
     if (upper_name == "TIMESHIFT") {
-      if (func.args.size() != 2) {
-        throw std::runtime_error(
-            "TIMESHIFT requires exactly 2 arguments");
-      }
       auto signal = compile_expression(func.args[0], input_endpoint, scope,
                                        builder, cache, source_endpoints);
+      // Precondition: analyzer rejects non-foldable shift arguments.
       auto shift_result =
           compile_expression(func.args[1], input_endpoint, scope, builder,
                              cache, source_endpoints);
       auto* shift_const = std::get_if<ConstantMarker>(&shift_result);
-      if (!shift_const) {
-        throw std::runtime_error(
-            "TIMESHIFT shift must be a constant");
-      }
+      if (!shift_const) __builtin_unreachable();
 
       auto signal_ep =
           ensure_endpoint_local(std::move(signal), input_endpoint, builder);
@@ -342,20 +331,14 @@ ExprResult compile_expression(const parser::ast::Expr& expr,
 
     // RESAMPLE_CONSTANT(expr, interval [, snap_first]) — resampler with fixed grid (t0=0)
     if (upper_name == "RESAMPLE_CONSTANT") {
-      if (func.args.size() < 2 || func.args.size() > 3) {
-        throw std::runtime_error(
-            "RESAMPLE_CONSTANT requires 2 or 3 arguments");
-      }
       auto signal = compile_expression(func.args[0], input_endpoint, scope,
                                        builder, cache, source_endpoints);
+      // Preconditions: analyzer rejects non-foldable interval / snap_first.
       auto interval_result =
           compile_expression(func.args[1], input_endpoint, scope, builder,
                              cache, source_endpoints);
       auto* interval_const = std::get_if<ConstantMarker>(&interval_result);
-      if (!interval_const) {
-        throw std::runtime_error(
-            "RESAMPLE_CONSTANT interval must be a constant");
-      }
+      if (!interval_const) __builtin_unreachable();
 
       // Optional 3rd arg: snap_first flag (default 0)
       double snap_first_val = 0.0;
@@ -364,10 +347,7 @@ ExprResult compile_expression(const parser::ast::Expr& expr,
             compile_expression(func.args[2], input_endpoint, scope, builder,
                                cache, source_endpoints);
         auto* snap_const = std::get_if<ConstantMarker>(&snap_result);
-        if (!snap_const) {
-          throw std::runtime_error(
-              "RESAMPLE_CONSTANT snap_first must be a constant");
-        }
+        if (!snap_const) __builtin_unreachable();
         snap_first_val = snap_const->value;
       }
 
@@ -396,10 +376,10 @@ ExprResult compile_expression(const parser::ast::Expr& expr,
         maybe_cache(expr, r);
         return r;
       }
-      throw std::runtime_error("unknown function: " + func.name);
-    }
-    if (func.args.size() != 1) {
-      throw std::runtime_error(func.name + " requires exactly 1 argument");
+      // Precondition: analyzer rejects unknown function names before
+      // compilation. Direct callers of compile_expression() must
+      // guarantee `func.name` is recognized.
+      __builtin_unreachable();
     }
 
     auto arg = compile_expression(func.args[0], input_endpoint, scope, builder,
@@ -422,9 +402,6 @@ ExprResult compile_expression(const parser::ast::Expr& expr,
   // Compiled as Multiplexer(N ports) with mutually-exclusive boolean controls.
   if (auto* case_ptr = std::get_if<std::unique_ptr<parser::ast::CaseExpr>>(&expr)) {
     const auto& ce = **case_ptr;
-    if (ce.when_clauses.empty()) {
-      throw std::runtime_error("CASE expression has no WHEN clauses");
-    }
 
     // Compile each WHEN condition → boolean endpoint.
     std::vector<Endpoint> cond_eps;

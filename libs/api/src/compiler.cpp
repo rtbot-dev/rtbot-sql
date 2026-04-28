@@ -10,6 +10,8 @@
 #include <string>
 #include <variant>
 
+#include "rtbot_sql/analyzer/analyzer.h"
+#include "rtbot_sql/analyzer/diagnostic.h"
 #include "rtbot_sql/analyzer/scope.h"
 #include "rtbot_sql/api/preprocessor.h"
 #include "rtbot_sql/catalog/catalog.h"
@@ -22,6 +24,7 @@
 #include "rtbot_sql/parser/ast.h"
 #include "rtbot_sql/parser/ast_converter.h"
 #include "rtbot_sql/parser/parser.h"
+#include "rtbot_sql/parser/source_text.h"
 #include "rtbot_sql/planner/classifier.h"
 #include "rtbot_sql/planner/planner.h"
 
@@ -92,7 +95,9 @@ StreamSchema lookup_schema(const std::string& source,
     return StreamSchema{it_table->second.name, it_table->second.columns};
   }
 
-  throw std::runtime_error("unknown source: " + source);
+  // Precondition: analyzer::analyze_select rejects unknown sources before
+  // lookup_schema runs.
+  __builtin_unreachable();
 }
 
 // Build a Scope from a CatalogSnapshot for a given source table.
@@ -159,26 +164,20 @@ CompilationResult compile_stream_cross_select(
         {compiler::expand_aliases(item.expr, alias_map, excl), item.alias});
   }
 
+  // Preconditions enforced by analyzer::analyze_select before compilation:
+  //   * no aggregate in WHERE (raw or via SELECT-list alias expansion),
+  //   * ORDER BY accompanied by LIMIT,
+  //   * GROUP BY not combined with multiple FROM sources,
+  //   * ORDER BY column resolves into the SELECT list.
+
   std::optional<parser::ast::Expr> expanded_where;
   if (stmt.where_clause.has_value()) {
     expanded_where = compiler::expand_aliases(*stmt.where_clause, alias_map);
-    if (compiler::expr_has_aggregate(*expanded_where)) {
-      return make_error(
-          "aggregate function not allowed in WHERE clause; use HAVING");
-    }
   }
 
   if (expanded_where.has_value()) {
     current = compiler::compile_where(*expanded_where, current, scope, builder,
                                       &source_ports);
-  }
-
-  if (!stmt.order_by.empty() && !stmt.limit.has_value()) {
-    return make_error("ORDER BY requires LIMIT in streaming context");
-  }
-
-  if (!stmt.group_by.empty()) {
-    return make_error("GROUP BY with multiple FROM sources is not yet supported");
   }
 
   auto [ep, field_map, _seg] = compiler::compile_select_projection(
@@ -194,9 +193,7 @@ CompilationResult compile_stream_cross_select(
         score_index = it->second;
       }
     }
-    if (score_index < 0) {
-      return make_error("ORDER BY column not found in SELECT list");
-    }
+    if (score_index < 0) __builtin_unreachable();
     auto topk_id = builder.next_id("topk");
     builder.add_operator(topk_id, "TopK",
                          {{"k", static_cast<double>(*stmt.limit)},
@@ -261,14 +258,12 @@ CompilationResult compile_select_to_program(
         {compiler::expand_aliases(item.expr, alias_map, excl), item.alias});
   }
 
-  // Expand WHERE; reject aggregate aliases (those belong in HAVING)
+  // Expand WHERE. The analyzer rejects aggregates in WHERE — both raw and
+  // those reachable through SELECT-list alias expansion — before
+  // compilation runs.
   std::optional<parser::ast::Expr> expanded_where;
   if (stmt.where_clause.has_value()) {
     expanded_where = compiler::expand_aliases(*stmt.where_clause, alias_map);
-    if (compiler::expr_has_aggregate(*expanded_where)) {
-      return make_error(
-          "aggregate function not allowed in WHERE clause; use HAVING");
-    }
   }
 
   // Expand HAVING
@@ -296,10 +291,7 @@ CompilationResult compile_select_to_program(
     current = compiler::compile_where(*expanded_where, current, scope, builder);
   }
 
-  // Validate ORDER BY + LIMIT early
-  if (!stmt.order_by.empty() && !stmt.limit.has_value()) {
-    return make_error("ORDER BY requires LIMIT in streaming context");
-  }
+  // ORDER BY without LIMIT is rejected by analyzer::analyze_select.
 
   // Compute input column count for composite GROUP BY support
   int num_input_cols = 0;
@@ -366,9 +358,9 @@ CompilationResult compile_select_to_program(
         score_index = it->second;
       }
     }
-    if (score_index < 0) {
-      return make_error("ORDER BY column not found in SELECT list");
-    }
+    // analyzer::analyze_select rejects ORDER BY columns absent from the
+    // SELECT list; score_index is guaranteed >= 0 here.
+    if (score_index < 0) __builtin_unreachable();
     auto topk_id = builder.next_id("topk");
     builder.add_operator(topk_id, "TopK",
                          {{"k", static_cast<double>(*stmt.limit)},
@@ -458,12 +450,10 @@ CompilationResult handle_create_table(const parser::ast::CreateStreamStmt& stmt)
       key_cols.push_back(static_cast<int>(i));
     }
   }
-  if (key_cols.empty()) {
-    return make_error("CREATE TABLE requires a PRIMARY KEY column");
-  }
-  if (key_cols.size() > 1) {
-    return make_error("Composite table keys are not yet supported");
-  }
+  // Single-PRIMARY-KEY shape enforced by analyzer::analyze_create_stream.
+  // The dispatch in compile_sql only routes here when key_cols is non-empty,
+  // and composite keys are rejected upstream.
+  if (key_cols.empty() || key_cols.size() > 1) __builtin_unreachable();
 
   TableSchema schema;
   schema.name = stmt.name;
@@ -491,44 +481,28 @@ CompilationResult handle_insert(const parser::ast::InsertStmt& stmt,
   result.statement_type = StatementType::INSERT;
   result.entity_name = stmt.table_name;
 
-  // Look up columns from streams or tables.
+  // Preconditions enforced by analyzer::analyze_insert: the table exists,
+  // value count matches column count, each value is a constant of the
+  // matching type.
   std::vector<ColumnDef> columns;
   auto it_stream = catalog.streams.find(stmt.table_name);
   if (it_stream != catalog.streams.end()) {
     columns = it_stream->second.columns;
   } else {
     auto it_table = catalog.tables.find(stmt.table_name);
-    if (it_table != catalog.tables.end()) {
-      columns = it_table->second.columns;
-    } else {
-      return make_error("INSERT: unknown stream or table: " +
-                        stmt.table_name);
-    }
+    if (it_table == catalog.tables.end()) __builtin_unreachable();
+    columns = it_table->second.columns;
   }
 
-  // Check value count matches column count.
-  if (stmt.values.size() != columns.size()) {
-    return make_error(
-        "INSERT: value count mismatch (" + std::to_string(stmt.values.size()) +
-        " values for " +
-        std::to_string(columns.size()) + " columns)");
-  }
+  if (stmt.values.size() != columns.size()) __builtin_unreachable();
 
   for (size_t i = 0; i < stmt.values.size(); ++i) {
     const auto& col = columns[i];
 
     if (auto* c = std::get_if<parser::ast::Constant>(&stmt.values[i])) {
-      if (col.type == ColumnType::TEXT) {
-        return make_error("INSERT: column '" + col.name +
-                          "' is TEXT but got a numeric value");
-      }
       result.insert_payload.push_back(c->value);
     } else if (auto* sc =
                    std::get_if<parser::ast::StringConstant>(&stmt.values[i])) {
-      if (col.type != ColumnType::TEXT) {
-        return make_error("INSERT: column '" + col.name +
-                          "' is DOUBLE but got a string value");
-      }
       // Encode string via dictionary.
       const std::string dict_key =
           stmt.table_name + "." + col.name;
@@ -538,7 +512,7 @@ CompilationResult handle_insert(const parser::ast::InsertStmt& stmt,
       // Record the dictionary update.
       result.dictionary_updates[dict_key] = dict.all_entries();
     } else {
-      return make_error("INSERT values must be constants");
+      __builtin_unreachable();
     }
   }
   return result;
@@ -551,33 +525,24 @@ CompilationResult handle_delete(const parser::ast::DeleteStmt& stmt,
   result.statement_type = StatementType::DELETE;
   result.entity_name = stmt.table_name;
 
+  // Preconditions enforced by analyzer::analyze_delete: table exists, has
+  // a primary key, WHERE is a `key_column = constant` comparison.
   auto it = catalog.tables.find(stmt.table_name);
-  if (it == catalog.tables.end()) {
-    return make_error("DELETE: unknown table: " + stmt.table_name);
-  }
+  if (it == catalog.tables.end()) __builtin_unreachable();
   const auto& table = it->second;
-  if (table.key_columns.empty()) {
-    return make_error("DELETE: table has no primary key: " + stmt.table_name);
-  }
-
-  if (!stmt.where_clause.has_value()) {
-    return make_error("DELETE requires WHERE key_column = value");
-  }
+  if (table.key_columns.empty()) __builtin_unreachable();
+  if (!stmt.where_clause.has_value()) __builtin_unreachable();
 
   const auto* cmp =
       std::get_if<std::unique_ptr<parser::ast::ComparisonExpr>>(&*stmt.where_clause);
-  if (!cmp || (*cmp)->op != "=") {
-    return make_error("DELETE WHERE must be key_column = constant");
-  }
+  if (!cmp || (*cmp)->op != "=") __builtin_unreachable();
 
   const auto* key_const = std::get_if<parser::ast::Constant>(&(*cmp)->right);
   if (!key_const) {
-    // Try left side (constant = col)
+    // analyzer accepts both `col = const` and `const = col` shapes.
     key_const = std::get_if<parser::ast::Constant>(&(*cmp)->left);
   }
-  if (!key_const) {
-    return make_error("DELETE WHERE value must be a constant");
-  }
+  if (!key_const) __builtin_unreachable();
 
   // Payload: [key, NaN] — NaN signals deletion to KeyedVariable
   result.delete_payload = {key_const->value,
@@ -682,16 +647,15 @@ CompilationResult compile_table_join(
     const parser::ast::SelectStmt& stmt,
     const parser::ast::JoinClause& join,
     const CatalogSnapshot& catalog) {
-  // Look up left stream
+  // Preconditions enforced by analyzer::analyze_select: the left stream
+  // exists in the catalog (covered by source-existence check) and the
+  // JOIN target is a TABLE.
   auto it_left = catalog.streams.find(stmt.from_table);
-  if (it_left == catalog.streams.end()) {
-    return make_error("JOIN: unknown left stream: " + stmt.from_table);
-  }
+  if (it_left == catalog.streams.end()) __builtin_unreachable();
   const StreamSchema& left_schema = it_left->second;
 
-  // Look up right table (verify existence)
   if (catalog.tables.find(join.table_name) == catalog.tables.end()) {
-    return make_error("JOIN: unknown table: " + join.table_name);
+    __builtin_unreachable();
   }
 
   // Resolve join column index from ON condition (left side)
@@ -716,11 +680,9 @@ CompilationResult compile_table_join(
       if (join_col_idx == -1) join_col_idx = try_left_col((*cmp)->right);
     }
   }
-  if (join_col_idx == -1) {
-    return make_error(
-        "JOIN: could not resolve join column from ON condition for table: " +
-        join.table_name);
-  }
+  // Precondition: analyzer::analyze_select rejects ON conditions that
+  // don't resolve a join column from the left stream.
+  if (join_col_idx == -1) __builtin_unreachable();
 
   // Build graph
   compiler::GraphBuilder builder;
@@ -807,18 +769,15 @@ CompilationResult compile_joined_select(const parser::ast::SelectStmt& stmt,
 
   const auto& join = stmt.join_clauses[0];
 
+  // Preconditions enforced by analyzer::analyze_select: the JOIN target
+  // resolves to a TABLE entity. Stream/View targets and unknown names are
+  // rejected before this dispatch runs.
   auto cat = snapshot_to_catalog(catalog);
   auto entity_type = cat.resolve_entity(join.table_name);
-
-  if (!entity_type.has_value()) {
-    return make_error("JOIN: unknown join target: " + join.table_name);
+  if (!entity_type.has_value() || *entity_type != EntityType::TABLE) {
+    __builtin_unreachable();
   }
-  if (*entity_type == EntityType::TABLE) {
-    return compile_table_join(stmt, join, catalog);
-  }
-
-  return make_error("JOIN: unsupported join target type for: " + join.table_name +
-                    " (only TABLE joins are supported)");
+  return compile_table_join(stmt, join, catalog);
 }
 
 // Handle CREATE MATERIALIZED VIEW.
@@ -853,11 +812,9 @@ CompilationResult handle_create_mat_view(
 CompilationResult handle_select_from_view(const parser::ast::SelectStmt& stmt,
                                           const ViewMeta& view_meta,
                                           const CatalogSnapshot& catalog) {
-  // SELECT FROM VIEW always requires LIMIT (no unbounded ephemeral replays).
-  if (!stmt.limit.has_value()) {
-    return make_error("SELECT FROM VIEW '" + stmt.from_table +
-                      "' requires LIMIT or WHERE time bounds");
-  }
+  // SELECT FROM VIEW always requires LIMIT (no unbounded ephemeral
+  // replays). Enforced by analyzer::analyze_select before compilation.
+  if (!stmt.limit.has_value()) __builtin_unreachable();
 
   // Load the VIEW's stored graph, dropping the Output connection.
   auto [builder, pre_output_ep] =
@@ -913,30 +870,10 @@ CompilationResult handle_select_from_view(const parser::ast::SelectStmt& stmt,
   return result;
 }
 
-// Handle DROP with dependency checking.
+// Handle DROP. Dependency check (entity not referenced by any view) is
+// enforced by analyzer::analyze_drop before compilation.
 CompilationResult handle_drop(const parser::ast::DropStmt& stmt,
-                              const CatalogSnapshot& catalog) {
-  // Check whether any registered view depends on the entity being dropped.
-  std::vector<std::string> dependents;
-  for (const auto& [view_name, view_meta] : catalog.views) {
-    if (view_name == stmt.name) continue;
-    for (const auto& src : view_meta.source_streams) {
-      if (src == stmt.name) {
-        dependents.push_back(view_name);
-        break;
-      }
-    }
-  }
-  if (!dependents.empty()) {
-    std::string dep_list;
-    for (size_t i = 0; i < dependents.size(); ++i) {
-      if (i > 0) dep_list += ", ";
-      dep_list += dependents[i];
-    }
-    return make_error("Cannot drop '" + stmt.name +
-                      "': referenced by: " + dep_list);
-  }
-
+                              const CatalogSnapshot& /*catalog*/) {
   CompilationResult result{};
   result.statement_type = StatementType::DROP;
   result.drop_entity_name = stmt.name;
@@ -966,7 +903,8 @@ CompilationResult compile_sql(const std::string& sql,
   if (!parse_result.ok()) {
     CompilationResult r{};
     for (const auto& err : parse_result.errors) {
-      r.errors.push_back({err, -1, -1});
+      r.errors.push_back({err.message, err.loc.line, err.loc.column,
+                          err.loc.end_line, err.loc.end_column});
     }
     parser::free_result(parse_result);
     return r;
@@ -975,9 +913,17 @@ CompilationResult compile_sql(const std::string& sql,
   // Step 2: Get JSON parse tree and convert to AST
   auto json_result = pg_query_parse(normalized.c_str());
   if (json_result.error) {
-    auto r = make_error(json_result.error->message
+    auto src = parser::make_source_text(normalized);
+    // cursorpos is 1-based (PostgreSQL convention); compute_location
+    // expects 0-based byte offsets — convert here.
+    int cursorpos = json_result.error->cursorpos;
+    int byte_offset = cursorpos > 0 ? cursorpos - 1 : -1;
+    auto loc = parser::compute_location(src, byte_offset);
+    CompilationResult r{};
+    r.errors.push_back({json_result.error->message
                             ? json_result.error->message
-                            : "parse error");
+                            : "parse error",
+                        loc.line, loc.column, loc.end_line, loc.end_column});
     pg_query_free_parse_result(json_result);
     parser::free_result(parse_result);
     return r;
@@ -985,7 +931,15 @@ CompilationResult compile_sql(const std::string& sql,
 
   parser::ast::Statement stmt;
   try {
-    stmt = parser::convert_parse_tree(json_result.parse_tree);
+    stmt = parser::convert_parse_tree(normalized, json_result.parse_tree);
+  } catch (const parser::ConverterError& e) {
+    // Converter throws carry a SourceLocation — propagate the full span.
+    pg_query_free_parse_result(json_result);
+    parser::free_result(parse_result);
+    CompilationResult r{};
+    r.errors.push_back({e.what(), e.loc().line, e.loc().column,
+                        e.loc().end_line, e.loc().end_column});
+    return r;
   } catch (const std::exception& e) {
     pg_query_free_parse_result(json_result);
     parser::free_result(parse_result);
@@ -994,6 +948,22 @@ CompilationResult compile_sql(const std::string& sql,
 
   pg_query_free_parse_result(json_result);
   parser::free_result(parse_result);
+
+  // Step 2.5: Semantic analysis. Returns diagnostics with source locations.
+  // If the analyzer reports errors, surface them and short-circuit before
+  // compilation runs. As Phase C migrations land, more checks fire here
+  // (with locations) instead of throwing during compilation.
+  {
+    auto diags = analyzer::analyze_statement(stmt, catalog, normalized);
+    if (!diags.empty()) {
+      CompilationResult r{};
+      for (const auto& d : diags) {
+        r.errors.push_back({d.message, d.loc.line, d.loc.column,
+                            d.loc.end_line, d.loc.end_column});
+      }
+      return r;
+    }
+  }
 
   // Step 3: Dispatch on statement type
   try {
@@ -1021,7 +991,10 @@ CompilationResult compile_sql(const std::string& sql,
     if (auto* s = std::get_if<parser::ast::DeleteStmt>(&stmt)) {
       return handle_delete(*s, catalog);
     }
-    return make_error("unsupported statement type");
+    // Statement is a closed std::variant — every alternative is handled
+    // above. Reaching this point would mean a new variant was added
+    // without a matching dispatch arm.
+    __builtin_unreachable();
   } catch (const std::exception& e) {
     return make_error(e.what());
   }
@@ -1401,7 +1374,7 @@ Tier2FilterResult apply_tier2_filter(
 
   parser::ast::Statement stmt;
   try {
-    stmt = parser::convert_parse_tree(json_result.parse_tree);
+    stmt = parser::convert_parse_tree(normalized, json_result.parse_tree);
   } catch (...) {
     pg_query_free_parse_result(json_result);
     out.rows = input_rows;

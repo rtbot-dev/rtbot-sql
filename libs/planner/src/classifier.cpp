@@ -159,9 +159,9 @@ SelectTier classify_select(const parser::ast::SelectStmt& stmt,
   }
 
   auto entity_type = catalog.resolve_entity(stmt.from_table);
-  if (!entity_type.has_value()) {
-    throw std::runtime_error("unknown source: " + stmt.from_table);
-  }
+  // Precondition: analyzer::analyze_select rejects unknown sources before
+  // classify_select runs.
+  if (!entity_type.has_value()) __builtin_unreachable();
 
   auto type = *entity_type;
 
@@ -182,10 +182,10 @@ SelectTier classify_select(const parser::ast::SelectStmt& stmt,
         has_group_by(stmt) || !stmt.order_by.empty()) {
       return SelectTier::TIER3_EPHEMERAL;
     }
-    if (!stmt.limit.has_value()) {
-      throw std::runtime_error("stream '" + stmt.from_table +
-                               "' requires LIMIT or WHERE time bounds");
-    }
+    // Precondition: analyzer::analyze_select rejects unbounded stream
+    // SELECTs (no LIMIT, no aggregates/windowed/GROUP BY/ORDER BY) before
+    // classify_select runs.
+    if (!stmt.limit.has_value()) __builtin_unreachable();
   }
 
   // MATERIALIZED_VIEW or STREAM from here on

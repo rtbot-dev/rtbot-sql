@@ -76,8 +76,13 @@ struct CatalogSnapshot {
 
 struct CompilationError {
   std::string message;
-  int line;    // -1 if not applicable
-  int column;  // -1 if not applicable
+  int line = -1;    // 1-based; -1 if not applicable
+  int column = -1;  // 1-based; -1 if not applicable
+  // End position is exclusive — points one character past the last
+  // character of the offending token. Editors render this as a
+  // selection from (line, column) to (end_line, end_column).
+  int end_line = -1;
+  int end_column = -1;
 };
 
 struct CompilationResult {
