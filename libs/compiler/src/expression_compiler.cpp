@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "rtbot_sql/api/unreachable.h"
 #include "rtbot_sql/compiler/expr_cache.h"
 #include "rtbot_sql/compiler/function_compiler.h"
 #include "rtbot_sql/compiler/where_compiler.h"
@@ -291,7 +292,7 @@ ExprResult compile_expression(const parser::ast::Expr& expr,
       auto exp_result = compile_expression(func.args[1], input_endpoint, scope,
                                             builder, cache, source_endpoints);
       auto* exp_const = std::get_if<ConstantMarker>(&exp_result);
-      if (!exp_const) __builtin_unreachable();
+      if (!exp_const) unreachable();
 
       // If base is also constant, fold
       if (auto* base_const = std::get_if<ConstantMarker>(&base)) {
@@ -315,7 +316,7 @@ ExprResult compile_expression(const parser::ast::Expr& expr,
           compile_expression(func.args[1], input_endpoint, scope, builder,
                              cache, source_endpoints);
       auto* shift_const = std::get_if<ConstantMarker>(&shift_result);
-      if (!shift_const) __builtin_unreachable();
+      if (!shift_const) unreachable();
 
       auto signal_ep =
           ensure_endpoint_local(std::move(signal), input_endpoint, builder);
@@ -338,7 +339,7 @@ ExprResult compile_expression(const parser::ast::Expr& expr,
           compile_expression(func.args[1], input_endpoint, scope, builder,
                              cache, source_endpoints);
       auto* interval_const = std::get_if<ConstantMarker>(&interval_result);
-      if (!interval_const) __builtin_unreachable();
+      if (!interval_const) unreachable();
 
       // Optional 3rd arg: snap_first flag (default 0)
       double snap_first_val = 0.0;
@@ -347,7 +348,7 @@ ExprResult compile_expression(const parser::ast::Expr& expr,
             compile_expression(func.args[2], input_endpoint, scope, builder,
                                cache, source_endpoints);
         auto* snap_const = std::get_if<ConstantMarker>(&snap_result);
-        if (!snap_const) __builtin_unreachable();
+        if (!snap_const) unreachable();
         snap_first_val = snap_const->value;
       }
 
@@ -379,7 +380,7 @@ ExprResult compile_expression(const parser::ast::Expr& expr,
       // Precondition: analyzer rejects unknown function names before
       // compilation. Direct callers of compile_expression() must
       // guarantee `func.name` is recognized.
-      __builtin_unreachable();
+      unreachable();
     }
 
     auto arg = compile_expression(func.args[0], input_endpoint, scope, builder,

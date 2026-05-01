@@ -1,6 +1,10 @@
 cc_library(
     name = "api",
-    hdrs = glob(["include/rtbot_sql/api/types.h", "include/rtbot_sql/version.h"]),
+    hdrs = glob([
+        "include/rtbot_sql/api/types.h",
+        "include/rtbot_sql/api/unreachable.h",
+        "include/rtbot_sql/version.h",
+    ]),
     strip_include_prefix = "include",
     visibility = ["//visibility:public"],
 )

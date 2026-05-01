@@ -4,6 +4,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "rtbot_sql/api/unreachable.h"
 #include "rtbot_sql/planner/classifier.h"
 
 namespace rtbot_sql::planner {
@@ -32,7 +33,7 @@ StreamSchema resolve_schema(const std::string& source,
 
   // Precondition: analyzer::analyze_select rejects unknown sources before
   // the planner runs.
-  __builtin_unreachable();
+  unreachable();
 }
 
 // Default alias for an expression.
@@ -65,7 +66,7 @@ SelectPlan plan_select(const parser::ast::SelectStmt& stmt,
             // Precondition: analyzer::analyze_select rejects unknown columns
             // before plan_select runs.
             auto idx = schema.column_index(col->column_name);
-            if (!idx.has_value()) __builtin_unreachable();
+            if (!idx.has_value()) unreachable();
             std::string alias = stmt.select_list[i].alias.value_or(
                 col->column_name);
             plan.field_map[alias] = *idx;
@@ -157,7 +158,7 @@ SelectPlan plan_select(const parser::ast::SelectStmt& stmt,
             // reference" check is cross-key-aggregation specific and
             // remains a compile-time check (analyzer doesn't know whether
             // the source is a keyed view).
-            if (func.args.size() != 1) __builtin_unreachable();
+            if (func.args.size() != 1) unreachable();
             auto* col_ref =
                 std::get_if<parser::ast::ColumnRef>(&func.args[0]);
             if (!col_ref) {
@@ -165,7 +166,7 @@ SelectPlan plan_select(const parser::ast::SelectStmt& stmt,
                   upper + ": argument must be a column reference");
             }
             auto idx = schema.column_index(col_ref->column_name);
-            if (!idx.has_value()) __builtin_unreachable();
+            if (!idx.has_value()) unreachable();
             agg.col_index = *idx;
           }
 

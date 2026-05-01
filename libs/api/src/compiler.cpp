@@ -14,6 +14,7 @@
 #include "rtbot_sql/analyzer/diagnostic.h"
 #include "rtbot_sql/analyzer/scope.h"
 #include "rtbot_sql/api/preprocessor.h"
+#include "rtbot_sql/api/unreachable.h"
 #include "rtbot_sql/catalog/catalog.h"
 #include "rtbot_sql/catalog/string_dictionary.h"
 #include "rtbot_sql/compiler/alias_expander.h"
@@ -97,7 +98,7 @@ StreamSchema lookup_schema(const std::string& source,
 
   // Precondition: analyzer::analyze_select rejects unknown sources before
   // lookup_schema runs.
-  __builtin_unreachable();
+  unreachable();
 }
 
 // Build a Scope from a CatalogSnapshot for a given source table.
@@ -193,7 +194,7 @@ CompilationResult compile_stream_cross_select(
         score_index = it->second;
       }
     }
-    if (score_index < 0) __builtin_unreachable();
+    if (score_index < 0) unreachable();
     auto topk_id = builder.next_id("topk");
     builder.add_operator(topk_id, "TopK",
                          {{"k", static_cast<double>(*stmt.limit)},
@@ -360,7 +361,7 @@ CompilationResult compile_select_to_program(
     }
     // analyzer::analyze_select rejects ORDER BY columns absent from the
     // SELECT list; score_index is guaranteed >= 0 here.
-    if (score_index < 0) __builtin_unreachable();
+    if (score_index < 0) unreachable();
     auto topk_id = builder.next_id("topk");
     builder.add_operator(topk_id, "TopK",
                          {{"k", static_cast<double>(*stmt.limit)},
@@ -453,7 +454,7 @@ CompilationResult handle_create_table(const parser::ast::CreateStreamStmt& stmt)
   // Single-PRIMARY-KEY shape enforced by analyzer::analyze_create_stream.
   // The dispatch in compile_sql only routes here when key_cols is non-empty,
   // and composite keys are rejected upstream.
-  if (key_cols.empty() || key_cols.size() > 1) __builtin_unreachable();
+  if (key_cols.empty() || key_cols.size() > 1) unreachable();
 
   TableSchema schema;
   schema.name = stmt.name;
@@ -490,11 +491,11 @@ CompilationResult handle_insert(const parser::ast::InsertStmt& stmt,
     columns = it_stream->second.columns;
   } else {
     auto it_table = catalog.tables.find(stmt.table_name);
-    if (it_table == catalog.tables.end()) __builtin_unreachable();
+    if (it_table == catalog.tables.end()) unreachable();
     columns = it_table->second.columns;
   }
 
-  if (stmt.values.size() != columns.size()) __builtin_unreachable();
+  if (stmt.values.size() != columns.size()) unreachable();
 
   for (size_t i = 0; i < stmt.values.size(); ++i) {
     const auto& col = columns[i];
@@ -512,7 +513,7 @@ CompilationResult handle_insert(const parser::ast::InsertStmt& stmt,
       // Record the dictionary update.
       result.dictionary_updates[dict_key] = dict.all_entries();
     } else {
-      __builtin_unreachable();
+      unreachable();
     }
   }
   return result;
@@ -528,21 +529,21 @@ CompilationResult handle_delete(const parser::ast::DeleteStmt& stmt,
   // Preconditions enforced by analyzer::analyze_delete: table exists, has
   // a primary key, WHERE is a `key_column = constant` comparison.
   auto it = catalog.tables.find(stmt.table_name);
-  if (it == catalog.tables.end()) __builtin_unreachable();
+  if (it == catalog.tables.end()) unreachable();
   const auto& table = it->second;
-  if (table.key_columns.empty()) __builtin_unreachable();
-  if (!stmt.where_clause.has_value()) __builtin_unreachable();
+  if (table.key_columns.empty()) unreachable();
+  if (!stmt.where_clause.has_value()) unreachable();
 
   const auto* cmp =
       std::get_if<std::unique_ptr<parser::ast::ComparisonExpr>>(&*stmt.where_clause);
-  if (!cmp || (*cmp)->op != "=") __builtin_unreachable();
+  if (!cmp || (*cmp)->op != "=") unreachable();
 
   const auto* key_const = std::get_if<parser::ast::Constant>(&(*cmp)->right);
   if (!key_const) {
     // analyzer accepts both `col = const` and `const = col` shapes.
     key_const = std::get_if<parser::ast::Constant>(&(*cmp)->left);
   }
-  if (!key_const) __builtin_unreachable();
+  if (!key_const) unreachable();
 
   // Payload: [key, NaN] — NaN signals deletion to KeyedVariable
   result.delete_payload = {key_const->value,
@@ -651,11 +652,11 @@ CompilationResult compile_table_join(
   // exists in the catalog (covered by source-existence check) and the
   // JOIN target is a TABLE.
   auto it_left = catalog.streams.find(stmt.from_table);
-  if (it_left == catalog.streams.end()) __builtin_unreachable();
+  if (it_left == catalog.streams.end()) unreachable();
   const StreamSchema& left_schema = it_left->second;
 
   if (catalog.tables.find(join.table_name) == catalog.tables.end()) {
-    __builtin_unreachable();
+    unreachable();
   }
 
   // Resolve join column index from ON condition (left side)
@@ -682,7 +683,7 @@ CompilationResult compile_table_join(
   }
   // Precondition: analyzer::analyze_select rejects ON conditions that
   // don't resolve a join column from the left stream.
-  if (join_col_idx == -1) __builtin_unreachable();
+  if (join_col_idx == -1) unreachable();
 
   // Build graph
   compiler::GraphBuilder builder;
@@ -775,7 +776,7 @@ CompilationResult compile_joined_select(const parser::ast::SelectStmt& stmt,
   auto cat = snapshot_to_catalog(catalog);
   auto entity_type = cat.resolve_entity(join.table_name);
   if (!entity_type.has_value() || *entity_type != EntityType::TABLE) {
-    __builtin_unreachable();
+    unreachable();
   }
   return compile_table_join(stmt, join, catalog);
 }
@@ -814,7 +815,7 @@ CompilationResult handle_select_from_view(const parser::ast::SelectStmt& stmt,
                                           const CatalogSnapshot& catalog) {
   // SELECT FROM VIEW always requires LIMIT (no unbounded ephemeral
   // replays). Enforced by analyzer::analyze_select before compilation.
-  if (!stmt.limit.has_value()) __builtin_unreachable();
+  if (!stmt.limit.has_value()) unreachable();
 
   // Load the VIEW's stored graph, dropping the Output connection.
   auto [builder, pre_output_ep] =
@@ -994,7 +995,7 @@ CompilationResult compile_sql(const std::string& sql,
     // Statement is a closed std::variant — every alternative is handled
     // above. Reaching this point would mean a new variant was added
     // without a matching dispatch arm.
-    __builtin_unreachable();
+    unreachable();
   } catch (const std::exception& e) {
     return make_error(e.what());
   }

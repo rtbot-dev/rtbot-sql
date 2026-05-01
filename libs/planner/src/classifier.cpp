@@ -4,6 +4,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "rtbot_sql/api/unreachable.h"
 #include "rtbot_sql/compiler/function_compiler.h"
 
 namespace rtbot_sql::planner {
@@ -161,7 +162,7 @@ SelectTier classify_select(const parser::ast::SelectStmt& stmt,
   auto entity_type = catalog.resolve_entity(stmt.from_table);
   // Precondition: analyzer::analyze_select rejects unknown sources before
   // classify_select runs.
-  if (!entity_type.has_value()) __builtin_unreachable();
+  if (!entity_type.has_value()) unreachable();
 
   auto type = *entity_type;
 
@@ -185,7 +186,7 @@ SelectTier classify_select(const parser::ast::SelectStmt& stmt,
     // Precondition: analyzer::analyze_select rejects unbounded stream
     // SELECTs (no LIMIT, no aggregates/windowed/GROUP BY/ORDER BY) before
     // classify_select runs.
-    if (!stmt.limit.has_value()) __builtin_unreachable();
+    if (!stmt.limit.has_value()) unreachable();
   }
 
   // MATERIALIZED_VIEW or STREAM from here on

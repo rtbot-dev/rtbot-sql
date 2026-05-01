@@ -6,6 +6,8 @@
 #include <stdexcept>
 #include <string>
 
+#include "rtbot_sql/api/unreachable.h"
+
 namespace rtbot_sql::planner {
 
 namespace {
@@ -15,7 +17,7 @@ int resolve_column_index(const parser::ast::ColumnRef& ref,
   // Precondition: analyzer::analyze_select rejects unknown columns before
   // the Tier 2 evaluator compiles its predicates.
   auto idx = schema.column_index(ref.column_name);
-  if (!idx.has_value()) __builtin_unreachable();
+  if (!idx.has_value()) unreachable();
   return *idx;
 }
 
@@ -109,7 +111,7 @@ std::unique_ptr<CompiledExpr> compile_for_eval(
     }
     // Precondition: analyzer::validate_function_call rejects bad arity for
     // unary math functions before the Tier 2 evaluator runs.
-    if (func.args.size() != 1) __builtin_unreachable();
+    if (func.args.size() != 1) unreachable();
     return std::make_unique<UnaryFuncExpr>(std::move(math_fn),
                                            compile_for_eval(func.args[0], schema));
   }

@@ -5,6 +5,7 @@
 #include <string>
 
 #include "rtbot_sql/analyzer/const_fold.h"
+#include "rtbot_sql/api/unreachable.h"
 #include "rtbot_sql/compiler/expr_cache.h"
 #include "rtbot_sql/compiler/expression_compiler.h"
 
@@ -48,7 +49,7 @@ int require_constant_int(const std::string& /*func_name*/,
                          const parser::ast::Expr& expr,
                          const std::string& /*param_name*/) {
   auto folded = analyzer::try_fold(expr);
-  if (!folded) __builtin_unreachable();
+  if (!folded) unreachable();
   return static_cast<int>(*folded);
 }
 
@@ -315,7 +316,7 @@ Endpoint compile_function(const std::string& name,
   // Precondition: analyzer::validate_function_call rejects unknown function
   // names before compilation. Direct callers of compile_function() must
   // guarantee `name` is recognized.
-  __builtin_unreachable();
+  unreachable();
 }
 
 }  // namespace rtbot_sql::compiler

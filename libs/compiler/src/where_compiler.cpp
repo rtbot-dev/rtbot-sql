@@ -4,6 +4,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "rtbot_sql/api/unreachable.h"
 #include "rtbot_sql/compiler/expression_compiler.h"
 
 namespace rtbot_sql::compiler {
@@ -170,7 +171,7 @@ Endpoint compile_predicate(const parser::ast::Expr& expr,
 
     // Precondition: analyzer::validate_predicate rejects NOT on
     // non-Comparison operands before compilation.
-    __builtin_unreachable();
+    unreachable();
   }
 
   // BetweenExpr → desugar to GTE(low) AND LTE(high)
