@@ -10,7 +10,7 @@ The key innovation is **tier-based execution**: simple reads bypass compilation 
 
 ## Build system
 
-Bazel with bzlmod (`MODULE.bazel`, version 0.3.0). C++17 with clang. Output goes to `dist/` (configured in `.bazelrc`).
+Bazel with bzlmod (`MODULE.bazel`, version 0.4.0). C++17 with clang. Output goes to `dist/` (configured in `.bazelrc`).
 
 ### Key dependencies
 
