@@ -33,3 +33,6 @@ examples/notebooks/.venv/
 
 # Jupyter checkpoints
 .ipynb_checkpoints/
+
+# Local Windows ARM64 build notes (host-specific)
+LOCAL_WIN.md
