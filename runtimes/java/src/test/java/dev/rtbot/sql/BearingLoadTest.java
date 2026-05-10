@@ -123,10 +123,10 @@ public class BearingLoadTest {
             AtomicLong kurtosisCount = new AtomicLong(0);
             AtomicLong rawCount = new AtomicLong(0);
 
-            runtime.subscribe("rms_trend", (name, ts2, vals) -> rmsCount.incrementAndGet());
-            runtime.subscribe("kurtosis_trend", (name, ts2, vals) -> kurtosisCount.incrementAndGet());
+            runtime.subscribe("rms_trend", OutputListener.ofArray((name, ts2, vals, n) -> rmsCount.incrementAndGet()));
+            runtime.subscribe("kurtosis_trend", OutputListener.ofArray((name, ts2, vals, n) -> kurtosisCount.incrementAndGet()));
             if (subscribeRaw) {
-                runtime.subscribe("vibration_raw", (name, ts2, vals) -> rawCount.incrementAndGet());
+                runtime.subscribe("vibration_raw", OutputListener.ofArray((name, ts2, vals, n) -> rawCount.incrementAndGet()));
             }
             if (profile) {
                 runtime.resetPerfStats();
