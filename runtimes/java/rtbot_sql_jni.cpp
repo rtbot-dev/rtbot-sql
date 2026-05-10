@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <iostream>
 #include <mutex>
 #include <string>
 #include <tuple>
@@ -14,6 +15,7 @@
 
 #include "rtbot/Message.h"
 #include "rtbot/Program.h"
+#include "rtbot/compiled/jit/JitCompiler.h"
 #include "rtbot_sql/api/batch_decoder.h"
 #include "rtbot_sql/api/compiler.h"
 #include "rtbot_sql/api/preprocessor.h"
@@ -538,8 +540,31 @@ JNIEXPORT jlong JNICALL
 Java_dev_rtbot_sql_RtBotSqlCompiler_createPipeline(JNIEnv* env, jclass,
                                                     jstring programJson) {
   try {
-    auto* program =
-        new rtbot::Program(jstring_to_std(env, programJson));
+    std::string program_json_str = jstring_to_std(env, programJson);
+    auto* program = new rtbot::Program(program_json_str);
+    std::string head = program_json_str.substr(0, std::min<size_t>(
+        program_json_str.size(), 120));
+    for (auto& c : head) {
+      if (c == '\n' || c == '\r') c = ' ';
+    }
+    std::cerr << "[jit-probe] createPipeline using_jit="
+              << (program->using_jit() ? 1 : 0)
+              << " bytes=" << program_json_str.size()
+              << " head='" << head << "'\n";
+    if (!program->using_jit()) {
+      try {
+        rtbot::jit::JitCompiler compiler;
+        auto probe = compiler.compile(program_json_str);
+        (void)probe;
+        std::cerr << "[jit-probe] direct compile() succeeded — "
+                     "Program::using_jit_ false for unknown reason\n";
+      } catch (const std::exception& e) {
+        std::cerr << "[jit-probe] direct compile() failed: "
+                  << e.what() << "\n";
+      } catch (...) {
+        std::cerr << "[jit-probe] direct compile() failed: unknown\n";
+      }
+    }
     return reinterpret_cast<jlong>(program);
   } catch (const std::exception& e) {
     throw_runtime_exception(
@@ -907,89 +932,171 @@ Java_dev_rtbot_sql_RtBotSqlCompiler_feedPipelineBufferSession(
     const jsize n = env->GetArrayLength(timestamps);
     const jsize num_cols = env->GetArrayLength(columns);
 
+    if (num_cols > 64) {
+      throw_runtime_exception(env,
+          "feedPipelineBufferSession: num_cols > 64");
+      return 0;
+    }
+
     std::vector<jdoubleArray> col_refs(num_cols);
-    std::vector<jdouble*> col_elems(num_cols);
     for (jsize c = 0; c < num_cols; ++c) {
       col_refs[c] = static_cast<jdoubleArray>(
           env->GetObjectArrayElement(columns, c));
       if (!col_refs[c] || env->GetArrayLength(col_refs[c]) != n) {
-        for (jsize j = 0; j < c; ++j) {
-          env->ReleaseDoubleArrayElements(col_refs[j], col_elems[j], JNI_ABORT);
-        }
         throw_runtime_exception(env,
             "feedPipelineBufferSession: column array null or length mismatch");
         return 0;
       }
-      col_elems[c] = env->GetDoubleArrayElements(col_refs[c], nullptr);
     }
 
-    jlong* ts_elems = env->GetLongArrayElements(timestamps, nullptr);
-
-    std::vector<double> rows(static_cast<std::size_t>(n) *
-                              static_cast<std::size_t>(num_cols));
-    for (jsize i = 0; i < n; ++i) {
-      for (jsize c = 0; c < num_cols; ++c) {
-        rows[static_cast<std::size_t>(i) * num_cols + c] =
-            static_cast<double>(col_elems[c][i]);
-      }
+    std::vector<jdouble*> col_elems(num_cols);
+    for (jsize c = 0; c < num_cols; ++c) {
+      col_elems[c] = static_cast<jdouble*>(
+          env->GetPrimitiveArrayCritical(col_refs[c], nullptr));
     }
+
+    jlong* ts_elems = static_cast<jlong*>(
+        env->GetPrimitiveArrayCritical(timestamps, nullptr));
 
     static_assert(sizeof(jlong) == sizeof(rtbot::timestamp_t),
                   "jlong vs timestamp_t mismatch");
     auto* times = reinterpret_cast<const rtbot::timestamp_t*>(ts_elems);
 
-    auto batch = program->receive_buffer(port_str, rows.data(),
-                                          static_cast<std::size_t>(n),
-                                          static_cast<std::size_t>(num_cols),
-                                          times);
+    const bool was_jit = program->using_jit();
+    rtbot::ProgramMsgBatch interp_batch;
+    if (was_jit) {
+      if (num_cols > 1) {
+        double row[64];
+        const std::size_t lane_width = program->jit_program()
+            ? program->jit_program()->input_lane_width()
+            : static_cast<std::size_t>(num_cols);
+        for (jsize r = 0; r < n; ++r) {
+          for (jsize c = 0; c < num_cols; ++c) row[c] = col_elems[c][r];
+          program->send_vector(times[r], row, lane_width);
+        }
+      } else {
+        for (jsize r = 0; r < n; ++r) {
+          program->send(times[r], col_elems[0][r]);
+        }
+      }
+    } else {
+      std::vector<double> rows(static_cast<std::size_t>(n) *
+                                static_cast<std::size_t>(num_cols));
+      for (jsize i = 0; i < n; ++i) {
+        for (jsize c = 0; c < num_cols; ++c) {
+          rows[static_cast<std::size_t>(i) * num_cols + c] = col_elems[c][i];
+        }
+      }
+      interp_batch = program->receive_buffer(
+          port_str, rows.data(), static_cast<std::size_t>(n),
+          static_cast<std::size_t>(num_cols), times);
+    }
 
-    env->ReleaseLongArrayElements(timestamps, ts_elems, JNI_ABORT);
+    env->ReleasePrimitiveArrayCritical(timestamps, ts_elems, JNI_ABORT);
     for (jsize c = 0; c < num_cols; ++c) {
-      env->ReleaseDoubleArrayElements(col_refs[c], col_elems[c], JNI_ABORT);
+      env->ReleasePrimitiveArrayCritical(col_refs[c], col_elems[c], JNI_ABORT);
     }
 
-    // Decode via shared helper (iteration + stable sort by
-    // (timestamp, operator_id, port) shared across runtimes). Outputs
-    // from operators not present in the session's registered terminal
-    // table are discarded; in practice the consolidated compiler only
-    // exposes materialized-view terminals so every decoded message
-    // should resolve to a registered index.
-    auto decoded = api::decode_program_batch(batch);
+    // Single-pass speculative write into the direct buffer. Track overflow
+    // separately so the caller can grow and retry. On the JIT path we drain
+    // emit_buf_ destructively here; on overflow we already lost the data,
+    // so the caller's contract becomes "grow on first call" — the retry
+    // path re-drives the input rows into the JIT/interpreter via a second
+    // call. To preserve the original API (caller-grow-and-retry without
+    // re-supplying input), we use a non-destructive peek when overflow
+    // would occur, which means we walk twice in the rare overflow case
+    // and once in the steady state.
+    char* const buf_begin = static_cast<char*>(buf_addr);
+    char* const buf_end   = buf_begin + buf_capacity;
+    char* p = buf_begin;
 
-    size_t kept = 0;
-    size_t required = sizeof(int32_t);
-    for (const auto& m : decoded) {
-      if (session_map->id_to_idx.find(m.operator_id)
-              == session_map->id_to_idx.end()) continue;
-      required += sizeof(int32_t) + sizeof(int32_t) + sizeof(int64_t) +
-                  m.values.size() * sizeof(double);
-      kept++;
+    if (static_cast<jlong>(sizeof(int32_t)) > buf_capacity) {
+      // Buffer can't even hold the header. Switch to a destructive drain
+      // followed by a size estimate via the interpreter side; for JIT the
+      // best we can do without re-driving inputs is return a generous
+      // estimate.
+      if (was_jit) program->jit_program()->discard_emitted();
+      return -static_cast<jint>(sizeof(int32_t) * 2);
     }
-    if (static_cast<jlong>(required) > buf_capacity) {
-      return -static_cast<jint>(required);  // caller grows and retries
-    }
+    p += sizeof(int32_t);  // reserve count slot
 
-    char* p = static_cast<char*>(buf_addr);
-    auto write_bytes = [&p](const void* src, size_t sz) {
-      std::memcpy(p, src, sz);
-      p += sz;
-    };
-    const int32_t nout = static_cast<int32_t>(kept);
-    write_bytes(&nout, sizeof(int32_t));
-    for (const auto& m : decoded) {
-      auto it = session_map->id_to_idx.find(m.operator_id);
-      if (it == session_map->id_to_idx.end()) continue;
-      const int32_t opIdx = it->second;
-      const int32_t nvals = static_cast<int32_t>(m.values.size());
-      const int64_t ts = static_cast<int64_t>(m.timestamp);
-      write_bytes(&opIdx, sizeof(int32_t));
-      write_bytes(&nvals, sizeof(int32_t));
-      write_bytes(&ts, sizeof(int64_t));
+    int32_t kept = 0;
+    bool overflowed = false;
+    std::size_t overflow_required = sizeof(int32_t);
+
+    auto emit_rec = [&](int64_t ts, int32_t opIdx, const double* vals,
+                         std::size_t nvals) {
+      const std::size_t need = sizeof(int32_t) + sizeof(int32_t) +
+                                sizeof(int64_t) + nvals * sizeof(double);
+      if (overflowed || (p + need) > buf_end) {
+        if (!overflowed) {
+          overflow_required = static_cast<std::size_t>(p - buf_begin);
+          overflowed = true;
+        }
+        overflow_required += need;
+        return;
+      }
+      const int32_t nv32 = static_cast<int32_t>(nvals);
+      std::memcpy(p, &opIdx, sizeof(int32_t));     p += sizeof(int32_t);
+      std::memcpy(p, &nv32,  sizeof(int32_t));     p += sizeof(int32_t);
+      std::memcpy(p, &ts,    sizeof(int64_t));     p += sizeof(int64_t);
       if (nvals > 0) {
-        write_bytes(m.values.data(), nvals * sizeof(double));
+        std::memcpy(p, vals, nvals * sizeof(double));
+        p += nvals * sizeof(double);
+      }
+      ++kept;
+    };
+
+    if (was_jit) {
+      // Use a non-destructive peek so emit_buf_ survives an overflow and
+      // the caller's grow-and-retry can re-drain it. In the steady state
+      // (buffer large enough) this is a single walk of emit_buf_; on
+      // success we explicitly discard.
+      program->drain_records(
+          [&](std::int64_t time, const std::string& op_id,
+              const double* values, std::size_t n_values) {
+            auto it = session_map->id_to_idx.find(op_id);
+            if (it == session_map->id_to_idx.end()) return;
+            emit_rec(static_cast<int64_t>(time), it->second, values, n_values);
+          },
+          /*consume=*/false);
+    } else {
+      for (const auto& [op_id, op_batch] : interp_batch) {
+        auto it = session_map->id_to_idx.find(op_id);
+        if (it == session_map->id_to_idx.end()) continue;
+        const int32_t opIdx = it->second;
+        for (const auto& [port_name, messages] : op_batch) {
+          (void)port_name;
+          for (const auto& message : messages) {
+            if (auto* vm = dynamic_cast<const rtbot::Message<rtbot::VectorNumberData>*>(
+                    message.get())) {
+              const auto& vals = vm->data.values ? *vm->data.values
+                                                  : std::vector<double>{};
+              emit_rec(static_cast<int64_t>(vm->time), opIdx, vals.data(),
+                       vals.size());
+              continue;
+            }
+            if (auto* nm = dynamic_cast<const rtbot::Message<rtbot::NumberData>*>(
+                    message.get())) {
+              const double v = nm->data.value;
+              emit_rec(static_cast<int64_t>(nm->time), opIdx, &v, 1);
+            }
+          }
+        }
       }
     }
-    return static_cast<jint>(required);
+
+    if (overflowed) {
+      // emit_buf_ is intact (non-destructive peek); caller grows and retries.
+      return -static_cast<jint>(overflow_required);
+    }
+
+    if (was_jit) {
+      // Steady-state success: drop the now-serialized records.
+      program->jit_program()->discard_emitted();
+    }
+    std::memcpy(buf_begin, &kept, sizeof(int32_t));
+    return static_cast<jint>(p - buf_begin);
   } catch (const std::exception& e) {
     throw_runtime_exception(
         env, std::string("feedPipelineBufferSession: ") + e.what());
