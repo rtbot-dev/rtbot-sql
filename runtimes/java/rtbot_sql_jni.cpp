@@ -15,7 +15,16 @@
 
 #include "rtbot/Message.h"
 #include "rtbot/Program.h"
-#include "rtbot/compiled/jit/JitCompiler.h"
+
+// Feature-gate: this header (and the entire JIT API on Program) only exists
+// on rtbot RB-495+. On rtbot master we fall back to receive/receive_buffer.
+#if __has_include(<rtbot/compiled/jit/JitCompiledProgram.h>)
+#  define RTBOT_HAS_JIT_API 1
+#  include "rtbot/compiled/jit/JitCompiler.h"
+#else
+#  define RTBOT_HAS_JIT_API 0
+#endif
+
 #include "rtbot_sql/api/batch_decoder.h"
 #include "rtbot_sql/api/compiler.h"
 #include "rtbot_sql/api/preprocessor.h"
@@ -547,6 +556,7 @@ Java_dev_rtbot_sql_RtBotSqlCompiler_createPipeline(JNIEnv* env, jclass,
     for (auto& c : head) {
       if (c == '\n' || c == '\r') c = ' ';
     }
+#if RTBOT_HAS_JIT_API
     std::cerr << "[jit-probe] createPipeline using_jit="
               << (program->using_jit() ? 1 : 0)
               << " bytes=" << program_json_str.size()
@@ -565,6 +575,11 @@ Java_dev_rtbot_sql_RtBotSqlCompiler_createPipeline(JNIEnv* env, jclass,
         std::cerr << "[jit-probe] direct compile() failed: unknown\n";
       }
     }
+#else
+    std::cerr << "[jit-probe] createPipeline jit_api=absent"
+              << " bytes=" << program_json_str.size()
+              << " head='" << head << "'\n";
+#endif
     return reinterpret_cast<jlong>(program);
   } catch (const std::exception& e) {
     throw_runtime_exception(
@@ -962,9 +977,14 @@ Java_dev_rtbot_sql_RtBotSqlCompiler_feedPipelineBufferSession(
                   "jlong vs timestamp_t mismatch");
     auto* times = reinterpret_cast<const rtbot::timestamp_t*>(ts_elems);
 
+#if RTBOT_HAS_JIT_API
     const bool was_jit = program->using_jit();
+#else
+    constexpr bool was_jit = false;
+#endif
     rtbot::ProgramMsgBatch interp_batch;
     if (was_jit) {
+#if RTBOT_HAS_JIT_API
       if (num_cols > 1) {
         double row[64];
         const std::size_t lane_width = program->jit_program()
@@ -979,6 +999,7 @@ Java_dev_rtbot_sql_RtBotSqlCompiler_feedPipelineBufferSession(
           program->send(times[r], col_elems[0][r]);
         }
       }
+#endif
     } else {
       std::vector<double> rows(static_cast<std::size_t>(n) *
                                 static_cast<std::size_t>(num_cols));
@@ -1015,7 +1036,9 @@ Java_dev_rtbot_sql_RtBotSqlCompiler_feedPipelineBufferSession(
       // followed by a size estimate via the interpreter side; for JIT the
       // best we can do without re-driving inputs is return a generous
       // estimate.
+#if RTBOT_HAS_JIT_API
       if (was_jit) program->jit_program()->discard_emitted();
+#endif
       return -static_cast<jint>(sizeof(int32_t) * 2);
     }
     p += sizeof(int32_t);  // reserve count slot
@@ -1048,6 +1071,7 @@ Java_dev_rtbot_sql_RtBotSqlCompiler_feedPipelineBufferSession(
     };
 
     if (was_jit) {
+#if RTBOT_HAS_JIT_API
       // Use a non-destructive peek so emit_buf_ survives an overflow and
       // the caller's grow-and-retry can re-drain it. In the steady state
       // (buffer large enough) this is a single walk of emit_buf_; on
@@ -1060,6 +1084,7 @@ Java_dev_rtbot_sql_RtBotSqlCompiler_feedPipelineBufferSession(
             emit_rec(static_cast<int64_t>(time), it->second, values, n_values);
           },
           /*consume=*/false);
+#endif
     } else {
       for (const auto& [op_id, op_batch] : interp_batch) {
         auto it = session_map->id_to_idx.find(op_id);
@@ -1092,8 +1117,10 @@ Java_dev_rtbot_sql_RtBotSqlCompiler_feedPipelineBufferSession(
     }
 
     if (was_jit) {
+#if RTBOT_HAS_JIT_API
       // Steady-state success: drop the now-serialized records.
       program->jit_program()->discard_emitted();
+#endif
     }
     std::memcpy(buf_begin, &kept, sizeof(int32_t));
     return static_cast<jint>(p - buf_begin);
