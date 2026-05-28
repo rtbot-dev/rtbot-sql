@@ -3,8 +3,8 @@
 # Pin minor versions, allow patch updates (~=).
 # Install into a dedicated venv — see setup.sh.
 
-# Core RtBot SQL engine (installed from the local wheel by setup.sh)
-# rtbot-sql is installed separately — see setup.sh
+# Core RtBot SQL engine
+rtbot-sql~=0.4.1
 
 # Data handling
 pandas~=2.2
