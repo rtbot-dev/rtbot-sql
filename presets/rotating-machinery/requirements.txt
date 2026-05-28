@@ -25,6 +25,9 @@ asyncua~=1.1
 
 # Visualisation (matches existing examples/notebooks style)
 plotly~=5.22
+# Static PNG export so plotly figures render on GitHub
+# (pinned to 0.2.x — 1.x changed the API)
+kaleido==0.2.1
 
 # Jupyter environment
 jupyterlab~=4.2
