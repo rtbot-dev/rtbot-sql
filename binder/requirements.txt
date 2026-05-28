@@ -1,0 +1,16 @@
+# Binder build requirements for the rotating-machinery preset notebook
+# mybinder.org reads this file to build a JupyterLab environment.
+# Keep in sync with presets/rotating-machinery/requirements.txt.
+
+rtbot-sql~=0.4.1
+
+pandas~=2.2
+numpy~=1.26
+scipy~=1.13
+pooch~=1.8
+
+plotly~=5.22
+kaleido==0.2.1
+
+jupyterlab~=4.2
+ipykernel~=6.29
