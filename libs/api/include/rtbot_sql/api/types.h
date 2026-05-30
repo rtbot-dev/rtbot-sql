@@ -36,6 +36,7 @@ struct ColumnDef {
 struct StreamSchema {
   std::string name;
   std::vector<ColumnDef> columns;
+  std::optional<std::string> source;  // FROM "..." metadata from CREATE STREAM
 
   std::optional<int> column_index(const std::string& col_name) const {
     for (const auto& col : columns) {

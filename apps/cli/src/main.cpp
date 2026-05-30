@@ -99,6 +99,8 @@ json result_to_json(const CompilationResult& r) {
                         {"type", (col.type == ColumnType::TEXT) ? "TEXT" : "DOUBLE"}});
       }
       j["schema"] = cols;
+      if (r.stream_schema.source.has_value())
+        j["source"] = r.stream_schema.source.value();
       break;
     }
     case StatementType::CREATE_TABLE: {

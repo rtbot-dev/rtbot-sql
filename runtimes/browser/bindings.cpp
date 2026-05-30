@@ -223,6 +223,8 @@ json result_to_json(const CompilationResult& r) {
                     {"type", (c.type == ColumnType::TEXT) ? "TEXT" : "DOUBLE"}});
   }
   schema["columns"] = cols;
+  if (r.stream_schema.source.has_value())
+    schema["source"] = r.stream_schema.source.value();
   j["stream_schema"] = schema;
 
   // table_schema

@@ -1058,6 +1058,87 @@ TEST_F(CompilerIntegrationTest, CreateStreamSyntax) {
   EXPECT_EQ(r.stream_schema.columns[0].index, 0);
   EXPECT_EQ(r.stream_schema.columns[1].name, "price");
   EXPECT_EQ(r.stream_schema.columns[2].name, "quantity");
+  EXPECT_FALSE(r.stream_schema.source.has_value());
+}
+
+// --- CreateStreamWithSource: optional FROM "..." metadata ---
+
+TEST_F(CompilerIntegrationTest, CreateStreamWithSource) {
+  auto r = compile_sql(
+      R"(CREATE STREAM system_cpu(cpu DOUBLE, x TEXT) FROM "abcdeg")",
+      catalog);
+
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  EXPECT_EQ(r.statement_type, StatementType::CREATE_STREAM);
+  EXPECT_EQ(r.entity_name, "system_cpu");
+  ASSERT_EQ(r.stream_schema.columns.size(), 2u);
+  ASSERT_TRUE(r.stream_schema.source.has_value());
+  EXPECT_EQ(r.stream_schema.source.value(), "abcdeg");
+}
+
+TEST_F(CompilerIntegrationTest, CreateStreamWithSourceCaseInsensitive) {
+  auto r = compile_sql(
+      R"(CREATE STREAM system_cpu(cpu DOUBLE, x TEXT) from "my-source")",
+      catalog);
+
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  ASSERT_TRUE(r.stream_schema.source.has_value());
+  EXPECT_EQ(r.stream_schema.source.value(), "my-source");
+}
+
+// --- CreateStreamMultiple: three streams compiled as a sequential program ---
+// The current API compiles one statement at a time; this test models the
+// real session workflow where each statement is compiled in order and the
+// catalog is updated between steps so later statements see earlier definitions.
+
+TEST_F(CompilerIntegrationTest, CreateStreamMultiple) {
+  CatalogSnapshot session;
+
+  auto r1 = compile_sql_expanded(
+      R"(CREATE STREAM system_cpu(cpu DOUBLE, x TEXT) FROM "Aleluya";)",
+      session, 1000);
+  ASSERT_EQ(r1.results.size(), 1u);
+  ASSERT_FALSE(r1.results[0].has_errors()) << r1.results[0].errors[0].message;
+  EXPECT_EQ(r1.results[0].statement_type, StatementType::CREATE_STREAM);
+  EXPECT_EQ(r1.results[0].entity_name, "system_cpu");
+  ASSERT_EQ(r1.results[0].stream_schema.columns.size(), 2u);
+  EXPECT_EQ(r1.results[0].stream_schema.columns[0].name, "cpu");
+  EXPECT_EQ(r1.results[0].stream_schema.columns[0].type, ColumnType::DOUBLE);
+  EXPECT_EQ(r1.results[0].stream_schema.columns[1].name, "x");
+  EXPECT_EQ(r1.results[0].stream_schema.columns[1].type, ColumnType::TEXT);
+  ASSERT_TRUE(r1.results[0].stream_schema.source.has_value());
+  EXPECT_EQ(r1.results[0].stream_schema.source.value(), "Aleluya");
+  session.streams["system_cpu"] = r1.results[0].stream_schema;
+
+  auto r2 = compile_sql_expanded(
+      R"(CREATE STREAM system_memory(memory DOUBLE) FROM "Maria Morena";)",
+      session, 1000);
+  ASSERT_EQ(r2.results.size(), 1u);
+  ASSERT_FALSE(r2.results[0].has_errors()) << r2.results[0].errors[0].message;
+  EXPECT_EQ(r2.results[0].statement_type, StatementType::CREATE_STREAM);
+  EXPECT_EQ(r2.results[0].entity_name, "system_memory");
+  ASSERT_EQ(r2.results[0].stream_schema.columns.size(), 1u);
+  EXPECT_EQ(r2.results[0].stream_schema.columns[0].name, "memory");
+  EXPECT_EQ(r2.results[0].stream_schema.columns[0].type, ColumnType::DOUBLE);
+  ASSERT_TRUE(r2.results[0].stream_schema.source.has_value());
+  EXPECT_EQ(r2.results[0].stream_schema.source.value(), "Maria Morena");
+  session.streams["system_memory"] = r2.results[0].stream_schema;
+
+  auto r3 = compile_sql_expanded(
+      "CREATE STREAM system_decay(cpu DOUBLE, x TEXT);",
+      session, 1000);
+  ASSERT_EQ(r3.results.size(), 1u);
+  ASSERT_FALSE(r3.results[0].has_errors()) << r3.results[0].errors[0].message;
+  EXPECT_EQ(r3.results[0].statement_type, StatementType::CREATE_STREAM);
+  EXPECT_EQ(r3.results[0].entity_name, "system_decay");
+  ASSERT_EQ(r3.results[0].stream_schema.columns.size(), 2u);
+  EXPECT_FALSE(r3.results[0].stream_schema.source.has_value());
+  session.streams["system_decay"] = r3.results[0].stream_schema;
+
+  EXPECT_EQ(session.streams.size(), 3u);
+  EXPECT_TRUE(session.streams.count("system_cpu"));
+  EXPECT_TRUE(session.streams.count("system_memory"));
+  EXPECT_TRUE(session.streams.count("system_decay"));
 }
 
 }  // namespace

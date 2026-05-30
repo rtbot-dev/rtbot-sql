@@ -35,6 +35,12 @@ namespace {
 
 std::string normalize_sql(const std::string& sql) {
   std::string out = sql;
+  // Strip optional FROM "..." source metadata so pg_query never sees it.
+  // The anchor on ) ensures we only match after a column-list closing paren,
+  // not in SELECT ... FROM clauses.
+  static const std::regex kStreamFrom(R"(\)\s+FROM\s+"[^"]*"\s*;?\s*$)",
+                                      std::regex::icase);
+  out = std::regex_replace(out, kStreamFrom, ")");
   static const std::regex kCreateStream(R"(\bCREATE\s+STREAM\b)",
                                         std::regex::icase);
   out = std::regex_replace(out, kCreateStream, "CREATE TABLE");
@@ -897,6 +903,17 @@ CompilationResult handle_drop(const parser::ast::DropStmt& stmt,
 
 CompilationResult compile_sql(const std::string& sql,
                               const CatalogSnapshot& catalog) {
+  // Extract optional FROM "..." source metadata before normalization strips it.
+  std::optional<std::string> stream_source;
+  {
+    static const std::regex kStreamFrom(R"re(\)\s+FROM\s+"([^"]*)"\s*;?\s*$)re",
+                                        std::regex::icase);
+    std::smatch m;
+    if (std::regex_search(sql, m, kStreamFrom)) {
+      stream_source = m[1].str();
+    }
+  }
+
   const std::string normalized = normalize_sql(sql);
 
   // Step 1: Parse
@@ -977,7 +994,10 @@ CompilationResult compile_sql(const std::string& sql,
                                 [](const parser::ast::ColumnDefAST& c) {
                                   return c.primary_key;
                                 });
-      return has_pk ? handle_create_table(*s) : handle_create_stream(*s);
+      if (has_pk) return handle_create_table(*s);
+      auto result = handle_create_stream(*s);
+      result.stream_schema.source = stream_source;
+      return result;
     }
     if (auto* s = std::get_if<parser::ast::CreateViewStmt>(&stmt)) {
       return handle_create_mat_view(*s, catalog);
