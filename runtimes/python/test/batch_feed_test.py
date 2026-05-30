@@ -41,7 +41,7 @@ class FeedBatchCorrectnessTest(unittest.TestCase):
     """MOVING_AVERAGE via feed_batch == via feed loop."""
     # --- Row-by-row baseline (slow path) ---
     sql_slow = rtbot_sql.RtBotSql()
-    sql_slow.execute("CREATE STREAM sensor (temperature DOUBLE)")
+    sql_slow.execute("SELECT STREAM sensor (temperature DOUBLE)")
     sql_slow.execute(
         "CREATE MATERIALIZED VIEW stats AS "
         "SELECT temperature, MOVING_AVERAGE(temperature, 5) AS avg_temp "
@@ -55,7 +55,7 @@ class FeedBatchCorrectnessTest(unittest.TestCase):
 
     # --- Batch path (fast path via DataFrame) ---
     sql_fast = rtbot_sql.RtBotSql()
-    sql_fast.execute("CREATE STREAM sensor (temperature DOUBLE)")
+    sql_fast.execute("SELECT STREAM sensor (temperature DOUBLE)")
     sql_fast.execute(
         "CREATE MATERIALIZED VIEW stats AS "
         "SELECT temperature, MOVING_AVERAGE(temperature, 5) AS avg_temp "
@@ -87,7 +87,7 @@ class FeedBatchCorrectnessTest(unittest.TestCase):
 
     # Slow path (list-of-dicts)
     sql_slow = rtbot_sql.RtBotSql()
-    sql_slow.execute("CREATE STREAM sensors (device DOUBLE, value DOUBLE)")
+    sql_slow.execute("SELECT STREAM sensors (device DOUBLE, value DOUBLE)")
     sql_slow.execute(
         "CREATE MATERIALIZED VIEW agg AS "
         "SELECT device, SUM(value) AS total, COUNT(*) AS cnt "
@@ -99,7 +99,7 @@ class FeedBatchCorrectnessTest(unittest.TestCase):
 
     # Fast path (DataFrame)
     sql_fast = rtbot_sql.RtBotSql()
-    sql_fast.execute("CREATE STREAM sensors (device DOUBLE, value DOUBLE)")
+    sql_fast.execute("SELECT STREAM sensors (device DOUBLE, value DOUBLE)")
     sql_fast.execute(
         "CREATE MATERIALIZED VIEW agg AS "
         "SELECT device, SUM(value) AS total, COUNT(*) AS cnt "
@@ -147,7 +147,7 @@ class FeedBatchCorrectnessTest(unittest.TestCase):
 
     # Slow path
     sql_slow = rtbot_sql.RtBotSql()
-    sql_slow.execute("CREATE STREAM vibration (device_id DOUBLE, channel_id DOUBLE, amplitude DOUBLE)")
+    sql_slow.execute("SELECT STREAM vibration (device_id DOUBLE, channel_id DOUBLE, amplitude DOUBLE)")
     sql_slow.execute(sql_text)
     sql_slow.insert_dataframe("vibration", readings)
     result_slow = sql_slow.execute("SELECT * FROM rms WHERE sample_count > 1")
@@ -155,7 +155,7 @@ class FeedBatchCorrectnessTest(unittest.TestCase):
 
     # Fast path
     sql_fast = rtbot_sql.RtBotSql()
-    sql_fast.execute("CREATE STREAM vibration (device_id DOUBLE, channel_id DOUBLE, amplitude DOUBLE)")
+    sql_fast.execute("SELECT STREAM vibration (device_id DOUBLE, channel_id DOUBLE, amplitude DOUBLE)")
     sql_fast.execute(sql_text)
     df = pd.DataFrame(readings)
     sql_fast.insert_dataframe("vibration", df)
@@ -194,7 +194,7 @@ class FeedBatchCorrectnessTest(unittest.TestCase):
 
     # Slow path
     sql_slow = rtbot_sql.RtBotSql()
-    sql_slow.execute("CREATE STREAM sensor (temperature DOUBLE)")
+    sql_slow.execute("SELECT STREAM sensor (temperature DOUBLE)")
     sql_slow.execute(sql_text_base)
     sql_slow.execute(sql_text_derived)
     sql_slow.insert_dataframe("sensor", readings)
@@ -203,7 +203,7 @@ class FeedBatchCorrectnessTest(unittest.TestCase):
 
     # Fast path
     sql_fast = rtbot_sql.RtBotSql()
-    sql_fast.execute("CREATE STREAM sensor (temperature DOUBLE)")
+    sql_fast.execute("SELECT STREAM sensor (temperature DOUBLE)")
     sql_fast.execute(sql_text_base)
     sql_fast.execute(sql_text_derived)
     df = pd.DataFrame(readings)
@@ -220,7 +220,7 @@ class FeedBatchCorrectnessTest(unittest.TestCase):
   def test_keyed_view_tracks_keys_correctly(self):
     """KEYED views track known keys via batch path."""
     sql = rtbot_sql.RtBotSql()
-    sql.execute("CREATE STREAM sensors (device DOUBLE, value DOUBLE)")
+    sql.execute("SELECT STREAM sensors (device DOUBLE, value DOUBLE)")
     sql.execute(
         "CREATE MATERIALIZED VIEW agg AS "
         "SELECT device, SUM(value) AS total, COUNT(*) AS cnt "
@@ -248,7 +248,7 @@ class FeedBatchCorrectnessTest(unittest.TestCase):
   def test_store_raw_false_skips_raw_storage(self):
     """store_raw=False doesn't store raw stream but views still work."""
     sql = rtbot_sql.RtBotSql()
-    sql.execute("CREATE STREAM sensor (temperature DOUBLE)")
+    sql.execute("SELECT STREAM sensor (temperature DOUBLE)")
     sql.execute(
         "CREATE MATERIALIZED VIEW stats AS "
         "SELECT temperature, MOVING_AVERAGE(temperature, 5) AS avg_temp "
@@ -274,7 +274,7 @@ class FeedBatchCorrectnessTest(unittest.TestCase):
     """column_map remapping works with DataFrame fast path."""
     sql = rtbot_sql.RtBotSql()
     sql.execute(
-        "CREATE STREAM trades (price DOUBLE, qty DOUBLE, "
+        "SELECT STREAM trades (price DOUBLE, qty DOUBLE, "
         "quote_qty DOUBLE, is_buyer_maker DOUBLE)"
     )
 
@@ -313,8 +313,8 @@ class FeedBatchCorrectnessTest(unittest.TestCase):
     routes each source's messages to the correct input port.
     """
     sql = rtbot_sql.RtBotSql()
-    sql.execute("CREATE STREAM btc (price DOUBLE)")
-    sql.execute("CREATE STREAM eth (price DOUBLE)")
+    sql.execute("SELECT STREAM btc (price DOUBLE)")
+    sql.execute("SELECT STREAM eth (price DOUBLE)")
     sql.execute(
         "CREATE MATERIALIZED VIEW cross_stats AS "
         "SELECT b.price AS btc_price, e.price AS eth_price, b.price - e.price AS spread "
@@ -341,8 +341,8 @@ class FeedBatchCorrectnessTest(unittest.TestCase):
   def test_multi_source_view_matching_timestamps(self):
     """Multi-source view with matching timestamps produces correct output."""
     sql = rtbot_sql.RtBotSql()
-    sql.execute("CREATE STREAM btc (price DOUBLE)")
-    sql.execute("CREATE STREAM eth (price DOUBLE)")
+    sql.execute("SELECT STREAM btc (price DOUBLE)")
+    sql.execute("SELECT STREAM eth (price DOUBLE)")
     sql.execute(
         "CREATE MATERIALIZED VIEW cross_stats AS "
         "SELECT b.price AS btc_price, e.price AS eth_price, b.price - e.price AS spread "
@@ -413,7 +413,7 @@ class FeedBatchPerformanceTest(unittest.TestCase):
 
     def _setup_sql():
       s = rtbot_sql.RtBotSql()
-      s.execute("CREATE STREAM vibration (device DOUBLE, channel DOUBLE, amplitude DOUBLE)")
+      s.execute("SELECT STREAM vibration (device DOUBLE, channel DOUBLE, amplitude DOUBLE)")
       for v in view_stmts:
         s.execute(v)
       return s
@@ -454,7 +454,7 @@ class FeedBatchPerformanceTest(unittest.TestCase):
     })
 
     sql = rtbot_sql.RtBotSql()
-    sql.execute("CREATE STREAM vibration (device DOUBLE, channel DOUBLE, amplitude DOUBLE)")
+    sql.execute("SELECT STREAM vibration (device DOUBLE, channel DOUBLE, amplitude DOUBLE)")
     sql.execute(
         "CREATE MATERIALIZED VIEW rms AS "
         "SELECT device, channel, COUNT(*) AS n, "
@@ -495,7 +495,7 @@ class FeedBatchPerformanceTest(unittest.TestCase):
 
     def _setup_sql():
       s = rtbot_sql.RtBotSql()
-      s.execute("CREATE STREAM sensor (col_a DOUBLE, col_b DOUBLE, col_c DOUBLE)")
+      s.execute("SELECT STREAM sensor (col_a DOUBLE, col_b DOUBLE, col_c DOUBLE)")
       for v in view_stmts:
         s.execute(v)
       return s

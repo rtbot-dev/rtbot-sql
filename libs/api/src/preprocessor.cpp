@@ -137,9 +137,9 @@ PreprocessResult preprocess_sql(const std::string& sql,
       std::string bin_str = std::to_string(bin_units);
       std::vector<std::string> stmts;
 
-      // CREATE STREAM per column
+      // SELECT STREAM per column
       for (const auto& col : columns) {
-        stmts.push_back("CREATE STREAM " + col.name + " (value " + col.type +
+        stmts.push_back("SELECT STREAM " + col.name + " (value " + col.type +
                          ")");
       }
 

@@ -6,13 +6,13 @@ namespace rtbot_sql::api {
 namespace {
 
 // ---------------------------------------------------------------------------
-// CREATE STREAM — column types
+// SELECT STREAM — column types
 // ---------------------------------------------------------------------------
 
 TEST(SchemaTest, CreateStreamWithTextColumnPreservesType) {
   CatalogSnapshot empty;
   auto result = compile_sql(
-      "CREATE STREAM sensors "
+      "SELECT STREAM sensors "
       "(device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)",
       empty);
   ASSERT_FALSE(result.has_errors());
@@ -52,7 +52,7 @@ TEST(SchemaTest, CreateTableWithTextColumnPreservesType) {
 TEST(SchemaTest, CreateStreamWithoutTextDefaultsToDouble) {
   CatalogSnapshot empty;
   auto result = compile_sql(
-      "CREATE STREAM ticks (value DOUBLE PRECISION)", empty);
+      "SELECT STREAM ticks (value DOUBLE PRECISION)", empty);
   ASSERT_FALSE(result.has_errors());
   ASSERT_EQ(result.stream_schema.columns.size(), 1u);
   EXPECT_EQ(result.stream_schema.columns[0].name, "value");

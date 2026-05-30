@@ -16,10 +16,10 @@ namespace {
 
 // Normalize RTBot SQL dialect keywords to their PostgreSQL equivalents so that
 // libpg_query (a PostgreSQL 17 grammar wrapper) can parse them successfully.
-// CREATE STREAM → CREATE TABLE, DROP STREAM → DROP TABLE.
+// SELECT STREAM → CREATE TABLE, DROP STREAM → DROP TABLE.
 std::string normalize_sql(const std::string& sql) {
   std::string out = sql;
-  static const std::regex kCreateStream(R"(\bCREATE\s+STREAM\b)",
+  static const std::regex kCreateStream(R"(\bSELECT\s+STREAM\b)",
                                         std::regex::icase);
   out = std::regex_replace(out, kCreateStream, "CREATE TABLE");
   static const std::regex kDropStream(R"(\bDROP\s+STREAM\b)",

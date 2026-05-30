@@ -19,7 +19,7 @@ import rtbot_sql
 
 
 SQL_STREAM = (
-    "CREATE STREAM vibration_raw ("
+    "SELECT STREAM vibration_raw ("
     "device_id DOUBLE, channel_id DOUBLE, amplitude DOUBLE)"
 )
 

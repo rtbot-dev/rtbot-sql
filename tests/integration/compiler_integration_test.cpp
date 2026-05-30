@@ -24,7 +24,7 @@ class CompilerIntegrationTest : public ::testing::Test {
   CatalogSnapshot catalog;
 };
 
-// --- Test 1: CREATE STREAM ---
+// --- Test 1: SELECT STREAM ---
 
 TEST_F(CompilerIntegrationTest, CreateStream) {
   auto r = compile_sql(
@@ -1042,11 +1042,11 @@ TEST_F(CompilerIntegrationTest, PresetRmsTrendPattern) {
 // --- CreateStreamSyntax: verify that the raw STREAM keyword is accepted ---
 
 TEST_F(CompilerIntegrationTest, CreateStreamSyntax) {
-  // compile_sql must normalize "CREATE STREAM" → "CREATE TABLE" internally
+  // compile_sql must normalize "SELECT STREAM" → "CREATE TABLE" internally
   // before handing the SQL to libpg_query.  Pass the raw keyword directly
   // (no external normalization) and assert the result is a CREATE_STREAM.
   auto r = compile_sql(
-      "CREATE STREAM orders (id DOUBLE PRECISION, price DOUBLE PRECISION, "
+      "SELECT STREAM orders (id DOUBLE PRECISION, price DOUBLE PRECISION, "
       "quantity DOUBLE PRECISION)",
       catalog);
 
@@ -1065,7 +1065,7 @@ TEST_F(CompilerIntegrationTest, CreateStreamSyntax) {
 
 TEST_F(CompilerIntegrationTest, CreateStreamWithSource) {
   auto r = compile_sql(
-      R"(CREATE STREAM system_cpu(cpu DOUBLE, x TEXT) FROM "abcdeg")",
+      R"(SELECT STREAM system_cpu(cpu DOUBLE, x TEXT) FROM "abcdeg")",
       catalog);
 
   ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
@@ -1078,7 +1078,7 @@ TEST_F(CompilerIntegrationTest, CreateStreamWithSource) {
 
 TEST_F(CompilerIntegrationTest, CreateStreamWithSourceCaseInsensitive) {
   auto r = compile_sql(
-      R"(CREATE STREAM system_cpu(cpu DOUBLE, x TEXT) from "my-source")",
+      R"(SELECT STREAM system_cpu(cpu DOUBLE, x TEXT) from "my-source")",
       catalog);
 
   ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
@@ -1095,7 +1095,7 @@ TEST_F(CompilerIntegrationTest, CreateStreamMultiple) {
   CatalogSnapshot session;
 
   auto r1 = compile_sql_expanded(
-      R"(CREATE STREAM system_cpu(cpu DOUBLE, x TEXT) FROM "Aleluya";)",
+      R"(SELECT STREAM system_cpu(cpu DOUBLE, x TEXT) FROM "Aleluya";)",
       session, 1000);
   ASSERT_EQ(r1.results.size(), 1u);
   ASSERT_FALSE(r1.results[0].has_errors()) << r1.results[0].errors[0].message;
@@ -1111,7 +1111,7 @@ TEST_F(CompilerIntegrationTest, CreateStreamMultiple) {
   session.streams["system_cpu"] = r1.results[0].stream_schema;
 
   auto r2 = compile_sql_expanded(
-      R"(CREATE STREAM system_memory(memory DOUBLE) FROM "Maria Morena";)",
+      R"(SELECT STREAM system_memory(memory DOUBLE) FROM "Maria Morena";)",
       session, 1000);
   ASSERT_EQ(r2.results.size(), 1u);
   ASSERT_FALSE(r2.results[0].has_errors()) << r2.results[0].errors[0].message;
@@ -1125,7 +1125,7 @@ TEST_F(CompilerIntegrationTest, CreateStreamMultiple) {
   session.streams["system_memory"] = r2.results[0].stream_schema;
 
   auto r3 = compile_sql_expanded(
-      "CREATE STREAM system_decay(cpu DOUBLE, x TEXT);",
+      "SELECT STREAM system_decay(cpu DOUBLE, x TEXT);",
       session, 1000);
   ASSERT_EQ(r3.results.size(), 1u);
   ASSERT_FALSE(r3.results[0].has_errors()) << r3.results[0].errors[0].message;

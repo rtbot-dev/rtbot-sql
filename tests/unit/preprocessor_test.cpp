@@ -6,9 +6,9 @@ using namespace rtbot_sql::api;
 class PreprocessorTest : public ::testing::Test {};
 
 TEST_F(PreprocessorTest, RegularSqlPassesThrough) {
-  auto r = preprocess_sql("CREATE STREAM sensor (value DOUBLE)", 1000000);
+  auto r = preprocess_sql("SELECT STREAM sensor (value DOUBLE)", 1000000);
   ASSERT_EQ(r.statements.size(), 1);
-  EXPECT_EQ(r.statements[0], "CREATE STREAM sensor (value DOUBLE)");
+  EXPECT_EQ(r.statements[0], "SELECT STREAM sensor (value DOUBLE)");
   EXPECT_EQ(r.new_ts_units_per_second, -1);
 }
 
@@ -19,8 +19,8 @@ TEST_F(PreprocessorTest, AlignedStreamTwoColumns) {
   // 2 streams + 2 _bin views + 2 _rs views + 1 combining materialized view = 7
   ASSERT_EQ(r.statements.size(), 7);
   // Per-column streams
-  EXPECT_EQ(r.statements[0], "CREATE STREAM vibration (value DOUBLE)");
-  EXPECT_EQ(r.statements[1], "CREATE STREAM bearing_temp (value DOUBLE)");
+  EXPECT_EQ(r.statements[0], "SELECT STREAM vibration (value DOUBLE)");
+  EXPECT_EQ(r.statements[1], "SELECT STREAM bearing_temp (value DOUBLE)");
   // Binning views
   EXPECT_EQ(r.statements[2],
       "CREATE VIEW vibration_bin AS SELECT AVG(value) AS vibration "
@@ -46,7 +46,7 @@ TEST_F(PreprocessorTest, AlignedStreamSingleColumn) {
       "CREATE ALIGNED STREAM data (pressure DOUBLE) BIN(500ms)", 1000000);
   // 1 stream + 1 _bin + 1 _rs + 1 combining = 4
   ASSERT_EQ(r.statements.size(), 4);
-  EXPECT_EQ(r.statements[0], "CREATE STREAM pressure (value DOUBLE)");
+  EXPECT_EQ(r.statements[0], "SELECT STREAM pressure (value DOUBLE)");
   EXPECT_EQ(r.statements[1],
       "CREATE VIEW pressure_bin AS SELECT AVG(value) AS pressure "
       "FROM pressure GROUP BY FLOOR(TS() / 500000)");
@@ -126,9 +126,9 @@ TEST_F(PreprocessorTest, ThreeColumns) {
       1000000);
   // 3 streams + 3 _bin + 3 _rs + 1 combining = 10
   ASSERT_EQ(r.statements.size(), 10);
-  EXPECT_EQ(r.statements[0], "CREATE STREAM x (value DOUBLE)");
-  EXPECT_EQ(r.statements[1], "CREATE STREAM y (value DOUBLE)");
-  EXPECT_EQ(r.statements[2], "CREATE STREAM z (value DOUBLE)");
+  EXPECT_EQ(r.statements[0], "SELECT STREAM x (value DOUBLE)");
+  EXPECT_EQ(r.statements[1], "SELECT STREAM y (value DOUBLE)");
+  EXPECT_EQ(r.statements[2], "SELECT STREAM z (value DOUBLE)");
   // _bin views
   EXPECT_NE(r.statements[3].find("x_bin"), std::string::npos);
   EXPECT_NE(r.statements[4].find("y_bin"), std::string::npos);
@@ -149,8 +149,8 @@ TEST_F(PreprocessorTest, FiveColumns) {
       1000000);
   // 5 streams + 5 _bin + 5 _rs + 1 combining = 16
   ASSERT_EQ(r.statements.size(), 16);
-  EXPECT_EQ(r.statements[0], "CREATE STREAM a (value DOUBLE)");
-  EXPECT_EQ(r.statements[4], "CREATE STREAM e (value DOUBLE)");
+  EXPECT_EQ(r.statements[0], "SELECT STREAM a (value DOUBLE)");
+  EXPECT_EQ(r.statements[4], "SELECT STREAM e (value DOUBLE)");
   EXPECT_EQ(r.statements[15],
             "CREATE MATERIALIZED VIEW many AS SELECT a, b, c, d, e "
             "FROM a_rs, b_rs, c_rs, d_rs, e_rs");

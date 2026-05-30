@@ -298,12 +298,12 @@ TEST(AnalyzerTest, MultipleErrorsAccumulateInSingleCompile) {
 // don't hard-code magic numbers.
 // ---------------------------------------------------------------------------
 
-// Mirror compile_sql's normalize_sql: rewrite CREATE STREAM → CREATE TABLE
+// Mirror compile_sql's normalize_sql: rewrite SELECT STREAM → CREATE TABLE
 // and DROP STREAM → DROP TABLE so byte offsets in the test SQL match what
 // the parser actually saw. Without this, span extraction from the original
 // SQL is off-by-N for any input that contains STREAM keywords.
 inline std::string normalize_for_span(const std::string& sql) {
-  static const std::regex kCreateStream(R"(\bCREATE\s+STREAM\b)",
+  static const std::regex kCreateStream(R"(\bSELECT\s+STREAM\b)",
                                         std::regex::icase);
   static const std::regex kDropStream(R"(\bDROP\s+STREAM\b)",
                                       std::regex::icase);
@@ -393,7 +393,7 @@ TEST(AnalyzerLocationTest, UnknownFunctionPointsAtFunctionCall) {
 // its (line, column) match a token's offset.
 //
 // IMPORTANT: the analyzer's locations are relative to the SQL after
-// normalize_sql (CREATE STREAM → CREATE TABLE, DROP STREAM → DROP TABLE),
+// normalize_sql (SELECT STREAM → CREATE TABLE, DROP STREAM → DROP TABLE),
 // not the user's original. We normalize here so the search-for-token uses
 // the same byte space the analyzer reports against.
 void expect_loc_at_token(const std::string& sql,
@@ -516,10 +516,10 @@ TEST(AnalyzerLocationTest, UnknownColumnTypePointsAtColumnName) {
   // libpg_query's ColumnDef.location points at the column-name token —
   // verified empirically against the parser's actual output. The earlier
   // commit comment claiming it pointed at `(` was wrong; the test was
-  // passing only by coincidence (CREATE STREAM normalizes to CREATE
+  // passing only by coincidence (SELECT STREAM normalizes to CREATE
   // TABLE, shifting offsets by 1, which made `(` in the original happen
   // to align with `val` in the normalized).
-  const std::string sql = "CREATE STREAM s (val BANANA)";
+  const std::string sql = "SELECT STREAM s (val BANANA)";
   expect_loc_at_token(sql, empty, "unknown column type", "val");
 }
 
@@ -771,7 +771,7 @@ TEST(AnalyzerSpanTest, UnknownColumnTypeSpan) {
   CatalogSnapshot empty;
   // libpg_query's ColumnDef.location points at the column-name token, not
   // at the surrounding parens — span identifies the column name.
-  expect_span_matches("CREATE STREAM s (val BANANA)", empty,
+  expect_span_matches("SELECT STREAM s (val BANANA)", empty,
                       "unknown column type", "val");
 }
 
@@ -1543,7 +1543,7 @@ TEST(AnalyzerCoverageTest, DuplicateSelectAliasesRejected) {
 TEST(AnalyzerCoverageTest, DuplicateColumnNameInCreateStreamRejected) {
   CatalogSnapshot empty;
   expect_error_containing(
-      "CREATE STREAM s (x DOUBLE PRECISION, x DOUBLE PRECISION)", empty,
+      "SELECT STREAM s (x DOUBLE PRECISION, x DOUBLE PRECISION)", empty,
       "duplicate column name 'x' in 's'");
 }
 
@@ -1559,7 +1559,7 @@ TEST(AnalyzerCoverageTest, DuplicateColumnNameInCreateTableRejected) {
 TEST(AnalyzerCoverageTest, UnknownColumnTypeRejected) {
   CatalogSnapshot empty;
   expect_error_containing(
-      "CREATE STREAM s (val BANANA)", empty,
+      "SELECT STREAM s (val BANANA)", empty,
       "unknown column type");
 }
 
@@ -1567,7 +1567,7 @@ TEST(AnalyzerCoverageTest, KnownColumnTypesAccepted) {
   CatalogSnapshot empty;
   // All these should compile cleanly.
   EXPECT_FALSE(compile_sql(
-                   "CREATE STREAM s1 (a INT, b BIGINT, c REAL, d FLOAT, "
+                   "SELECT STREAM s1 (a INT, b BIGINT, c REAL, d FLOAT, "
                    "e TEXT, f VARCHAR, g BOOLEAN)",
                    empty)
                    .has_errors());

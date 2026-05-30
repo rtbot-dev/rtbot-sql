@@ -41,7 +41,7 @@ std::string normalize_sql(const std::string& sql) {
   static const std::regex kStreamFrom(R"(\)\s+FROM\s+"[^"]*"\s*;?\s*$)",
                                       std::regex::icase);
   out = std::regex_replace(out, kStreamFrom, ")");
-  static const std::regex kCreateStream(R"(\bCREATE\s+STREAM\b)",
+  static const std::regex kCreateStream(R"(\bSELECT\s+STREAM\b)",
                                         std::regex::icase);
   out = std::regex_replace(out, kCreateStream, "CREATE TABLE");
   static const std::regex kDropStream(R"(\bDROP\s+STREAM\b)",
@@ -423,7 +423,7 @@ CompilationResult compile_select_to_program(
   return result;
 }
 
-// Handle CREATE STREAM (via CREATE TABLE).
+// Handle SELECT STREAM (via CREATE TABLE).
 CompilationResult handle_create_stream(
     const parser::ast::CreateStreamStmt& stmt) {
   CompilationResult result{};

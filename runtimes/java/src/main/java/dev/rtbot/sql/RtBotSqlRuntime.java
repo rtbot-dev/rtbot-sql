@@ -26,7 +26,7 @@ import java.util.regex.Pattern;
  *
  * <p>Supports:
  * <ul>
- *   <li>CREATE STREAM / CREATE TABLE</li>
+ *   <li>SELECT STREAM / CREATE TABLE</li>
  *   <li>INSERT INTO</li>
  *   <li>CREATE VIEW / CREATE MATERIALIZED VIEW</li>
  *   <li>DROP</li>
@@ -841,7 +841,7 @@ public class RtBotSqlRuntime {
 
     /**
      * Normalize SQL by replacing RTBot-specific syntax with standard SQL.
-     * "CREATE STREAM" -> "CREATE TABLE", "DROP STREAM" -> "DROP TABLE".
+     * "SELECT STREAM" -> "CREATE TABLE", "DROP STREAM" -> "DROP TABLE".
      */
     private static String normalizeSql(String sql) {
         String out = sql.strip();
@@ -855,7 +855,7 @@ public class RtBotSqlRuntime {
     // =================================================================
 
     /**
-     * Handle CREATE STREAM: register the stream schema in the catalog.
+     * Handle SELECT STREAM: register the stream schema in the catalog.
      */
     private void handleCreateStream(CompilationResult result) {
         catalog.registerStream(result.entityName, result.streamSchema);

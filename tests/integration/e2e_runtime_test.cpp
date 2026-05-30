@@ -1447,10 +1447,10 @@ TEST_F(E2eRuntimeTest, MultiStreamMixedTimestamps) {
 }
 
 // ---------------------------------------------------------------------------
-// T-text-1: TEXT column round-trip via CREATE STREAM + INSERT
+// T-text-1: TEXT column round-trip via SELECT STREAM + INSERT
 //
 // Verifies that:
-//   1. CREATE STREAM with TEXT column produces correct ColumnType in schema
+//   1. SELECT STREAM with TEXT column produces correct ColumnType in schema
 //   2. INSERT with string literal resolves to dictionary ID
 //   3. dictionary_updates contains the new encoding
 // ---------------------------------------------------------------------------
@@ -1458,7 +1458,7 @@ TEST_F(E2eRuntimeTest, MultiStreamMixedTimestamps) {
 TEST(E2ERuntimeTextTest, TextColumnRoundTrip) {
   CatalogSnapshot snap;
   auto create_result = compile_sql(
-      "CREATE STREAM sensors (device_id DOUBLE PRECISION, location TEXT, "
+      "SELECT STREAM sensors (device_id DOUBLE PRECISION, location TEXT, "
       "value DOUBLE PRECISION)",
       snap);
   ASSERT_FALSE(create_result.has_errors());
@@ -2352,7 +2352,7 @@ TEST_F(E2eRuntimeTest, ExpandedPassthroughSingleStatement) {
   // Regular SQL should produce exactly one CompilationResult.
   CatalogSnapshot empty_catalog;
   auto expanded = compile_sql_expanded(
-      "CREATE STREAM sensor (value DOUBLE)", empty_catalog, 1000);
+      "SELECT STREAM sensor (value DOUBLE)", empty_catalog, 1000);
 
   EXPECT_EQ(expanded.new_ts_units_per_second, -1);
   ASSERT_EQ(expanded.results.size(), 1u);
@@ -2381,11 +2381,11 @@ TEST_F(E2eRuntimeTest, ExpandedAlignedStreamProduces7Results) {
                 : expanded.results[i].errors[0].message);
   }
 
-  // Statement 0: CREATE STREAM vibration (value DOUBLE)
+  // Statement 0: SELECT STREAM vibration (value DOUBLE)
   EXPECT_EQ(expanded.results[0].statement_type, StatementType::CREATE_STREAM);
   EXPECT_EQ(expanded.results[0].entity_name, "vibration");
 
-  // Statement 1: CREATE STREAM bearing_temp (value DOUBLE)
+  // Statement 1: SELECT STREAM bearing_temp (value DOUBLE)
   EXPECT_EQ(expanded.results[1].statement_type, StatementType::CREATE_STREAM);
   EXPECT_EQ(expanded.results[1].entity_name, "bearing_temp");
 
@@ -3282,7 +3282,7 @@ TEST_F(E2eRuntimeTest, FusedAggregateSegmentMaxReset) {
 // Full pipeline test: SQL → compiler → bytecode → Pipeline operator →
 // segment boundaries → correct aggregated output.
 //
-// CREATE STREAM vibrations (device_id FLOAT, channel_id FLOAT, amplitude FLOAT)
+// SELECT STREAM vibrations (device_id FLOAT, channel_id FLOAT, amplitude FLOAT)
 // CREATE MATERIALIZED VIEW moments AS
 // SELECT SUM(amplitude) AS total, COUNT(*) AS cnt
 // FROM vibrations
