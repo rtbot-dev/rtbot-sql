@@ -22,9 +22,65 @@ export interface ColumnDef {
   type?: "DOUBLE" | "TEXT";
 }
 
+/**
+ * The effective ingest mode for a `SELECT STREAM`. `scalar` is one
+ * tag-value per event; `csv_burst` parses a comma-separated string of
+ * N samples per event with the per-sample interval driven by
+ * `window_clause.value` (Hz). When the SQL omits `TYPE`, the C++
+ * compiler defaults to `scalar`.
+ */
+export type SourceType = "scalar" | "csv_burst";
+
+/**
+ * Span over the `TYPE` value identifier. Present only when the user
+ * wrote `TYPE …` in the SQL — absent when the type defaults to scalar.
+ */
+export interface SourceTypeClause {
+  value: SourceType;
+  line: number;
+  column: number;
+  end_line: number;
+  end_column: number;
+}
+
+/**
+ * Span over the `WINDOW` digits. Only valid (and required) with
+ * `TYPE csv_burst`; the analyzer flags the clause otherwise.
+ */
+export interface SourceWindowClause {
+  value: number;
+  line: number;
+  column: number;
+  end_line: number;
+  end_column: number;
+}
+
+/**
+ * Metadata from `FROM "<pattern>"` on a `SELECT STREAM`. `name` is the
+ * unquoted pattern verbatim (e.g. `"ignition://{x}/cpu"`); `{col}`
+ * placeholders reference TEXT columns in the schema by name and are
+ * resolved at deploy time against the gateway tag tree.
+ *
+ * `type` reflects the effective type (defaults to "scalar" when the
+ * SQL omits `TYPE`). The optional `type_clause` / `window_clause`
+ * carry the user-written tokens with their spans, for editor
+ * diagnostics on `WINDOW > 0`, unknown TYPE, etc.
+ */
+export interface Source {
+  name: string;
+  type: SourceType;
+  line: number;
+  column: number;
+  end_line: number;
+  end_column: number;
+  type_clause?: SourceTypeClause;
+  window_clause?: SourceWindowClause;
+}
+
 export interface StreamSchema {
   name: string;
   columns: ColumnDef[];
+  source?: Source;
 }
 
 export interface ViewMeta {

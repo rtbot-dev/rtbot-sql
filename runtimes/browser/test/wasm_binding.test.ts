@@ -64,6 +64,63 @@ describe("Real WASM binding — error location fields", () => {
     expect(err.end_column).toBeGreaterThanOrEqual(1);
   });
 
+  it("compileSqlJson surfaces SELECT STREAM source metadata (default scalar)", () => {
+    // No TYPE clause → effective type defaults to scalar; type_clause /
+    // window_clause are omitted (no user-written tokens to span). The
+    // analyzer accepts the omission and emits no diagnostics.
+    const catalogJson = JSON.stringify({
+      streams: {},
+      views: {},
+      tables: {},
+      dictionaries: {},
+    });
+    const json = wasm!.compileSqlJson(
+      'SELECT STREAM system_cpu (cpu DOUBLE, x TEXT) FROM "ignition://{x}/cpu";',
+      catalogJson,
+      1_000_000,
+    );
+    const out = JSON.parse(json);
+    const result = out.results[0];
+    expect(result.errors).toEqual([]);
+    expect(result.statement_type).toBe("SELECT_STREAM");
+    expect(result.stream_schema.name).toBe("system_cpu");
+    expect(result.stream_schema.source).toBeDefined();
+    const src = result.stream_schema.source;
+    expect(src.name).toBe("ignition://{x}/cpu");
+    expect(src.type).toBe("scalar");
+    expect(src.type_clause).toBeUndefined();
+    expect(src.window_clause).toBeUndefined();
+    expect(src.line).toBeGreaterThanOrEqual(1);
+    expect(src.end_column).toBeGreaterThan(src.column);
+  });
+
+  it("compileSqlJson surfaces csv_burst TYPE + WINDOW with token spans", () => {
+    // Explicit TYPE csv_burst + WINDOW yields both clauses with their
+    // own spans. The analyzer requires WINDOW alongside csv_burst, and
+    // forbids it otherwise.
+    const catalogJson = JSON.stringify({
+      streams: {},
+      views: {},
+      tables: {},
+      dictionaries: {},
+    });
+    const json = wasm!.compileSqlJson(
+      'SELECT STREAM vibration (amplitude DOUBLE) FROM "ignition://{x}/burst" TYPE csv_burst WINDOW 20480;',
+      catalogJson,
+      1_000_000,
+    );
+    const out = JSON.parse(json);
+    const result = out.results[0];
+    expect(result.errors).toEqual([]);
+    const src = result.stream_schema.source;
+    expect(src.type).toBe("csv_burst");
+    expect(src.type_clause).toBeDefined();
+    expect(src.type_clause.value).toBe("csv_burst");
+    expect(src.window_clause).toBeDefined();
+    expect(src.window_clause.value).toBe(20480);
+    expect(src.window_clause.end_column).toBeGreaterThan(src.window_clause.column);
+  });
+
   it("compileSqlJson returns end_line / end_column on AST converter errors (BETWEEN)", () => {
     const catalogJson = JSON.stringify({
       streams: {},
