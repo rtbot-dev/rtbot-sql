@@ -914,6 +914,30 @@ CompilationResult compile_sql(const std::string& sql,
   //   * `... FROM "src" WINDOW <not-a-number>` → "WINDOW requires a positive integer"
   //   * `... FROM "src" <non-`;` after metadata>` → "expected `;` after source name"
   //   * Otherwise accepted; source/type/window populated.
+  // `CREATE STREAM` was renamed to `SELECT STREAM`. If the user still types
+  // the old keyword, libpg_query happily parses it as `CREATE TABLE` (via the
+  // normalize_sql rewrite below) and then errors on the FROM clause — which
+  // points at the wrong token. Catch it here and span the `CREATE STREAM`
+  // tokens so the diagnostic lands where the user can act on it.
+  {
+    static const std::regex kCreateStream(
+        R"(\bCREATE(\s+)STREAM\b)", std::regex::icase);
+    std::smatch m;
+    if (std::regex_search(sql, m, kCreateStream)) {
+      auto src = parser::make_source_text(sql);
+      int start_offset = static_cast<int>(m.position(0));
+      int end_offset = start_offset + static_cast<int>(m.length(0));
+      auto start_loc = parser::compute_location(src, start_offset);
+      auto end_loc = parser::compute_location(src, end_offset - 1);
+      CompilationResult r{};
+      r.errors.push_back(
+          {"CREATE STREAM is not recognized",
+           start_loc.line, start_loc.column,
+           end_loc.end_line, end_loc.end_column});
+      return r;
+    }
+  }
+
   std::optional<Source> stream_source;
   {
     static const std::regex kSelectStream(R"(\bSELECT\s+STREAM\b)",

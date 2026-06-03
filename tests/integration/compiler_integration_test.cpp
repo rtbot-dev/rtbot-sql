@@ -1158,6 +1158,29 @@ TEST_F(CompilerIntegrationTest, CreateStreamSourceLocationAbsentWhenNoSource) {
   EXPECT_FALSE(r.stream_schema.source.has_value());
 }
 
+// Old `CREATE STREAM` keyword is rejected up front with a message that names
+// the rename, pointing at the `CREATE STREAM` tokens (not the FROM clause
+// where libpg_query would otherwise choke).
+TEST_F(CompilerIntegrationTest, LegacyCreateStreamRejected) {
+  const std::string sql =
+      R"(CREATE STREAM cpu (cpu_usage DOUBLE) FROM "ignition://[Gateway]")";
+  auto r = compile_sql(sql, catalog);
+
+  ASSERT_TRUE(r.has_errors());
+  EXPECT_NE(r.errors[0].message.find(
+                "CREATE STREAM is not recognized"),
+            std::string::npos);
+  auto create_pos = sql.find("CREATE");
+  ASSERT_NE(create_pos, std::string::npos);
+  auto stream_pos = sql.find("STREAM");
+  ASSERT_NE(stream_pos, std::string::npos);
+  EXPECT_EQ(r.errors[0].line, 1);
+  EXPECT_EQ(r.errors[0].column, static_cast<int>(create_pos) + 1);
+  EXPECT_EQ(r.errors[0].end_line, 1);
+  EXPECT_EQ(r.errors[0].end_column,
+            static_cast<int>(stream_pos) + 1 + 6);  // span ends after STREAM
+}
+
 // FROM keyword present without a quoted source name → semantic error
 // pointing at the FROM token. Caught before libpg_query so the user sees a
 // purposeful message instead of a generic syntax error.
