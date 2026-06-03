@@ -68,7 +68,7 @@ json result_to_json(const CompilationResult& r) {
 
   // Statement type
   static const char* stmt_names[] = {
-      "CREATE_STREAM", "CREATE_VIEW", "CREATE_MATERIALIZED_VIEW",
+      "SELECT_STREAM", "CREATE_VIEW", "CREATE_MATERIALIZED_VIEW",
       "CREATE_TABLE", "INSERT", "SELECT", "SUBSCRIBE", "DROP"};
   j["statement_type"] = stmt_names[static_cast<int>(r.statement_type)];
 
@@ -92,15 +92,42 @@ json result_to_json(const CompilationResult& r) {
 
   // Statement-specific fields
   switch (r.statement_type) {
-    case StatementType::CREATE_STREAM: {
+    case StatementType::SELECT_STREAM: {
       json cols = json::array();
       for (const auto& col : r.stream_schema.columns) {
         cols.push_back({{"name", col.name}, {"index", col.index},
                         {"type", (col.type == ColumnType::TEXT) ? "TEXT" : "DOUBLE"}});
       }
       j["schema"] = cols;
-      if (r.stream_schema.source.has_value())
-        j["source"] = r.stream_schema.source.value();
+      if (r.stream_schema.source.has_value()) {
+        const auto& s = *r.stream_schema.source;
+        json src = {
+            {"name", s.name},
+            {"type", s.effective_type() == SourceType::CSV_BURST
+                          ? "csv_burst"
+                          : "scalar"},
+            {"line", s.line},
+            {"column", s.column},
+            {"end_line", s.end_line},
+            {"end_column", s.end_column}};
+        if (s.type.has_value()) {
+          src["type_clause"] = {
+              {"value", s.type->value == SourceType::CSV_BURST ? "csv_burst"
+                                                                : "scalar"},
+              {"line", s.type->line},
+              {"column", s.type->column},
+              {"end_line", s.type->end_line},
+              {"end_column", s.type->end_column}};
+        }
+        if (s.window.has_value()) {
+          src["window_clause"] = {{"value", s.window->value},
+                                  {"line", s.window->line},
+                                  {"column", s.window->column},
+                                  {"end_line", s.window->end_line},
+                                  {"end_column", s.window->end_column}};
+        }
+        j["source"] = src;
+      }
       break;
     }
     case StatementType::CREATE_TABLE: {

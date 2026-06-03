@@ -259,8 +259,8 @@ CatalogSnapshot catalog_from_json(const std::string& catalog_json) {
 
 std::string statement_type_str(StatementType t) {
   switch (t) {
-    case StatementType::CREATE_STREAM:
-      return "CREATE_STREAM";
+    case StatementType::SELECT_STREAM:
+      return "SELECT_STREAM";
     case StatementType::CREATE_VIEW:
       return "CREATE_VIEW";
     case StatementType::CREATE_MATERIALIZED_VIEW:
@@ -356,8 +356,34 @@ json result_to_json(const CompilationResult& r) {
                     {"type", (c.type == ColumnType::TEXT) ? "TEXT" : "DOUBLE"}});
   }
   schema["columns"] = cols;
-  if (r.stream_schema.source.has_value())
-    schema["source"] = r.stream_schema.source.value();
+  if (r.stream_schema.source.has_value()) {
+    const auto& s = *r.stream_schema.source;
+    json src = {
+        {"name", s.name},
+        {"type", s.effective_type() == SourceType::CSV_BURST ? "csv_burst"
+                                                              : "scalar"},
+        {"line", s.line},
+        {"column", s.column},
+        {"end_line", s.end_line},
+        {"end_column", s.end_column}};
+    if (s.type.has_value()) {
+      src["type_clause"] = {{"value", s.type->value == SourceType::CSV_BURST
+                                          ? "csv_burst"
+                                          : "scalar"},
+                            {"line", s.type->line},
+                            {"column", s.type->column},
+                            {"end_line", s.type->end_line},
+                            {"end_column", s.type->end_column}};
+    }
+    if (s.window.has_value()) {
+      src["window_clause"] = {{"value", s.window->value},
+                              {"line", s.window->line},
+                              {"column", s.window->column},
+                              {"end_line", s.window->end_line},
+                              {"end_column", s.window->end_column}};
+    }
+    schema["source"] = src;
+  }
   j["stream_schema"] = schema;
 
   // table_schema

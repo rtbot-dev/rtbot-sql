@@ -5,7 +5,7 @@ export type ViewType = "SCALAR" | "KEYED" | "TOPK";
 export type EntityType = "STREAM" | "VIEW" | "MATERIALIZED_VIEW" | "TABLE";
 
 export type StatementType =
-  | "CREATE_STREAM"
+  | "SELECT_STREAM"
   | "CREATE_VIEW"
   | "CREATE_MATERIALIZED_VIEW"
   | "CREATE_TABLE"

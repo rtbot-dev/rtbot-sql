@@ -112,7 +112,7 @@ public class RtBotSqlRuntime {
 
     private static final Pattern LIMIT_PATTERN =
             Pattern.compile("\\bLIMIT\\s+(\\d+)\\b", Pattern.CASE_INSENSITIVE);
-    private static final Pattern CREATE_STREAM_PATTERN =
+    private static final Pattern SELECT_STREAM_PATTERN =
             Pattern.compile("^\\s*CREATE\\s+STREAM\\b", Pattern.CASE_INSENSITIVE);
     private static final Pattern DROP_STREAM_PATTERN =
             Pattern.compile("^\\s*DROP\\s+STREAM\\b", Pattern.CASE_INSENSITIVE);
@@ -157,7 +157,7 @@ public class RtBotSqlRuntime {
             }
 
             switch (stType) {
-                case CREATE_STREAM:
+                case SELECT_STREAM:
                     handleCreateStream(result);
                     break;
                 case INSERT:
@@ -845,7 +845,7 @@ public class RtBotSqlRuntime {
      */
     private static String normalizeSql(String sql) {
         String out = sql.strip();
-        out = CREATE_STREAM_PATTERN.matcher(out).replaceFirst("CREATE TABLE");
+        out = SELECT_STREAM_PATTERN.matcher(out).replaceFirst("CREATE TABLE");
         out = DROP_STREAM_PATTERN.matcher(out).replaceFirst("DROP TABLE");
         return out;
     }

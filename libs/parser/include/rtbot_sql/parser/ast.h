@@ -10,7 +10,7 @@
 namespace rtbot_sql::parser::ast {
 
 enum class StmtType {
-  CREATE_STREAM,
+  SELECT_STREAM,
   CREATE_VIEW,
   CREATE_MATERIALIZED_VIEW,
   CREATE_TABLE,
@@ -175,9 +175,57 @@ struct ColumnDefAST {
   SourceLocation loc;
 };
 
+enum class SourceType { SCALAR, CSV_BURST, UNKNOWN };
+
+// The `TYPE <scalar|csv_burst>` clause. `raw` preserves the user-written
+// identifier verbatim — used by the analyzer when emitting "unknown TYPE"
+// diagnostics. `value` is UNKNOWN when `raw` is neither "scalar" nor
+// "csv_burst" (case-insensitive), so the analyzer can flag it. The span
+// covers the value identifier (inclusive start, exclusive end, 1-based).
+struct SourceTypeClause {
+  SourceType value = SourceType::SCALAR;
+  std::string raw;
+  int line = -1;
+  int column = -1;
+  int end_line = -1;
+  int end_column = -1;
+};
+
+// The `WINDOW <int>` clause. Span over the digits.
+struct SourceWindowClause {
+  int value = 0;
+  int line = -1;
+  int column = -1;
+  int end_line = -1;
+  int end_column = -1;
+};
+
+// Metadata for `FROM "..."` on SELECT STREAM. `name` is the unquoted source
+// identifier; `line`/`column`/`end_line`/`end_column` span the `"..."`
+// token (inclusive start, exclusive end, 1-based).
+//
+// `type` and `window` are present only when the user wrote the respective
+// clauses. Validation of their contents — unknown TYPE values, csv_burst
+// requiring WINDOW, WINDOW being valid only with csv_burst — lives in the
+// analyzer (libs/analyzer/src/ddl_analyzer.cpp::analyze_create_stream).
+struct Source {
+  std::string name;
+  int line = -1;
+  int column = -1;
+  int end_line = -1;
+  int end_column = -1;
+  std::optional<SourceTypeClause> type;
+  std::optional<SourceWindowClause> window;
+
+  SourceType effective_type() const {
+    return type.has_value() ? type->value : SourceType::SCALAR;
+  }
+};
+
 struct CreateStreamStmt {
   std::string name;
   std::vector<ColumnDefAST> columns;
+  std::optional<Source> source;
   SourceLocation loc;
 };
 

@@ -35,11 +35,12 @@ namespace {
 
 std::string normalize_sql(const std::string& sql) {
   std::string out = sql;
-  // Strip optional FROM "..." source metadata so pg_query never sees it.
-  // The anchor on ) ensures we only match after a column-list closing paren,
-  // not in SELECT ... FROM clauses.
-  static const std::regex kStreamFrom(R"(\)\s+FROM\s+"[^"]*"\s*;?\s*$)",
-                                      std::regex::icase);
+  // Strip optional FROM "..." [TYPE x] [WINDOW n] source metadata so
+  // pg_query never sees it. The anchor on ) ensures we only match after a
+  // column-list closing paren, not in SELECT ... FROM clauses.
+  static const std::regex kStreamFrom(
+      R"(\)\s+FROM\s+"[^"]*"(?:\s+TYPE\s+\w+)?(?:\s+WINDOW\s+\d+)?\s*;?\s*$)",
+      std::regex::icase);
   out = std::regex_replace(out, kStreamFrom, ")");
   static const std::regex kCreateStream(R"(\bSELECT\s+STREAM\b)",
                                         std::regex::icase);
@@ -427,7 +428,7 @@ CompilationResult compile_select_to_program(
 CompilationResult handle_create_stream(
     const parser::ast::CreateStreamStmt& stmt) {
   CompilationResult result{};
-  result.statement_type = StatementType::CREATE_STREAM;
+  result.statement_type = StatementType::SELECT_STREAM;
   result.entity_name = stmt.name;
 
   StreamSchema schema;
@@ -441,6 +442,7 @@ CompilationResult handle_create_stream(
     schema.columns.push_back(
         {stmt.columns[i].name, static_cast<int>(i), col_type});
   }
+  schema.source = stmt.source;
   result.stream_schema = schema;
   return result;
 }
@@ -903,14 +905,171 @@ CompilationResult handle_drop(const parser::ast::DropStmt& stmt,
 
 CompilationResult compile_sql(const std::string& sql,
                               const CatalogSnapshot& catalog) {
-  // Extract optional FROM "..." source metadata before normalization strips it.
-  std::optional<std::string> stream_source;
+  // Parse the optional FROM "..." [TYPE x] [WINDOW n] source metadata before
+  // normalization strips it. Validation rules:
+  //   * `SELECT STREAM ... ) FROM`            → "FROM requires a quoted source name"
+  //   * `... FROM "<unknown TYPE>`            → "unknown TYPE '...'"
+  //   * `... FROM "src" TYPE csv_burst` (no WINDOW)
+  //                                            → "TYPE csv_burst requires WINDOW"
+  //   * `... FROM "src" WINDOW <not-a-number>` → "WINDOW requires a positive integer"
+  //   * `... FROM "src" <non-`;` after metadata>` → "expected `;` after source name"
+  //   * Otherwise accepted; source/type/window populated.
+  std::optional<Source> stream_source;
   {
-    static const std::regex kStreamFrom(R"re(\)\s+FROM\s+"([^"]*)"\s*;?\s*$)re",
-                                        std::regex::icase);
+    static const std::regex kSelectStream(R"(\bSELECT\s+STREAM\b)",
+                                          std::regex::icase);
+    static const std::regex kStreamFromAnywhere(
+        R"re(\)\s+FROM\s+"([^"]*)")re", std::regex::icase);
+    static const std::regex kBareFrom(R"re(\)\s+(FROM)\b)re",
+                                      std::regex::icase);
+
+    bool is_select_stream = std::regex_search(sql, kSelectStream);
     std::smatch m;
-    if (std::regex_search(sql, m, kStreamFrom)) {
-      stream_source = m[1].str();
+
+    auto make_loc_error = [&](int byte_offset,
+                              const std::string& msg) -> CompilationResult {
+      auto src = parser::make_source_text(sql);
+      auto loc = parser::compute_location(src, byte_offset);
+      CompilationResult r{};
+      r.errors.push_back(
+          {msg, loc.line, loc.column, loc.end_line, loc.end_column});
+      return r;
+    };
+
+    if (is_select_stream && std::regex_search(sql, m, kStreamFromAnywhere)) {
+      Source s;
+      s.name = m[1].str();
+      auto src = parser::make_source_text(sql);
+      // Span the `"..."` token (both quotes) via find_token_end.
+      int quote_offset = static_cast<int>(m.position(1)) - 1;
+      auto loc = parser::compute_location(src, quote_offset);
+      s.line = loc.line;
+      s.column = loc.column;
+      s.end_line = loc.end_line;
+      s.end_column = loc.end_column;
+
+      // Cursor for parsing TYPE and WINDOW clauses after the closing quote.
+      std::size_t i = static_cast<std::size_t>(m.position(0)) +
+                       static_cast<std::size_t>(m.length(0));
+      auto skip_ws = [&]() {
+        while (i < sql.size() &&
+               std::isspace(static_cast<unsigned char>(sql[i])))
+          ++i;
+      };
+      auto match_keyword = [&](const std::string& kw) -> bool {
+        if (i + kw.size() > sql.size()) return false;
+        for (std::size_t k = 0; k < kw.size(); ++k) {
+          if (std::tolower(static_cast<unsigned char>(sql[i + k])) !=
+              std::tolower(static_cast<unsigned char>(kw[k])))
+            return false;
+        }
+        if (i + kw.size() < sql.size()) {
+          unsigned char next =
+              static_cast<unsigned char>(sql[i + kw.size()]);
+          if (std::isalnum(next) || next == '_') return false;
+        }
+        return true;
+      };
+      auto read_word = [&]() -> std::string {
+        std::size_t start = i;
+        while (i < sql.size() &&
+               (std::isalnum(static_cast<unsigned char>(sql[i])) ||
+                sql[i] == '_'))
+          ++i;
+        return sql.substr(start, i - start);
+      };
+
+      skip_ws();
+
+      // Optional TYPE clause.
+      if (match_keyword("TYPE")) {
+        i += 4;
+        skip_ws();
+        std::size_t id_start = i;
+        std::string type_str = read_word();
+        if (type_str.empty()) {
+          return make_loc_error(
+              static_cast<int>(id_start),
+              "SELECT STREAM: TYPE requires a value (scalar or csv_burst)");
+        }
+        std::string type_lower = type_str;
+        std::transform(type_lower.begin(), type_lower.end(),
+                       type_lower.begin(), ::tolower);
+        SourceTypeClause tc;
+        tc.raw = type_str;
+        auto type_loc = parser::compute_location(
+            src, static_cast<int>(id_start));
+        tc.line = type_loc.line;
+        tc.column = type_loc.column;
+        tc.end_line = type_loc.end_line;
+        tc.end_column = type_loc.end_column;
+        if (type_lower == "scalar") {
+          tc.value = SourceType::SCALAR;
+        } else if (type_lower == "csv_burst") {
+          tc.value = SourceType::CSV_BURST;
+        } else {
+          // Preserve the raw identifier; the analyzer will flag UNKNOWN.
+          tc.value = SourceType::UNKNOWN;
+        }
+        s.type = tc;
+        skip_ws();
+        // Reject a second TYPE clause. Span over the duplicate keyword.
+        if (match_keyword("TYPE")) {
+          return make_loc_error(
+              static_cast<int>(i),
+              "SELECT STREAM: duplicate TYPE clause");
+        }
+      }
+
+      // Optional WINDOW clause.
+      if (match_keyword("WINDOW")) {
+        std::size_t window_offset = i;
+        i += 6;
+        skip_ws();
+        std::size_t num_start = i;
+        while (i < sql.size() &&
+               std::isdigit(static_cast<unsigned char>(sql[i])))
+          ++i;
+        if (num_start == i) {
+          return make_loc_error(
+              static_cast<int>(window_offset),
+              "SELECT STREAM: WINDOW requires a positive integer");
+        }
+        SourceWindowClause wc;
+        wc.value = std::stoi(sql.substr(num_start, i - num_start));
+        auto window_loc = parser::compute_location(
+            src, static_cast<int>(num_start));
+        wc.line = window_loc.line;
+        wc.column = window_loc.column;
+        wc.end_line = window_loc.end_line;
+        wc.end_column = window_loc.end_column;
+        s.window = wc;
+        skip_ws();
+        // Reject a second WINDOW clause. Span over the duplicate keyword.
+        if (match_keyword("WINDOW")) {
+          return make_loc_error(
+              static_cast<int>(i),
+              "SELECT STREAM: duplicate WINDOW clause");
+        }
+      }
+
+      // Semantic checks (unknown TYPE, csv_burst↔WINDOW correlation) live
+      // in the analyzer (libs/analyzer/src/ddl_analyzer.cpp).
+
+      // After source / TYPE / WINDOW: first non-whitespace must be `;` or
+      // end-of-input.
+      if (i < sql.size() && sql[i] != ';') {
+        return make_loc_error(
+            static_cast<int>(i),
+            "SELECT STREAM: expected `;` after source name");
+      }
+
+      stream_source = std::move(s);
+    } else if (is_select_stream &&
+               std::regex_search(sql, m, kBareFrom)) {
+      return make_loc_error(
+          static_cast<int>(m.position(1)),
+          "SELECT STREAM: FROM requires a quoted source name");
     }
   }
 
@@ -967,6 +1126,14 @@ CompilationResult compile_sql(const std::string& sql,
   pg_query_free_parse_result(json_result);
   parser::free_result(parse_result);
 
+  // Attach the extracted FROM "..." / TYPE / WINDOW metadata to the AST so
+  // the analyzer can validate it alongside other CREATE STREAM rules.
+  if (stream_source.has_value()) {
+    if (auto* s = std::get_if<parser::ast::CreateStreamStmt>(&stmt)) {
+      s->source = *stream_source;
+    }
+  }
+
   // Step 2.5: Semantic analysis. Returns diagnostics with source locations.
   // If the analyzer reports errors, surface them and short-circuit before
   // compilation runs. As Phase C migrations land, more checks fire here
@@ -995,9 +1162,7 @@ CompilationResult compile_sql(const std::string& sql,
                                   return c.primary_key;
                                 });
       if (has_pk) return handle_create_table(*s);
-      auto result = handle_create_stream(*s);
-      result.stream_schema.source = stream_source;
-      return result;
+      return handle_create_stream(*s);
     }
     if (auto* s = std::get_if<parser::ast::CreateViewStmt>(&stmt)) {
       return handle_create_mat_view(*s, catalog);
@@ -1312,7 +1477,7 @@ namespace {
 void apply_result_to_catalog(CatalogSnapshot& catalog,
                              const CompilationResult& r) {
   switch (r.statement_type) {
-    case StatementType::CREATE_STREAM: {
+    case StatementType::SELECT_STREAM: {
       catalog.streams[r.entity_name] = r.stream_schema;
       break;
     }

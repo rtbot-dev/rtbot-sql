@@ -2357,7 +2357,7 @@ TEST_F(E2eRuntimeTest, ExpandedPassthroughSingleStatement) {
   EXPECT_EQ(expanded.new_ts_units_per_second, -1);
   ASSERT_EQ(expanded.results.size(), 1u);
   EXPECT_FALSE(expanded.results[0].has_errors());
-  EXPECT_EQ(expanded.results[0].statement_type, StatementType::CREATE_STREAM);
+  EXPECT_EQ(expanded.results[0].statement_type, StatementType::SELECT_STREAM);
   EXPECT_EQ(expanded.results[0].entity_name, "sensor");
 }
 
@@ -2382,11 +2382,11 @@ TEST_F(E2eRuntimeTest, ExpandedAlignedStreamProduces7Results) {
   }
 
   // Statement 0: SELECT STREAM vibration (value DOUBLE)
-  EXPECT_EQ(expanded.results[0].statement_type, StatementType::CREATE_STREAM);
+  EXPECT_EQ(expanded.results[0].statement_type, StatementType::SELECT_STREAM);
   EXPECT_EQ(expanded.results[0].entity_name, "vibration");
 
   // Statement 1: SELECT STREAM bearing_temp (value DOUBLE)
-  EXPECT_EQ(expanded.results[1].statement_type, StatementType::CREATE_STREAM);
+  EXPECT_EQ(expanded.results[1].statement_type, StatementType::SELECT_STREAM);
   EXPECT_EQ(expanded.results[1].entity_name, "bearing_temp");
 
   // Statement 2: CREATE VIEW vibration_bin

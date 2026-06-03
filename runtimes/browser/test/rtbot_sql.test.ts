@@ -41,7 +41,7 @@ function wrapExpandedErrors(
     end_column: e.end_column ?? e.column + 1,
   }));
   const result: CompilationResult = {
-    statement_type: "CREATE_STREAM",
+    statement_type: "SELECT_STREAM",
     entity_name: "",
     program_json: "",
     field_map: {},
@@ -75,7 +75,7 @@ function createMockWasm(): RtBotSqlWasmModule {
           index: i,
         }));
         const result: CompilationResult = {
-          statement_type: "CREATE_STREAM",
+          statement_type: "SELECT_STREAM",
           entity_name: name,
           program_json: "",
           field_map: {},
@@ -352,7 +352,7 @@ describe("RtBotSql lifecycle", () => {
       "CREATE STREAM prices (price DOUBLE, volume DOUBLE)",
     );
     expect(createResult.errors).toHaveLength(0);
-    expect(createResult.statement_type).toBe("CREATE_STREAM");
+    expect(createResult.statement_type).toBe("SELECT_STREAM");
 
     // Verify stream was registered
     const schema = rtbotSql.getCatalog().lookupStream("prices");
@@ -665,7 +665,7 @@ describe("RtBotSql SQL INSERT dictionary sync", () => {
             return { name: parts[0], index: i, type: colType };
           });
           return wrapExpanded({
-            statement_type: "CREATE_STREAM",
+            statement_type: "SELECT_STREAM",
             entity_name: name,
             stream_schema: { name, columns: colDefs },
             errors: [],
@@ -727,7 +727,7 @@ describe("CREATE ALIGNED STREAM BIN() sugar syntax catalog", () => {
   /** Build a default CompilationResult with all required fields. */
   function baseResult(overrides: Partial<CompilationResult>): CompilationResult {
     return {
-      statement_type: "CREATE_STREAM",
+      statement_type: "SELECT_STREAM",
       entity_name: "",
       program_json: "",
       field_map: {},
@@ -753,18 +753,18 @@ describe("CREATE ALIGNED STREAM BIN() sugar syntax catalog", () => {
         if (sql === alignedSql) {
           const expanded: ExpandedCompilationResult = {
             results: [
-              // Result 1: CREATE_STREAM for "vibration"
+              // Result 1: SELECT_STREAM for "vibration"
               baseResult({
-                statement_type: "CREATE_STREAM",
+                statement_type: "SELECT_STREAM",
                 entity_name: "vibration",
                 stream_schema: {
                   name: "vibration",
                   columns: [{ name: "value", index: 0 }],
                 },
               }),
-              // Result 2: CREATE_STREAM for "bearing_temp"
+              // Result 2: SELECT_STREAM for "bearing_temp"
               baseResult({
-                statement_type: "CREATE_STREAM",
+                statement_type: "SELECT_STREAM",
                 entity_name: "bearing_temp",
                 stream_schema: {
                   name: "bearing_temp",
@@ -883,7 +883,7 @@ describe("CREATE ALIGNED STREAM BIN() sugar syntax catalog", () => {
         const expanded: ExpandedCompilationResult = {
           results: [
             baseResult({
-              statement_type: "CREATE_STREAM",
+              statement_type: "SELECT_STREAM",
               entity_name: "vibration",
               stream_schema: {
                 name: "vibration",
@@ -891,7 +891,7 @@ describe("CREATE ALIGNED STREAM BIN() sugar syntax catalog", () => {
               },
             }),
             baseResult({
-              statement_type: "CREATE_STREAM",
+              statement_type: "SELECT_STREAM",
               entity_name: "bearing_temp",
               stream_schema: {
                 name: "bearing_temp",

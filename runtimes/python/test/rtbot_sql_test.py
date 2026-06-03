@@ -36,7 +36,7 @@ class CompilerBindingTest(unittest.TestCase):
 
     self.assertIn("results", compilation)
     result = compilation["results"][0]
-    self.assertEqual(result.statement_type, compiler.native.StatementType.CREATE_STREAM)
+    self.assertEqual(result.statement_type, compiler.native.StatementType.SELECT_STREAM)
     self.assertEqual(len(result.errors), 0)
     self.assertEqual(result.entity_name, "trades")
 

@@ -45,6 +45,57 @@ bool is_known_column_type(const std::string& name) {
 void analyze_create_stream(const parser::ast::CreateStreamStmt& stmt,
                            const CatalogSnapshot& /*catalog*/,
                            DiagnosticBag& bag) {
+  // --- SELECT STREAM source metadata (FROM "..." [TYPE …] [WINDOW …]) ---
+  if (stmt.source.has_value()) {
+    const auto& src = *stmt.source;
+
+    // Unknown TYPE value — points at the bad identifier.
+    if (src.type.has_value() &&
+        src.type->value == parser::ast::SourceType::UNKNOWN) {
+      parser::ast::SourceLocation loc;
+      loc.line = src.type->line;
+      loc.column = src.type->column;
+      loc.end_line = src.type->end_line;
+      loc.end_column = src.type->end_column;
+      bag.error(
+          "SELECT STREAM: unknown TYPE '" + src.type->raw +
+              "', expected 'scalar' or 'csv_burst'",
+          loc);
+    } else {
+      // Only run csv_burst↔WINDOW correlation when TYPE is well-defined.
+      // CSV_BURST requires WINDOW.
+      if (src.effective_type() == parser::ast::SourceType::CSV_BURST &&
+          !src.window.has_value()) {
+        parser::ast::SourceLocation loc;
+        loc.line = src.line;
+        loc.column = src.column;
+        loc.end_line = src.end_line;
+        loc.end_column = src.end_column;
+        bag.error("SELECT STREAM: TYPE csv_burst requires WINDOW", loc);
+      }
+      // WINDOW only valid with csv_burst.
+      if (src.window.has_value() &&
+          src.effective_type() != parser::ast::SourceType::CSV_BURST) {
+        parser::ast::SourceLocation loc;
+        loc.line = src.window->line;
+        loc.column = src.window->column;
+        loc.end_line = src.window->end_line;
+        loc.end_column = src.window->end_column;
+        bag.error(
+            "SELECT STREAM: WINDOW is only valid with TYPE csv_burst", loc);
+      }
+      // WINDOW value must be strictly positive.
+      if (src.window.has_value() && src.window->value <= 0) {
+        parser::ast::SourceLocation loc;
+        loc.line = src.window->line;
+        loc.column = src.window->column;
+        loc.end_line = src.window->end_line;
+        loc.end_column = src.window->end_column;
+        bag.error("SELECT STREAM: WINDOW must be a positive integer", loc);
+      }
+    }
+  }
+
   // Composite primary keys are not yet supported. Mirrors the throw at
   // libs/api/src/compiler.cpp:467-468.
   int pk_count = 0;

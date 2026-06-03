@@ -162,7 +162,7 @@ PYBIND11_MODULE(_rtbot_sql_native, m) {
       .value("TABLE", EntityType::TABLE);
 
   py::enum_<StatementType>(m, "StatementType")
-      .value("CREATE_STREAM", StatementType::CREATE_STREAM)
+      .value("SELECT_STREAM", StatementType::SELECT_STREAM)
       .value("CREATE_VIEW", StatementType::CREATE_VIEW)
       .value("CREATE_MATERIALIZED_VIEW",
              StatementType::CREATE_MATERIALIZED_VIEW)

@@ -5,14 +5,24 @@
 #include <string>
 #include <vector>
 
+#include "rtbot_sql/parser/ast.h"
+
 namespace rtbot_sql {
+
+// Source / SourceType / SourceTypeClause / SourceWindowClause live in
+// parser::ast so the AST can carry them on CreateStreamStmt. Re-export here
+// so existing api consumers keep using the bare names.
+using parser::ast::Source;
+using parser::ast::SourceType;
+using parser::ast::SourceTypeClause;
+using parser::ast::SourceWindowClause;
 
 enum class ViewType { SCALAR, KEYED, TOPK };
 
 enum class EntityType { STREAM, VIEW, MATERIALIZED_VIEW, TABLE };
 
 enum class StatementType {
-  CREATE_STREAM,
+  SELECT_STREAM,
   CREATE_VIEW,
   CREATE_MATERIALIZED_VIEW,
   CREATE_TABLE,
@@ -36,7 +46,7 @@ struct ColumnDef {
 struct StreamSchema {
   std::string name;
   std::vector<ColumnDef> columns;
-  std::optional<std::string> source;  // FROM "..." metadata from SELECT STREAM
+  std::optional<Source> source;  // FROM "..." metadata from SELECT STREAM
 
   std::optional<int> column_index(const std::string& col_name) const {
     for (const auto& col : columns) {

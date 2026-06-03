@@ -52,7 +52,7 @@ export class RtBotSql {
     if (expanded.new_ts_units_per_second > 0) {
       this.tsUnitsPerSecond = expanded.new_ts_units_per_second;
       return {
-        statement_type: "CREATE_STREAM",
+        statement_type: "SELECT_STREAM",
         entity_name: "",
         program_json: "",
         field_map: {},
@@ -76,7 +76,7 @@ export class RtBotSql {
       if (result.errors.length > 0) return result;
 
       switch (result.statement_type) {
-        case "CREATE_STREAM":
+        case "SELECT_STREAM":
           this.catalog.registerStream(
             result.entity_name,
             result.stream_schema,
@@ -137,7 +137,7 @@ export class RtBotSql {
 
     // Return last result, or a default empty result if there were no results
     return lastResult ?? {
-      statement_type: "CREATE_STREAM",
+      statement_type: "SELECT_STREAM",
       entity_name: "",
       program_json: "",
       field_map: {},
