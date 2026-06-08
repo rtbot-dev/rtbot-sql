@@ -36,7 +36,7 @@ class CompilerBindingTest(unittest.TestCase):
 
     self.assertIn("results", compilation)
     result = compilation["results"][0]
-    self.assertEqual(result.statement_type, compiler.native.StatementType.SELECT_STREAM)
+    self.assertEqual(result.statement_type, compiler.native.StatementType.CREATE_STREAM)
     self.assertEqual(len(result.errors), 0)
     self.assertEqual(result.entity_name, "trades")
 
@@ -112,7 +112,7 @@ class RuntimeLifecycleTest(unittest.TestCase):
   def test_create_stream_alias(self):
     sql = rtbot_sql.RtBotSql()
 
-    sql.execute("SELECT STREAM ticks (value DOUBLE PRECISION)")
+    sql.execute("CREATE STREAM ticks (value DOUBLE PRECISION)")
     sql.execute("INSERT INTO ticks VALUES (42)")
 
     result = sql.execute("SELECT * FROM ticks LIMIT 1")
@@ -190,7 +190,7 @@ class RuntimeLifecycleTest(unittest.TestCase):
 
     sql = rtbot_sql.RtBotSql()
     sql.execute(
-        "SELECT STREAM trades (price DOUBLE PRECISION, qty DOUBLE PRECISION, "
+        "CREATE STREAM trades (price DOUBLE PRECISION, qty DOUBLE PRECISION, "
         "quote_qty DOUBLE PRECISION, is_buyer_maker DOUBLE PRECISION)"
     )
 
@@ -225,8 +225,8 @@ class RuntimeLifecycleTest(unittest.TestCase):
   def test_multi_from_materialized_view(self):
     sql = rtbot_sql.RtBotSql()
 
-    sql.execute("SELECT STREAM btc (price DOUBLE PRECISION)")
-    sql.execute("SELECT STREAM eth (price DOUBLE PRECISION)")
+    sql.execute("CREATE STREAM btc (price DOUBLE PRECISION)")
+    sql.execute("CREATE STREAM eth (price DOUBLE PRECISION)")
     sql.execute(
         "CREATE MATERIALIZED VIEW cross_stats AS "
         "SELECT b.price AS btc_price, e.price AS eth_price, b.price - e.price AS spread "
@@ -265,8 +265,8 @@ class RuntimeLifecycleTest(unittest.TestCase):
     """
     sql = rtbot_sql.RtBotSql()
 
-    sql.execute("SELECT STREAM btc (price DOUBLE PRECISION)")
-    sql.execute("SELECT STREAM eth (price DOUBLE PRECISION)")
+    sql.execute("CREATE STREAM btc (price DOUBLE PRECISION)")
+    sql.execute("CREATE STREAM eth (price DOUBLE PRECISION)")
 
     sql.insert_dataframe("btc", [{"time": 1000, "price": 100.0}])
     sql.insert_dataframe("eth", [{"time": 1200, "price": 95.0}])
@@ -286,8 +286,8 @@ class RuntimeLifecycleTest(unittest.TestCase):
     """Matching timestamps across streams produce correct combined output."""
     sql = rtbot_sql.RtBotSql()
 
-    sql.execute("SELECT STREAM btc (price DOUBLE PRECISION)")
-    sql.execute("SELECT STREAM eth (price DOUBLE PRECISION)")
+    sql.execute("CREATE STREAM btc (price DOUBLE PRECISION)")
+    sql.execute("CREATE STREAM eth (price DOUBLE PRECISION)")
 
     sql.insert_dataframe("btc", [
         {"time": 1000, "price": 100.0},
@@ -314,7 +314,7 @@ class RuntimeLifecycleTest(unittest.TestCase):
     sql = rtbot_sql.RtBotSql()
     sql.configure_time_format(formatter=lambda ts: ts)
 
-    sql.execute("SELECT STREAM sensors (temperature DOUBLE)")
+    sql.execute("CREATE STREAM sensors (temperature DOUBLE)")
     sql.execute(
         "CREATE MATERIALIZED VIEW stats AS "
         "SELECT temperature, "
@@ -359,7 +359,7 @@ class RuntimeLifecycleTest(unittest.TestCase):
 
   def test_configure_time_format_override(self):
     sql = rtbot_sql.RtBotSql()
-    sql.execute("SELECT STREAM ticks (value DOUBLE PRECISION)")
+    sql.execute("CREATE STREAM ticks (value DOUBLE PRECISION)")
     sql.insert_dataframe("ticks", [{"time": 1700000000000, "value": 1.0}])
 
     sql.configure_time_format(unit="ms", column_name="ts", formatter=lambda ts: ts)
@@ -377,7 +377,7 @@ class ViewStorageTest(unittest.TestCase):
   def test_view_does_not_store_output(self):
     """A CREATE VIEW should not accumulate rows in the stream store."""
     sql = rtbot_sql.RtBotSql()
-    sql.execute("SELECT STREAM trades (instrument_id DOUBLE, price DOUBLE, quantity DOUBLE)")
+    sql.execute("CREATE STREAM trades (instrument_id DOUBLE, price DOUBLE, quantity DOUBLE)")
     sql.execute(
         "CREATE VIEW trade_view AS "
         "SELECT instrument_id, price FROM trades LIMIT 1"
@@ -398,7 +398,7 @@ class ViewStorageTest(unittest.TestCase):
   def test_materialized_view_stores_output(self):
     """A CREATE MATERIALIZED VIEW should accumulate rows in the stream store."""
     sql = rtbot_sql.RtBotSql()
-    sql.execute("SELECT STREAM trades (instrument_id DOUBLE, price DOUBLE, quantity DOUBLE)")
+    sql.execute("CREATE STREAM trades (instrument_id DOUBLE, price DOUBLE, quantity DOUBLE)")
     sql.execute(
         "CREATE MATERIALIZED VIEW trade_stats AS "
         "SELECT instrument_id, SUM(price) AS total_price, COUNT(*) AS cnt "
@@ -419,7 +419,7 @@ class ViewStorageTest(unittest.TestCase):
     while only storing the final materialized output, not the intermediate
     VIEW output."""
     sql = rtbot_sql.RtBotSql()
-    sql.execute("SELECT STREAM trades (instrument_id DOUBLE, price DOUBLE, quantity DOUBLE)")
+    sql.execute("CREATE STREAM trades (instrument_id DOUBLE, price DOUBLE, quantity DOUBLE)")
 
     # Intermediate VIEW: computes a derived column
     sql.execute(
@@ -494,7 +494,7 @@ class CatalogDictionaryTest(unittest.TestCase):
   def test_column_def_preserves_type(self):
     """Python ColumnDef stores TEXT type from C++ compilation."""
     rt = rtbot_sql.RtBotSql()
-    rt.execute("SELECT STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)")
+    rt.execute("CREATE STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)")
     schema = rt._catalog.lookup_stream("sensors")
     self.assertEqual(schema.columns[0].col_type, "DOUBLE")
     self.assertEqual(schema.columns[1].col_type, "TEXT")
@@ -503,7 +503,7 @@ class CatalogDictionaryTest(unittest.TestCase):
   def test_column_def_is_text(self):
     """ColumnDef.is_text helper method."""
     rt = rtbot_sql.RtBotSql()
-    rt.execute("SELECT STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)")
+    rt.execute("CREATE STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)")
     schema = rt._catalog.lookup_stream("sensors")
     self.assertFalse(schema.columns[0].is_text)
     self.assertTrue(schema.columns[1].is_text)
@@ -608,7 +608,7 @@ class CatalogDictionaryStorageTest(unittest.TestCase):
 class InsertMixedTest(unittest.TestCase):
   def test_insert_mixed_encodes_strings(self):
     rt = rtbot_sql.RtBotSql()
-    rt.execute("SELECT STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)")
+    rt.execute("CREATE STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)")
     rt.insert_mixed("sensors", 1000, [1.0, "Bay A", 42.0])
 
     messages = rt._store.read("sensors")
@@ -617,7 +617,7 @@ class InsertMixedTest(unittest.TestCase):
 
   def test_insert_mixed_reuses_existing_ids(self):
     rt = rtbot_sql.RtBotSql()
-    rt.execute("SELECT STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)")
+    rt.execute("CREATE STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)")
     rt.insert_mixed("sensors", 1000, [1.0, "Bay A", 42.0])
     rt.insert_mixed("sensors", 2000, [2.0, "Bay B", 99.0])
     rt.insert_mixed("sensors", 3000, [3.0, "Bay A", 55.0])
@@ -630,13 +630,13 @@ class InsertMixedTest(unittest.TestCase):
 
   def test_insert_mixed_string_into_double_column_raises(self):
     rt = rtbot_sql.RtBotSql()
-    rt.execute("SELECT STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)")
+    rt.execute("CREATE STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)")
     with self.assertRaises(ValueError):
       rt.insert_mixed("sensors", 1000, [1.0, "Bay A", "not a number"])
 
   def test_insert_mixed_double_into_text_column_raises(self):
     rt = rtbot_sql.RtBotSql()
-    rt.execute("SELECT STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)")
+    rt.execute("CREATE STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)")
     with self.assertRaises(ValueError):
       rt.insert_mixed("sensors", 1000, [1.0, 42.0, 42.0])
 
@@ -647,7 +647,7 @@ class InsertMixedTest(unittest.TestCase):
 
   def test_insert_mixed_column_count_mismatch_raises(self):
     rt = rtbot_sql.RtBotSql()
-    rt.execute("SELECT STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)")
+    rt.execute("CREATE STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)")
     with self.assertRaises(ValueError):
       rt.insert_mixed("sensors", 1000, [1.0, "Bay A"])
 
@@ -655,7 +655,7 @@ class InsertMixedTest(unittest.TestCase):
 class DecodeRowTest(unittest.TestCase):
   def test_decode_row_converts_text_columns(self):
     rt = rtbot_sql.RtBotSql()
-    rt.execute("SELECT STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)")
+    rt.execute("CREATE STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)")
     rt.insert_mixed("sensors", 1000, [1.0, "Bay A", 42.0])
     rt.insert_mixed("sensors", 2000, [2.0, "Bay B", 99.0])
 
@@ -674,7 +674,7 @@ class DecodeRowTest(unittest.TestCase):
 
   def test_decode_row_all_double_returns_doubles(self):
     rt = rtbot_sql.RtBotSql()
-    rt.execute("SELECT STREAM prices (price DOUBLE PRECISION, volume DOUBLE PRECISION)")
+    rt.execute("CREATE STREAM prices (price DOUBLE PRECISION, volume DOUBLE PRECISION)")
     rt.execute("INSERT INTO prices VALUES (100.0, 200.0)")
     messages = rt._store.read("prices")
     decoded = rt.decode_row("prices", messages[0].values)
@@ -685,7 +685,7 @@ class SqlInsertDictionarySyncTest(unittest.TestCase):
   def test_sql_insert_syncs_dictionary(self):
     """SQL INSERT with string literal syncs dictionary back to catalog."""
     rt = rtbot_sql.RtBotSql()
-    rt.execute("SELECT STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)")
+    rt.execute("CREATE STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)")
     rt.execute("INSERT INTO sensors VALUES (1, 'Bay A', 42.0)")
 
     d = rt._catalog.lookup_dictionary("sensors.location")
@@ -694,7 +694,7 @@ class SqlInsertDictionarySyncTest(unittest.TestCase):
 
   def test_consecutive_sql_inserts_maintain_dictionary(self):
     rt = rtbot_sql.RtBotSql()
-    rt.execute("SELECT STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)")
+    rt.execute("CREATE STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)")
     rt.execute("INSERT INTO sensors VALUES (1, 'Bay A', 42.0)")
     rt.execute("INSERT INTO sensors VALUES (2, 'Bay B', 99.0)")
     rt.execute("INSERT INTO sensors VALUES (3, 'Bay A', 55.0)")
@@ -713,7 +713,7 @@ class SqlInsertDictionarySyncTest(unittest.TestCase):
   def test_mixed_insert_paths_maintain_coherence(self):
     """insertMixed + SQL INSERT maintain dictionary coherence."""
     rt = rtbot_sql.RtBotSql()
-    rt.execute("SELECT STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)")
+    rt.execute("CREATE STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)")
     rt.insert_mixed("sensors", 1000, [1.0, "Bay A", 42.0])
     rt.execute("INSERT INTO sensors VALUES (2, 'Bay B', 99.0)")
     rt.insert_mixed("sensors", 3000, [3.0, "Bay A", 55.0])
@@ -738,8 +738,8 @@ class AlignedStreamSugarTest(unittest.TestCase):
     The single sugar statement:
       CREATE ALIGNED STREAM input (vibration DOUBLE, bearing_temp DOUBLE) BIN(1s)
     expands to 7 internal statements:
-      SELECT STREAM vibration (value DOUBLE)
-      SELECT STREAM bearing_temp (value DOUBLE)
+      CREATE STREAM vibration (value DOUBLE)
+      CREATE STREAM bearing_temp (value DOUBLE)
       CREATE VIEW vibration_bin AS ... BIN_AVG(vibration, 1s)
       CREATE VIEW bearing_temp_bin AS ... BIN_AVG(bearing_temp, 1s)
       CREATE VIEW vibration_rs AS ... RESAMPLE_CONSTANT + TIMESHIFT

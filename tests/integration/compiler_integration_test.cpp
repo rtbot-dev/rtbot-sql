@@ -24,7 +24,7 @@ class CompilerIntegrationTest : public ::testing::Test {
   CatalogSnapshot catalog;
 };
 
-// --- Test 1: SELECT STREAM ---
+// --- Test 1: CREATE STREAM ---
 
 TEST_F(CompilerIntegrationTest, CreateStream) {
   auto r = compile_sql(
@@ -33,7 +33,7 @@ TEST_F(CompilerIntegrationTest, CreateStream) {
       catalog);
 
   ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
-  EXPECT_EQ(r.statement_type, StatementType::SELECT_STREAM);
+  EXPECT_EQ(r.statement_type, StatementType::CREATE_STREAM);
   EXPECT_EQ(r.entity_name, "orders");
   ASSERT_EQ(r.stream_schema.columns.size(), 3u);
   EXPECT_EQ(r.stream_schema.columns[0].name, "id");
@@ -1042,16 +1042,16 @@ TEST_F(CompilerIntegrationTest, PresetRmsTrendPattern) {
 // --- CreateStreamSyntax: verify that the raw STREAM keyword is accepted ---
 
 TEST_F(CompilerIntegrationTest, CreateStreamSyntax) {
-  // compile_sql must normalize "SELECT STREAM" → "CREATE TABLE" internally
+  // compile_sql must normalize "CREATE STREAM" → "CREATE TABLE" internally
   // before handing the SQL to libpg_query.  Pass the raw keyword directly
-  // (no external normalization) and assert the result is a SELECT_STREAM.
+  // (no external normalization) and assert the result is a CREATE_STREAM.
   auto r = compile_sql(
-      "SELECT STREAM orders (id DOUBLE PRECISION, price DOUBLE PRECISION, "
+      "CREATE STREAM orders (id DOUBLE PRECISION, price DOUBLE PRECISION, "
       "quantity DOUBLE PRECISION)",
       catalog);
 
   ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
-  EXPECT_EQ(r.statement_type, StatementType::SELECT_STREAM);
+  EXPECT_EQ(r.statement_type, StatementType::CREATE_STREAM);
   EXPECT_EQ(r.entity_name, "orders");
   ASSERT_EQ(r.stream_schema.columns.size(), 3u);
   EXPECT_EQ(r.stream_schema.columns[0].name, "id");
@@ -1065,11 +1065,11 @@ TEST_F(CompilerIntegrationTest, CreateStreamSyntax) {
 
 TEST_F(CompilerIntegrationTest, CreateStreamWithSource) {
   const std::string sql =
-      R"(SELECT STREAM system_cpu(cpu DOUBLE, x TEXT) FROM "abcdeg")";
+      R"(CREATE STREAM system_cpu(cpu DOUBLE, x TEXT) FROM "abcdeg")";
   auto r = compile_sql(sql, catalog);
 
   ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
-  EXPECT_EQ(r.statement_type, StatementType::SELECT_STREAM);
+  EXPECT_EQ(r.statement_type, StatementType::CREATE_STREAM);
   EXPECT_EQ(r.entity_name, "system_cpu");
   ASSERT_EQ(r.stream_schema.columns.size(), 2u);
   ASSERT_TRUE(r.stream_schema.source.has_value());
@@ -1087,7 +1087,7 @@ TEST_F(CompilerIntegrationTest, CreateStreamWithSource) {
 
 TEST_F(CompilerIntegrationTest, CreateStreamWithSourceCaseInsensitive) {
   const std::string sql =
-      R"(SELECT STREAM system_cpu(cpu DOUBLE, x TEXT) from "my-source")";
+      R"(CREATE STREAM system_cpu(cpu DOUBLE, x TEXT) from "my-source")";
   auto r = compile_sql(sql, catalog);
 
   ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
@@ -1108,7 +1108,7 @@ TEST_F(CompilerIntegrationTest, CreateStreamWithSourceCaseInsensitive) {
 // (line ≠ 1, end_line ≠ 1) and the column resets to 1-based on that line.
 TEST_F(CompilerIntegrationTest, CreateStreamSourceLocationMultiLine) {
   const std::string sql =
-      "SELECT STREAM system_cpu(cpu DOUBLE)\n"
+      "CREATE STREAM system_cpu(cpu DOUBLE)\n"
       "FROM \"line-two\"";
   auto r = compile_sql(sql, catalog);
 
@@ -1128,7 +1128,7 @@ TEST_F(CompilerIntegrationTest, CreateStreamSourceLocationMultiLine) {
 // "..." token (including the closing quote) is captured.
 TEST_F(CompilerIntegrationTest, CreateStreamSourceLocationCoversInternalSpaces) {
   const std::string sql =
-      R"(SELECT STREAM s(x DOUBLE) FROM "two words")";
+      R"(CREATE STREAM s(x DOUBLE) FROM "two words")";
   auto r = compile_sql(sql, catalog);
 
   ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
@@ -1152,45 +1152,22 @@ TEST_F(CompilerIntegrationTest, CreateStreamSourceLocationCoversInternalSpaces) 
 // When the statement has no `FROM "..."` clause, the source is absent and
 // every location field stays at its -1 default.
 TEST_F(CompilerIntegrationTest, CreateStreamSourceLocationAbsentWhenNoSource) {
-  auto r = compile_sql("SELECT STREAM system_cpu(cpu DOUBLE)", catalog);
+  auto r = compile_sql("CREATE STREAM system_cpu(cpu DOUBLE)", catalog);
 
   ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
   EXPECT_FALSE(r.stream_schema.source.has_value());
-}
-
-// Old `CREATE STREAM` keyword is rejected up front with a message that names
-// the rename, pointing at the `CREATE STREAM` tokens (not the FROM clause
-// where libpg_query would otherwise choke).
-TEST_F(CompilerIntegrationTest, LegacyCreateStreamRejected) {
-  const std::string sql =
-      R"(CREATE STREAM cpu (cpu_usage DOUBLE) FROM "ignition://[Gateway]")";
-  auto r = compile_sql(sql, catalog);
-
-  ASSERT_TRUE(r.has_errors());
-  EXPECT_NE(r.errors[0].message.find(
-                "CREATE STREAM is not recognized"),
-            std::string::npos);
-  auto create_pos = sql.find("CREATE");
-  ASSERT_NE(create_pos, std::string::npos);
-  auto stream_pos = sql.find("STREAM");
-  ASSERT_NE(stream_pos, std::string::npos);
-  EXPECT_EQ(r.errors[0].line, 1);
-  EXPECT_EQ(r.errors[0].column, static_cast<int>(create_pos) + 1);
-  EXPECT_EQ(r.errors[0].end_line, 1);
-  EXPECT_EQ(r.errors[0].end_column,
-            static_cast<int>(stream_pos) + 1 + 6);  // span ends after STREAM
 }
 
 // FROM keyword present without a quoted source name → semantic error
 // pointing at the FROM token. Caught before libpg_query so the user sees a
 // purposeful message instead of a generic syntax error.
 TEST_F(CompilerIntegrationTest, CreateStreamBareFromRejected) {
-  const std::string sql = "SELECT STREAM system_cpu(cpu DOUBLE) FROM";
+  const std::string sql = "CREATE STREAM system_cpu(cpu DOUBLE) FROM";
   auto r = compile_sql(sql, catalog);
 
   ASSERT_TRUE(r.has_errors());
   EXPECT_NE(r.errors[0].message.find(
-                "SELECT STREAM: FROM requires a quoted source name"),
+                "CREATE STREAM: FROM requires a quoted source name"),
             std::string::npos);
   auto from_pos = sql.find("FROM");
   ASSERT_NE(from_pos, std::string::npos);
@@ -1203,12 +1180,12 @@ TEST_F(CompilerIntegrationTest, CreateStreamBareFromRejected) {
 // FROM followed by an unquoted identifier — also rejected; the rule is "a
 // quoted source name", not "any source name".
 TEST_F(CompilerIntegrationTest, CreateStreamFromUnquotedSourceRejected) {
-  auto r = compile_sql("SELECT STREAM s(x DOUBLE) FROM unquoted_name",
+  auto r = compile_sql("CREATE STREAM s(x DOUBLE) FROM unquoted_name",
                        catalog);
 
   ASSERT_TRUE(r.has_errors());
   EXPECT_NE(r.errors[0].message.find(
-                "SELECT STREAM: FROM requires a quoted source name"),
+                "CREATE STREAM: FROM requires a quoted source name"),
             std::string::npos);
 }
 
@@ -1216,12 +1193,12 @@ TEST_F(CompilerIntegrationTest, CreateStreamFromUnquotedSourceRejected) {
 // pointing at the unexpected content (the `S` of the following SELECT).
 TEST_F(CompilerIntegrationTest, CreateStreamMissingSemiBeforeNextStatement) {
   const std::string sql =
-      R"(SELECT STREAM s(x DOUBLE) FROM "abc" SELECT * FROM trades)";
+      R"(CREATE STREAM s(x DOUBLE) FROM "abc" SELECT * FROM trades)";
   auto r = compile_sql(sql, catalog);
 
   ASSERT_TRUE(r.has_errors());
   EXPECT_NE(r.errors[0].message.find(
-                "SELECT STREAM: expected `;` after source name"),
+                "CREATE STREAM: expected `;` after source name"),
             std::string::npos);
   // Points at the `S` of `SELECT` that follows the source. Token = `SELECT`
   // (6 chars), so end_column = start + 6.
@@ -1238,7 +1215,7 @@ TEST_F(CompilerIntegrationTest, CreateStreamMissingSemiBeforeNextStatement) {
 // Trailing whitespace alone (no next statement) is allowed.
 TEST_F(CompilerIntegrationTest, CreateStreamTrailingWhitespaceAccepted) {
   auto r = compile_sql(
-      R"(SELECT STREAM s(x DOUBLE) FROM "abc"   )", catalog);
+      R"(CREATE STREAM s(x DOUBLE) FROM "abc"   )", catalog);
   ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
   ASSERT_TRUE(r.stream_schema.source.has_value());
   EXPECT_EQ(r.stream_schema.source->name, "abc");
@@ -1248,7 +1225,7 @@ TEST_F(CompilerIntegrationTest, CreateStreamTrailingWhitespaceAccepted) {
 // statement satisfies the rule — accepted at this layer.
 TEST_F(CompilerIntegrationTest, CreateStreamSemiBeforeNextStatementAccepted) {
   auto r = compile_sql(
-      R"(SELECT STREAM s(x DOUBLE) FROM "abc"   ;   )", catalog);
+      R"(CREATE STREAM s(x DOUBLE) FROM "abc"   ;   )", catalog);
   ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
   ASSERT_TRUE(r.stream_schema.source.has_value());
   EXPECT_EQ(r.stream_schema.source->name, "abc");
@@ -1260,7 +1237,7 @@ TEST_F(CompilerIntegrationTest, CreateStreamSemiBeforeNextStatementAccepted) {
 
 // No TYPE clause → effective_type defaults to SCALAR, window absent.
 TEST_F(CompilerIntegrationTest, CreateStreamSourceTypeDefaultsToScalar) {
-  auto r = compile_sql(R"(SELECT STREAM s(x DOUBLE) FROM "abc")", catalog);
+  auto r = compile_sql(R"(CREATE STREAM s(x DOUBLE) FROM "abc")", catalog);
   ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
   ASSERT_TRUE(r.stream_schema.source.has_value());
   EXPECT_FALSE(r.stream_schema.source->type.has_value());
@@ -1271,7 +1248,7 @@ TEST_F(CompilerIntegrationTest, CreateStreamSourceTypeDefaultsToScalar) {
 // Explicit TYPE scalar is accepted.
 TEST_F(CompilerIntegrationTest, CreateStreamSourceTypeScalarExplicit) {
   auto r = compile_sql(
-      R"(SELECT STREAM s(x DOUBLE) FROM "abc" TYPE scalar)", catalog);
+      R"(CREATE STREAM s(x DOUBLE) FROM "abc" TYPE scalar)", catalog);
   ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
   ASSERT_TRUE(r.stream_schema.source.has_value());
   ASSERT_TRUE(r.stream_schema.source->type.has_value());
@@ -1281,7 +1258,7 @@ TEST_F(CompilerIntegrationTest, CreateStreamSourceTypeScalarExplicit) {
 // TYPE csv_burst with WINDOW: both fields populated; window is 100.
 TEST_F(CompilerIntegrationTest, CreateStreamSourceCsvBurstWithWindow) {
   auto r = compile_sql(
-      R"(SELECT STREAM s(x DOUBLE) FROM "abc" TYPE csv_burst WINDOW 100)",
+      R"(CREATE STREAM s(x DOUBLE) FROM "abc" TYPE csv_burst WINDOW 100)",
       catalog);
   ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
   ASSERT_TRUE(r.stream_schema.source.has_value());
@@ -1294,7 +1271,7 @@ TEST_F(CompilerIntegrationTest, CreateStreamSourceCsvBurstWithWindow) {
 // TYPE/WINDOW keywords are case-insensitive (consistent with SQL).
 TEST_F(CompilerIntegrationTest, CreateStreamSourceTypeWindowCaseInsensitive) {
   auto r = compile_sql(
-      R"(SELECT STREAM s(x DOUBLE) FROM "abc" type CSV_BURST window 42)",
+      R"(CREATE STREAM s(x DOUBLE) FROM "abc" type CSV_BURST window 42)",
       catalog);
   ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
   ASSERT_TRUE(r.stream_schema.source.has_value());
@@ -1308,11 +1285,11 @@ TEST_F(CompilerIntegrationTest, CreateStreamSourceTypeWindowCaseInsensitive) {
 // belongs to).
 TEST_F(CompilerIntegrationTest, CreateStreamSourceCsvBurstRequiresWindow) {
   const std::string sql =
-      R"(SELECT STREAM s(x DOUBLE) FROM "abc" TYPE csv_burst)";
+      R"(CREATE STREAM s(x DOUBLE) FROM "abc" TYPE csv_burst)";
   auto r = compile_sql(sql, catalog);
   ASSERT_TRUE(r.has_errors());
   EXPECT_NE(r.errors[0].message.find(
-                "SELECT STREAM: TYPE csv_burst requires WINDOW"),
+                "CREATE STREAM: TYPE csv_burst requires WINDOW"),
             std::string::npos);
   auto quote_pos = sql.find('"');
   ASSERT_NE(quote_pos, std::string::npos);
@@ -1326,7 +1303,7 @@ TEST_F(CompilerIntegrationTest, CreateStreamSourceCsvBurstRequiresWindow) {
 // Unknown TYPE value → semantic error.
 TEST_F(CompilerIntegrationTest, CreateStreamSourceUnknownTypeRejected) {
   auto r = compile_sql(
-      R"(SELECT STREAM s(x DOUBLE) FROM "abc" TYPE binary)", catalog);
+      R"(CREATE STREAM s(x DOUBLE) FROM "abc" TYPE binary)", catalog);
   ASSERT_TRUE(r.has_errors());
   EXPECT_NE(r.errors[0].message.find("unknown TYPE 'binary'"),
             std::string::npos);
@@ -1335,7 +1312,7 @@ TEST_F(CompilerIntegrationTest, CreateStreamSourceUnknownTypeRejected) {
 // WINDOW without an integer value → semantic error.
 TEST_F(CompilerIntegrationTest, CreateStreamSourceWindowMissingNumber) {
   auto r = compile_sql(
-      R"(SELECT STREAM s(x DOUBLE) FROM "abc" TYPE csv_burst WINDOW foo)",
+      R"(CREATE STREAM s(x DOUBLE) FROM "abc" TYPE csv_burst WINDOW foo)",
       catalog);
   ASSERT_TRUE(r.has_errors());
   EXPECT_NE(r.errors[0].message.find(
@@ -1348,7 +1325,7 @@ TEST_F(CompilerIntegrationTest, CreateStreamSourceWindowMissingNumber) {
 // editors can flag the dead clause.
 TEST_F(CompilerIntegrationTest, CreateStreamSourceWindowRejectedForScalar) {
   const std::string sql =
-      R"(SELECT STREAM s(x DOUBLE) FROM "abc" WINDOW 50)";
+      R"(CREATE STREAM s(x DOUBLE) FROM "abc" WINDOW 50)";
   auto r = compile_sql(sql, catalog);
   ASSERT_TRUE(r.has_errors());
   EXPECT_NE(r.errors[0].message.find(
@@ -1367,7 +1344,7 @@ TEST_F(CompilerIntegrationTest, CreateStreamSourceWindowRejectedForScalar) {
 TEST_F(CompilerIntegrationTest,
        CreateStreamSourceWindowRejectedForExplicitScalar) {
   const std::string sql =
-      R"(SELECT STREAM s(x DOUBLE) FROM "abc" TYPE scalar WINDOW 50)";
+      R"(CREATE STREAM s(x DOUBLE) FROM "abc" TYPE scalar WINDOW 50)";
   auto r = compile_sql(sql, catalog);
   ASSERT_TRUE(r.has_errors());
   EXPECT_NE(r.errors[0].message.find(
@@ -1384,7 +1361,7 @@ TEST_F(CompilerIntegrationTest,
 // Trailing `;` after TYPE/WINDOW metadata is still accepted.
 TEST_F(CompilerIntegrationTest, CreateStreamSourceMetadataThenSemiAccepted) {
   auto r = compile_sql(
-      R"(SELECT STREAM s(x DOUBLE) FROM "abc" TYPE csv_burst WINDOW 100;)",
+      R"(CREATE STREAM s(x DOUBLE) FROM "abc" TYPE csv_burst WINDOW 100;)",
       catalog);
   ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
   ASSERT_TRUE(r.stream_schema.source.has_value());
@@ -1397,7 +1374,7 @@ TEST_F(CompilerIntegrationTest, CreateStreamSourceMetadataThenSemiAccepted) {
 // clause written, so the terminator goes there.
 TEST_F(CompilerIntegrationTest, CreateStreamSemiAfterTypeAccepted) {
   auto r = compile_sql(
-      R"(SELECT STREAM s(x DOUBLE) FROM "abc" TYPE scalar;)", catalog);
+      R"(CREATE STREAM s(x DOUBLE) FROM "abc" TYPE scalar;)", catalog);
   ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
   ASSERT_TRUE(r.stream_schema.source.has_value());
   ASSERT_TRUE(r.stream_schema.source->type.has_value());
@@ -1408,7 +1385,7 @@ TEST_F(CompilerIntegrationTest, CreateStreamSemiAfterTypeAccepted) {
 // `;` directly after WINDOW value (no whitespace) is accepted.
 TEST_F(CompilerIntegrationTest, CreateStreamSemiDirectlyAfterWindowAccepted) {
   auto r = compile_sql(
-      R"(SELECT STREAM s(x DOUBLE) FROM "abc" TYPE csv_burst WINDOW 100;)",
+      R"(CREATE STREAM s(x DOUBLE) FROM "abc" TYPE csv_burst WINDOW 100;)",
       catalog);
   ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
   ASSERT_TRUE(r.stream_schema.source->window.has_value());
@@ -1420,11 +1397,11 @@ TEST_F(CompilerIntegrationTest, CreateStreamSemiDirectlyAfterWindowAccepted) {
 // past TYPE. Span points at the next non-whitespace token after TYPE.
 TEST_F(CompilerIntegrationTest, CreateStreamGarbageAfterTypeRejected) {
   const std::string sql =
-      R"(SELECT STREAM s(x DOUBLE) FROM "abc" TYPE scalar garbage)";
+      R"(CREATE STREAM s(x DOUBLE) FROM "abc" TYPE scalar garbage)";
   auto r = compile_sql(sql, catalog);
   ASSERT_TRUE(r.has_errors());
   EXPECT_NE(r.errors[0].message.find(
-                "SELECT STREAM: expected `;` after source name"),
+                "CREATE STREAM: expected `;` after source name"),
             std::string::npos);
   auto bad_pos = sql.find("garbage");
   ASSERT_NE(bad_pos, std::string::npos);
@@ -1437,11 +1414,11 @@ TEST_F(CompilerIntegrationTest, CreateStreamGarbageAfterTypeRejected) {
 // Only one TYPE clause is allowed. Span over the duplicate keyword.
 TEST_F(CompilerIntegrationTest, CreateStreamDuplicateTypeRejected) {
   const std::string sql =
-      R"(SELECT STREAM s(x DOUBLE) FROM "abc" TYPE scalar TYPE csv_burst)";
+      R"(CREATE STREAM s(x DOUBLE) FROM "abc" TYPE scalar TYPE csv_burst)";
   auto r = compile_sql(sql, catalog);
   ASSERT_TRUE(r.has_errors());
   EXPECT_NE(r.errors[0].message.find(
-                "SELECT STREAM: duplicate TYPE clause"),
+                "CREATE STREAM: duplicate TYPE clause"),
             std::string::npos);
   // The duplicate `TYPE` is the second occurrence (4 chars).
   auto first_type = sql.find("TYPE");
@@ -1456,11 +1433,11 @@ TEST_F(CompilerIntegrationTest, CreateStreamDuplicateTypeRejected) {
 // Only one WINDOW clause is allowed. Span over the duplicate keyword.
 TEST_F(CompilerIntegrationTest, CreateStreamDuplicateWindowRejected) {
   const std::string sql =
-      R"(SELECT STREAM s(x DOUBLE) FROM "abc" TYPE csv_burst WINDOW 100 WINDOW 200)";
+      R"(CREATE STREAM s(x DOUBLE) FROM "abc" TYPE csv_burst WINDOW 100 WINDOW 200)";
   auto r = compile_sql(sql, catalog);
   ASSERT_TRUE(r.has_errors());
   EXPECT_NE(r.errors[0].message.find(
-                "SELECT STREAM: duplicate WINDOW clause"),
+                "CREATE STREAM: duplicate WINDOW clause"),
             std::string::npos);
   auto first_win = sql.find("WINDOW");
   auto dup_pos = sql.find("WINDOW", first_win + 1);
@@ -1475,11 +1452,11 @@ TEST_F(CompilerIntegrationTest, CreateStreamDuplicateWindowRejected) {
 // over the digit.
 TEST_F(CompilerIntegrationTest, CreateStreamWindowZeroRejected) {
   const std::string sql =
-      R"(SELECT STREAM s(x DOUBLE) FROM "abc" TYPE csv_burst WINDOW 0)";
+      R"(CREATE STREAM s(x DOUBLE) FROM "abc" TYPE csv_burst WINDOW 0)";
   auto r = compile_sql(sql, catalog);
   ASSERT_TRUE(r.has_errors());
   EXPECT_NE(r.errors[0].message.find(
-                "SELECT STREAM: WINDOW must be a positive integer"),
+                "CREATE STREAM: WINDOW must be a positive integer"),
             std::string::npos);
   auto zero_pos = sql.find_last_of('0');
   ASSERT_NE(zero_pos, std::string::npos);
@@ -1493,11 +1470,11 @@ TEST_F(CompilerIntegrationTest, CreateStreamWindowZeroRejected) {
 // token. Cursor has advanced past WINDOW <num>; span over the next token.
 TEST_F(CompilerIntegrationTest, CreateStreamGarbageAfterWindowRejected) {
   const std::string sql =
-      R"(SELECT STREAM s(x DOUBLE) FROM "abc" TYPE csv_burst WINDOW 100 garbage)";
+      R"(CREATE STREAM s(x DOUBLE) FROM "abc" TYPE csv_burst WINDOW 100 garbage)";
   auto r = compile_sql(sql, catalog);
   ASSERT_TRUE(r.has_errors());
   EXPECT_NE(r.errors[0].message.find(
-                "SELECT STREAM: expected `;` after source name"),
+                "CREATE STREAM: expected `;` after source name"),
             std::string::npos);
   auto bad_pos = sql.find("garbage");
   ASSERT_NE(bad_pos, std::string::npos);
@@ -1510,11 +1487,11 @@ TEST_F(CompilerIntegrationTest, CreateStreamGarbageAfterWindowRejected) {
 // Non-`;` content after TYPE/WINDOW metadata → "expected `;`" error.
 TEST_F(CompilerIntegrationTest, CreateStreamMissingSemiAfterMetadata) {
   auto r = compile_sql(
-      R"(SELECT STREAM s(x DOUBLE) FROM "abc" TYPE csv_burst WINDOW 100 SELECT *)",
+      R"(CREATE STREAM s(x DOUBLE) FROM "abc" TYPE csv_burst WINDOW 100 SELECT *)",
       catalog);
   ASSERT_TRUE(r.has_errors());
   EXPECT_NE(r.errors[0].message.find(
-                "SELECT STREAM: expected `;` after source name"),
+                "CREATE STREAM: expected `;` after source name"),
             std::string::npos);
 }
 
@@ -1522,7 +1499,7 @@ TEST_F(CompilerIntegrationTest, CreateStreamMissingSemiAfterMetadata) {
 // identifier exactly. WINDOW value token gets its own span over the digits.
 TEST_F(CompilerIntegrationTest, CreateStreamTypeAndWindowSpans) {
   const std::string sql =
-      R"(SELECT STREAM s(x DOUBLE) FROM "abc" TYPE csv_burst WINDOW 100)";
+      R"(CREATE STREAM s(x DOUBLE) FROM "abc" TYPE csv_burst WINDOW 100)";
   auto r = compile_sql(sql, catalog);
   ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
   ASSERT_TRUE(r.stream_schema.source.has_value());
@@ -1549,7 +1526,7 @@ TEST_F(CompilerIntegrationTest, CreateStreamTypeAndWindowSpans) {
 
 // When TYPE/WINDOW clauses are absent, the optional clauses are nullopt.
 TEST_F(CompilerIntegrationTest, CreateStreamTypeWindowSpansAbsentByDefault) {
-  auto r = compile_sql(R"(SELECT STREAM s(x DOUBLE) FROM "abc")", catalog);
+  auto r = compile_sql(R"(CREATE STREAM s(x DOUBLE) FROM "abc")", catalog);
   ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
   ASSERT_TRUE(r.stream_schema.source.has_value());
   EXPECT_FALSE(r.stream_schema.source->type.has_value());
@@ -1560,7 +1537,7 @@ TEST_F(CompilerIntegrationTest, CreateStreamTypeWindowSpansAbsentByDefault) {
 // identifier — editors can underline the bad token directly.
 TEST_F(CompilerIntegrationTest, CreateStreamUnknownTypeSpansIdentifier) {
   const std::string sql =
-      R"(SELECT STREAM s(x DOUBLE) FROM "abc" TYPE binary)";
+      R"(CREATE STREAM s(x DOUBLE) FROM "abc" TYPE binary)";
   auto r = compile_sql(sql, catalog);
   ASSERT_TRUE(r.has_errors());
   EXPECT_NE(r.errors[0].message.find("unknown TYPE 'binary'"),
@@ -1582,11 +1559,11 @@ TEST_F(CompilerIntegrationTest, CreateStreamMultiple) {
   CatalogSnapshot session;
 
   auto r1 = compile_sql_expanded(
-      R"(SELECT STREAM system_cpu(cpu DOUBLE, x TEXT) FROM "Aleluya";)",
+      R"(CREATE STREAM system_cpu(cpu DOUBLE, x TEXT) FROM "Aleluya";)",
       session, 1000);
   ASSERT_EQ(r1.results.size(), 1u);
   ASSERT_FALSE(r1.results[0].has_errors()) << r1.results[0].errors[0].message;
-  EXPECT_EQ(r1.results[0].statement_type, StatementType::SELECT_STREAM);
+  EXPECT_EQ(r1.results[0].statement_type, StatementType::CREATE_STREAM);
   EXPECT_EQ(r1.results[0].entity_name, "system_cpu");
   ASSERT_EQ(r1.results[0].stream_schema.columns.size(), 2u);
   EXPECT_EQ(r1.results[0].stream_schema.columns[0].name, "cpu");
@@ -1598,11 +1575,11 @@ TEST_F(CompilerIntegrationTest, CreateStreamMultiple) {
   session.streams["system_cpu"] = r1.results[0].stream_schema;
 
   auto r2 = compile_sql_expanded(
-      R"(SELECT STREAM system_memory(memory DOUBLE) FROM "Maria Morena";)",
+      R"(CREATE STREAM system_memory(memory DOUBLE) FROM "Maria Morena";)",
       session, 1000);
   ASSERT_EQ(r2.results.size(), 1u);
   ASSERT_FALSE(r2.results[0].has_errors()) << r2.results[0].errors[0].message;
-  EXPECT_EQ(r2.results[0].statement_type, StatementType::SELECT_STREAM);
+  EXPECT_EQ(r2.results[0].statement_type, StatementType::CREATE_STREAM);
   EXPECT_EQ(r2.results[0].entity_name, "system_memory");
   ASSERT_EQ(r2.results[0].stream_schema.columns.size(), 1u);
   EXPECT_EQ(r2.results[0].stream_schema.columns[0].name, "memory");
@@ -1612,11 +1589,11 @@ TEST_F(CompilerIntegrationTest, CreateStreamMultiple) {
   session.streams["system_memory"] = r2.results[0].stream_schema;
 
   auto r3 = compile_sql_expanded(
-      "SELECT STREAM system_decay(cpu DOUBLE, x TEXT);",
+      "CREATE STREAM system_decay(cpu DOUBLE, x TEXT);",
       session, 1000);
   ASSERT_EQ(r3.results.size(), 1u);
   ASSERT_FALSE(r3.results[0].has_errors()) << r3.results[0].errors[0].message;
-  EXPECT_EQ(r3.results[0].statement_type, StatementType::SELECT_STREAM);
+  EXPECT_EQ(r3.results[0].statement_type, StatementType::CREATE_STREAM);
   EXPECT_EQ(r3.results[0].entity_name, "system_decay");
   ASSERT_EQ(r3.results[0].stream_schema.columns.size(), 2u);
   EXPECT_FALSE(r3.results[0].stream_schema.source.has_value());

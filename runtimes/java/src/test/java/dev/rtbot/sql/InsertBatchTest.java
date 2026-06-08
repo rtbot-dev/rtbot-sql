@@ -68,7 +68,7 @@ public class InsertBatchTest {
 
     @Test
     public void encodeTextReturnsSameValueForSameString() {
-        runtime.execute("SELECT STREAM sensors (device_id TEXT, value DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM sensors (device_id TEXT, value DOUBLE PRECISION)");
 
         double id1 = runtime.encodeText("sensors", "device_id", "Pump-01");
         double id2 = runtime.encodeText("sensors", "device_id", "Pump-01");
@@ -82,7 +82,7 @@ public class InsertBatchTest {
 
     @Test
     public void encodeTextReturnsDifferentValuesForDifferentStrings() {
-        runtime.execute("SELECT STREAM sensors (device_id TEXT, value DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM sensors (device_id TEXT, value DOUBLE PRECISION)");
 
         double id1 = runtime.encodeText("sensors", "device_id", "Pump-01");
         double id2 = runtime.encodeText("sensors", "device_id", "Pump-02");
@@ -98,7 +98,7 @@ public class InsertBatchTest {
 
     @Test
     public void encodeTextAcrossColumnsIsIndependent() {
-        runtime.execute("SELECT STREAM sensors (device_id TEXT, location TEXT, value DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM sensors (device_id TEXT, location TEXT, value DOUBLE PRECISION)");
 
         // Same string encoded for different columns should use separate dictionaries
         double devId = runtime.encodeText("sensors", "device_id", "alpha");
@@ -117,7 +117,7 @@ public class InsertBatchTest {
 
     @Test
     public void insertBatchWithPreEncodedTextProducesCorrectOutput() {
-        runtime.execute("SELECT STREAM readings (device_id TEXT, amplitude DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM readings (device_id TEXT, amplitude DOUBLE PRECISION)");
         runtime.execute(
             "CREATE MATERIALIZED VIEW device_avg AS "
             + "SELECT device_id, AVG(amplitude) AS avg_amp "
@@ -155,7 +155,7 @@ public class InsertBatchTest {
         RtBotSqlRuntime runtimeA = new RtBotSqlRuntime();
         runtimeA.setCollectMode(true);
         try {
-            runtimeA.execute("SELECT STREAM data (device_id TEXT, value DOUBLE PRECISION)");
+            runtimeA.execute("CREATE STREAM data (device_id TEXT, value DOUBLE PRECISION)");
             runtimeA.execute(
                 "CREATE MATERIALIZED VIEW doubled AS "
                 + "SELECT device_id, value * 2 AS doubled_value FROM data"
@@ -173,7 +173,7 @@ public class InsertBatchTest {
             RtBotSqlRuntime runtimeB = new RtBotSqlRuntime();
             runtimeB.setCollectMode(true);
             try {
-                runtimeB.execute("SELECT STREAM data (device_id TEXT, value DOUBLE PRECISION)");
+                runtimeB.execute("CREATE STREAM data (device_id TEXT, value DOUBLE PRECISION)");
                 runtimeB.execute(
                     "CREATE MATERIALIZED VIEW doubled AS "
                     + "SELECT device_id, value * 2 AS doubled_value FROM data"
@@ -219,7 +219,7 @@ public class InsertBatchTest {
 
     @Test
     public void insertBatchOneColumn() {
-        runtime.execute("SELECT STREAM single (value DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM single (value DOUBLE PRECISION)");
         runtime.execute(
             "CREATE MATERIALIZED VIEW single_out AS "
             + "SELECT value * 3 AS tripled FROM single"
@@ -240,7 +240,7 @@ public class InsertBatchTest {
 
     @Test
     public void insertBatchTwoColumns() {
-        runtime.execute("SELECT STREAM pair (a DOUBLE PRECISION, b DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM pair (a DOUBLE PRECISION, b DOUBLE PRECISION)");
         runtime.execute(
             "CREATE MATERIALIZED VIEW pair_out AS "
             + "SELECT a + b AS sum_ab FROM pair"
@@ -262,7 +262,7 @@ public class InsertBatchTest {
     @Test
     public void insertBatchThreeColumns() {
         runtime.execute(
-            "SELECT STREAM triple (x DOUBLE PRECISION, y DOUBLE PRECISION, z DOUBLE PRECISION)"
+            "CREATE STREAM triple (x DOUBLE PRECISION, y DOUBLE PRECISION, z DOUBLE PRECISION)"
         );
         runtime.execute(
             "CREATE MATERIALIZED VIEW triple_out AS "
@@ -286,7 +286,7 @@ public class InsertBatchTest {
     @Test
     public void insertBatchFourColumns() {
         runtime.execute(
-            "SELECT STREAM quad (a DOUBLE, b DOUBLE, c DOUBLE, d DOUBLE)"
+            "CREATE STREAM quad (a DOUBLE, b DOUBLE, c DOUBLE, d DOUBLE)"
         );
         runtime.execute(
             "CREATE MATERIALIZED VIEW quad_out AS "
@@ -323,7 +323,7 @@ public class InsertBatchTest {
     @Test
     public void insertBatchFiveColumns() {
         runtime.execute(
-            "SELECT STREAM wide (a DOUBLE, b DOUBLE, c DOUBLE, d DOUBLE, e DOUBLE)"
+            "CREATE STREAM wide (a DOUBLE, b DOUBLE, c DOUBLE, d DOUBLE, e DOUBLE)"
         );
         runtime.execute(
             "CREATE MATERIALIZED VIEW wide_out AS "
@@ -352,7 +352,7 @@ public class InsertBatchTest {
 
     @Test
     public void insertBatchEmptyArrayIsNoOp() {
-        runtime.execute("SELECT STREAM ticks (value DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM ticks (value DOUBLE PRECISION)");
 
         CollectingListener listener = new CollectingListener();
         runtime.subscribe("ticks", listener);
@@ -363,7 +363,7 @@ public class InsertBatchTest {
 
     @Test(expected = SqlError.class)
     public void insertBatchColumnCountMismatchThrows() {
-        runtime.execute("SELECT STREAM pair (a DOUBLE, b DOUBLE)");
+        runtime.execute("CREATE STREAM pair (a DOUBLE, b DOUBLE)");
         // Pass 3 columns for a 2-column stream
         long[] ts = {1000L};
         runtime.insertBatch("pair", ts,
@@ -378,7 +378,7 @@ public class InsertBatchTest {
 
     @Test
     public void insertBatchSingleRowWorks() {
-        runtime.execute("SELECT STREAM ticks (value DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM ticks (value DOUBLE PRECISION)");
         runtime.execute(
             "CREATE MATERIALIZED VIEW doubled AS "
             + "SELECT value * 2 AS d FROM ticks"

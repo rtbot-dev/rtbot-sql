@@ -66,12 +66,12 @@ public class RtBotSqlRuntimeTest {
     }
 
     // -----------------------------------------------------------------
-    // SELECT STREAM + INSERT + SELECT round-trip
+    // CREATE STREAM + INSERT + SELECT round-trip
     // -----------------------------------------------------------------
 
     @Test
     public void createStreamAndInsert() {
-        runtime.execute("SELECT STREAM ticks (value DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM ticks (value DOUBLE PRECISION)");
         runtime.execute("INSERT INTO ticks VALUES (42)");
 
         Object resultObj = runtime.execute("SELECT * FROM ticks LIMIT 1");
@@ -199,8 +199,8 @@ public class RtBotSqlRuntimeTest {
 
     @Test
     public void multiSourceMaterializedView() {
-        runtime.execute("SELECT STREAM btc (price DOUBLE PRECISION)");
-        runtime.execute("SELECT STREAM eth (price DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM btc (price DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM eth (price DOUBLE PRECISION)");
         runtime.execute(
             "CREATE MATERIALIZED VIEW cross_stats AS "
             + "SELECT b.price AS btc_price, e.price AS eth_price, b.price - e.price AS spread "
@@ -238,7 +238,7 @@ public class RtBotSqlRuntimeTest {
 
     @Test
     public void dropView() {
-        runtime.execute("SELECT STREAM ticks (value DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM ticks (value DOUBLE PRECISION)");
         runtime.execute(
             "CREATE MATERIALIZED VIEW stats AS "
             + "SELECT value, MOVING_AVERAGE(value, 3) AS avg FROM ticks"
@@ -274,7 +274,7 @@ public class RtBotSqlRuntimeTest {
 
     @Test
     public void viewChainPropagation() {
-        runtime.execute("SELECT STREAM trades (instrument_id DOUBLE, price DOUBLE, quantity DOUBLE)");
+        runtime.execute("CREATE STREAM trades (instrument_id DOUBLE, price DOUBLE, quantity DOUBLE)");
 
         // Intermediate VIEW: computes a derived column
         runtime.execute(
@@ -318,7 +318,7 @@ public class RtBotSqlRuntimeTest {
 
     @Test
     public void viewDoesNotStoreOutput() {
-        runtime.execute("SELECT STREAM trades (instrument_id DOUBLE, price DOUBLE, quantity DOUBLE)");
+        runtime.execute("CREATE STREAM trades (instrument_id DOUBLE, price DOUBLE, quantity DOUBLE)");
         runtime.execute(
             "CREATE VIEW trade_view AS "
             + "SELECT instrument_id, price FROM trades LIMIT 1"
@@ -339,7 +339,7 @@ public class RtBotSqlRuntimeTest {
 
     @Test
     public void materializedViewStoresOutput() {
-        runtime.execute("SELECT STREAM trades (instrument_id DOUBLE, price DOUBLE, quantity DOUBLE)");
+        runtime.execute("CREATE STREAM trades (instrument_id DOUBLE, price DOUBLE, quantity DOUBLE)");
         runtime.execute(
             "CREATE MATERIALIZED VIEW trade_stats AS "
             + "SELECT instrument_id, SUM(price) AS total_price, COUNT(*) AS cnt "
@@ -362,7 +362,7 @@ public class RtBotSqlRuntimeTest {
 
     @Test
     public void ddlReturnsNull() {
-        Object result = runtime.execute("SELECT STREAM ticks (value DOUBLE PRECISION)");
+        Object result = runtime.execute("CREATE STREAM ticks (value DOUBLE PRECISION)");
         assertNull("CREATE should return null", result);
 
         result = runtime.execute("INSERT INTO ticks VALUES (42)");
@@ -375,7 +375,7 @@ public class RtBotSqlRuntimeTest {
 
     @Test
     public void insertWithExplicitTimestamp() {
-        runtime.execute("SELECT STREAM ticks (price DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM ticks (price DOUBLE PRECISION)");
 
         // Insert with explicit timestamps
         runtime.insert("ticks", 1000L, Arrays.asList(100.0));
@@ -409,8 +409,8 @@ public class RtBotSqlRuntimeTest {
 
     @Test
     public void multiSourceEphemeralSelectNonMatchingTimestamps() {
-        runtime.execute("SELECT STREAM btc (price DOUBLE PRECISION)");
-        runtime.execute("SELECT STREAM eth (price DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM btc (price DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM eth (price DOUBLE PRECISION)");
 
         // Insert with non-matching timestamps
         runtime.insert("btc", 1000L, Arrays.asList(100.0));
@@ -434,8 +434,8 @@ public class RtBotSqlRuntimeTest {
 
     @Test
     public void multiSourceEphemeralSelectMatchingTimestamps() {
-        runtime.execute("SELECT STREAM btc (price DOUBLE PRECISION)");
-        runtime.execute("SELECT STREAM eth (price DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM btc (price DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM eth (price DOUBLE PRECISION)");
 
         // Insert with matching timestamps
         runtime.insert("btc", 1000L, Arrays.asList(100.0));
@@ -475,8 +475,8 @@ public class RtBotSqlRuntimeTest {
 
     @Test
     public void multiSourceMaterializedViewExact() {
-        runtime.execute("SELECT STREAM btc (price DOUBLE PRECISION)");
-        runtime.execute("SELECT STREAM eth (price DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM btc (price DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM eth (price DOUBLE PRECISION)");
         runtime.execute(
             "CREATE MATERIALIZED VIEW cross_stats AS "
             + "SELECT b.price AS btc_price, e.price AS eth_price, b.price - e.price AS spread "
@@ -522,7 +522,7 @@ public class RtBotSqlRuntimeTest {
 
     @Test
     public void filteredSelectOnMaterializedView() {
-        runtime.execute("SELECT STREAM sensors (temperature DOUBLE)");
+        runtime.execute("CREATE STREAM sensors (temperature DOUBLE)");
         runtime.execute(
             "CREATE MATERIALIZED VIEW stats AS "
             + "SELECT temperature, "
@@ -583,7 +583,7 @@ public class RtBotSqlRuntimeTest {
 
     @Test
     public void serializeRestoreRoundTrip() {
-        runtime.execute("SELECT STREAM ticks (value DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM ticks (value DOUBLE PRECISION)");
         runtime.execute(
             "CREATE MATERIALIZED VIEW avg_view AS "
             + "SELECT value, MOVING_AVERAGE(value, 3) AS avg FROM ticks"
@@ -608,7 +608,7 @@ public class RtBotSqlRuntimeTest {
         RtBotSqlRuntime runtime2 = new RtBotSqlRuntime();
         runtime2.setCollectMode(true);
         try {
-            runtime2.execute("SELECT STREAM ticks (value DOUBLE PRECISION)");
+            runtime2.execute("CREATE STREAM ticks (value DOUBLE PRECISION)");
             runtime2.execute(
                 "CREATE MATERIALIZED VIEW avg_view AS "
                 + "SELECT value, MOVING_AVERAGE(value, 3) AS avg FROM ticks"
@@ -647,7 +647,7 @@ public class RtBotSqlRuntimeTest {
 
     @Test
     public void insertPayloadLengthMismatch() {
-        runtime.execute("SELECT STREAM ticks (price DOUBLE, volume DOUBLE)");
+        runtime.execute("CREATE STREAM ticks (price DOUBLE, volume DOUBLE)");
 
         try {
             // 3 values for a 2-column stream
@@ -672,7 +672,7 @@ public class RtBotSqlRuntimeTest {
 
     @Test
     public void executeInsertPayloadMismatch() {
-        runtime.execute("SELECT STREAM ticks (price DOUBLE, volume DOUBLE)");
+        runtime.execute("CREATE STREAM ticks (price DOUBLE, volume DOUBLE)");
 
         try {
             // 3 values for a 2-column stream via SQL INSERT
@@ -696,10 +696,10 @@ public class RtBotSqlRuntimeTest {
 
     @Test
     public void duplicateCreateStreamIsIdempotent() {
-        runtime.execute("SELECT STREAM ticks (value DOUBLE)");
+        runtime.execute("CREATE STREAM ticks (value DOUBLE)");
         // Creating the same stream again should not throw — it's idempotent
         // (the catalog silently overwrites)
-        runtime.execute("SELECT STREAM ticks (value DOUBLE)");
+        runtime.execute("CREATE STREAM ticks (value DOUBLE)");
 
         // Verify the stream still works correctly
         runtime.insert("ticks", 1000L, Arrays.asList(42.0));
@@ -716,7 +716,7 @@ public class RtBotSqlRuntimeTest {
 
     @Test
     public void viewChainStoreVerification() {
-        runtime.execute("SELECT STREAM trades (instrument_id DOUBLE, price DOUBLE, quantity DOUBLE)");
+        runtime.execute("CREATE STREAM trades (instrument_id DOUBLE, price DOUBLE, quantity DOUBLE)");
 
         // Intermediate VIEW
         runtime.execute(
@@ -756,7 +756,7 @@ public class RtBotSqlRuntimeTest {
 
     @Test
     public void createDropRecreate() {
-        runtime.execute("SELECT STREAM ticks (value DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM ticks (value DOUBLE PRECISION)");
         runtime.execute(
             "CREATE MATERIALIZED VIEW stats AS "
             + "SELECT value, MOVING_AVERAGE(value, 3) AS avg FROM ticks"
@@ -808,7 +808,7 @@ public class RtBotSqlRuntimeTest {
 
     @Test
     public void destroyAllThenNewOperations() {
-        runtime.execute("SELECT STREAM ticks (value DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM ticks (value DOUBLE PRECISION)");
         runtime.execute(
             "CREATE MATERIALIZED VIEW stats AS "
             + "SELECT value, MOVING_AVERAGE(value, 3) AS avg FROM ticks"
@@ -819,7 +819,7 @@ public class RtBotSqlRuntimeTest {
         runtime.destroyAll();
 
         // Create fresh — should not crash or reuse stale state
-        runtime.execute("SELECT STREAM prices (bid DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM prices (bid DOUBLE PRECISION)");
         runtime.execute(
             "CREATE MATERIALIZED VIEW avg_bid AS "
             + "SELECT bid, MOVING_AVERAGE(bid, 2) AS avg FROM prices"
@@ -838,7 +838,7 @@ public class RtBotSqlRuntimeTest {
 
     @Test
     public void fanOutMultipleViewsOnSameSource() {
-        runtime.execute("SELECT STREAM ticks (value DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM ticks (value DOUBLE PRECISION)");
 
         // Two different views on the same source
         runtime.execute(
@@ -880,7 +880,7 @@ public class RtBotSqlRuntimeTest {
 
     @Test
     public void insertPropagatesToDependentView() {
-        runtime.execute("SELECT STREAM ticks (value DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM ticks (value DOUBLE PRECISION)");
         runtime.execute(
             "CREATE MATERIALIZED VIEW doubled AS "
             + "SELECT value * 2 AS doubled_value FROM ticks"
@@ -924,7 +924,7 @@ public class RtBotSqlRuntimeTest {
 
     @Test
     public void subscribeReceivesRawStreamMessages() {
-        runtime.execute("SELECT STREAM ticks (value DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM ticks (value DOUBLE PRECISION)");
 
         CollectingListener listener = new CollectingListener();
         runtime.subscribe("ticks", listener);
@@ -941,7 +941,7 @@ public class RtBotSqlRuntimeTest {
 
     @Test
     public void subscribeReceivesMaterializedViewOutput() {
-        runtime.execute("SELECT STREAM ticks (value DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM ticks (value DOUBLE PRECISION)");
         runtime.execute(
             "CREATE MATERIALIZED VIEW doubled AS "
             + "SELECT value * 2 AS doubled_value FROM ticks"
@@ -962,7 +962,7 @@ public class RtBotSqlRuntimeTest {
 
     @Test
     public void unsubscribeStopsDelivery() {
-        runtime.execute("SELECT STREAM ticks (value DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM ticks (value DOUBLE PRECISION)");
 
         CollectingListener listener = new CollectingListener();
         runtime.subscribe("ticks", listener);
@@ -978,7 +978,7 @@ public class RtBotSqlRuntimeTest {
 
     @Test
     public void hasSubscriberReflectsState() {
-        runtime.execute("SELECT STREAM ticks (value DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM ticks (value DOUBLE PRECISION)");
 
         assertFalse(runtime.hasSubscriber("ticks"));
 
@@ -992,8 +992,8 @@ public class RtBotSqlRuntimeTest {
 
     @Test
     public void multipleSubscribersOnDifferentStreams() {
-        runtime.execute("SELECT STREAM a (value DOUBLE PRECISION)");
-        runtime.execute("SELECT STREAM b (value DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM a (value DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM b (value DOUBLE PRECISION)");
 
         CollectingListener listenerA = new CollectingListener();
         CollectingListener listenerB = new CollectingListener();
@@ -1013,7 +1013,7 @@ public class RtBotSqlRuntimeTest {
 
     @Test
     public void subscribeToViewChain() {
-        runtime.execute("SELECT STREAM trades (instrument_id DOUBLE, price DOUBLE, quantity DOUBLE)");
+        runtime.execute("CREATE STREAM trades (instrument_id DOUBLE, price DOUBLE, quantity DOUBLE)");
         runtime.execute(
             "CREATE VIEW enriched AS "
             + "SELECT instrument_id, price * quantity AS notional "
@@ -1055,7 +1055,7 @@ public class RtBotSqlRuntimeTest {
         try {
             assertFalse("Collect mode should be off by default", rt.isCollectMode());
 
-            rt.execute("SELECT STREAM ticks (value DOUBLE PRECISION)");
+            rt.execute("CREATE STREAM ticks (value DOUBLE PRECISION)");
             rt.execute(
                 "CREATE MATERIALIZED VIEW doubled AS "
                 + "SELECT value * 2 AS doubled_value FROM ticks"
@@ -1078,7 +1078,7 @@ public class RtBotSqlRuntimeTest {
     public void defaultModeForwardsToSubscribers() {
         RtBotSqlRuntime rt = new RtBotSqlRuntime();
         try {
-            rt.execute("SELECT STREAM ticks (value DOUBLE PRECISION)");
+            rt.execute("CREATE STREAM ticks (value DOUBLE PRECISION)");
             rt.execute(
                 "CREATE MATERIALIZED VIEW doubled AS "
                 + "SELECT value * 2 AS doubled_value FROM ticks"
@@ -1114,7 +1114,7 @@ public class RtBotSqlRuntimeTest {
     public void defaultModeDiscardsWhenNoSubscriber() {
         RtBotSqlRuntime rt = new RtBotSqlRuntime();
         try {
-            rt.execute("SELECT STREAM ticks (value DOUBLE PRECISION)");
+            rt.execute("CREATE STREAM ticks (value DOUBLE PRECISION)");
 
             CollectingListener listener = new CollectingListener();
             rt.subscribe("ticks", listener);
@@ -1143,7 +1143,7 @@ public class RtBotSqlRuntimeTest {
         // Collect mode explicitly enabled (used by tests and notebooks)
         assertFalse("Plain VIEW should not store output", false);
 
-        runtime.execute("SELECT STREAM ticks (value DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM ticks (value DOUBLE PRECISION)");
         runtime.execute(
             "CREATE MATERIALIZED VIEW doubled AS "
             + "SELECT value * 2 AS doubled_value FROM ticks"
@@ -1163,7 +1163,7 @@ public class RtBotSqlRuntimeTest {
     public void collectModeSelectOnMaterializedViewWorks() {
         // runtime already has collect mode on (from setUp)
 
-        runtime.execute("SELECT STREAM ticks (value DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM ticks (value DOUBLE PRECISION)");
         runtime.execute(
             "CREATE MATERIALIZED VIEW doubled AS "
             + "SELECT value * 2 AS doubled_value FROM ticks"
@@ -1188,7 +1188,7 @@ public class RtBotSqlRuntimeTest {
 
     @Test
     public void destroyAllClearsSubscriptions() {
-        runtime.execute("SELECT STREAM ticks (value DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM ticks (value DOUBLE PRECISION)");
 
         CollectingListener listener = new CollectingListener();
         runtime.subscribe("ticks", listener);
@@ -1219,7 +1219,7 @@ public class RtBotSqlRuntimeTest {
 
     @Test
     public void createStreamWithTextColumnPreservesType() {
-        runtime.execute("SELECT STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)");
         StreamSchema schema = runtime.getCatalog().lookupStream("sensors");
         assertNotNull(schema);
         assertEquals(3, schema.columns.size());
@@ -1234,8 +1234,8 @@ public class RtBotSqlRuntimeTest {
 
     @Test
     public void multiStreamNonMatchingTimestampsProduceNoOutput() {
-        runtime.execute("SELECT STREAM stream_a (value DOUBLE)");
-        runtime.execute("SELECT STREAM stream_b (value DOUBLE)");
+        runtime.execute("CREATE STREAM stream_a (value DOUBLE)");
+        runtime.execute("CREATE STREAM stream_b (value DOUBLE)");
         runtime.execute(
                 "CREATE MATERIALIZED VIEW combined AS "
                 + "SELECT a.value AS val_a, b.value AS val_b "
@@ -1258,8 +1258,8 @@ public class RtBotSqlRuntimeTest {
 
     @Test
     public void multiStreamMatchingTimestampsProduceOutput() {
-        runtime.execute("SELECT STREAM stream_a (value DOUBLE)");
-        runtime.execute("SELECT STREAM stream_b (value DOUBLE)");
+        runtime.execute("CREATE STREAM stream_a (value DOUBLE)");
+        runtime.execute("CREATE STREAM stream_b (value DOUBLE)");
         runtime.execute(
                 "CREATE MATERIALIZED VIEW combined AS "
                 + "SELECT a.value AS val_a, b.value AS val_b, "
@@ -1287,8 +1287,8 @@ public class RtBotSqlRuntimeTest {
 
     @Test
     public void multiStreamMixedTimestamps() {
-        runtime.execute("SELECT STREAM stream_a (value DOUBLE)");
-        runtime.execute("SELECT STREAM stream_b (value DOUBLE)");
+        runtime.execute("CREATE STREAM stream_a (value DOUBLE)");
+        runtime.execute("CREATE STREAM stream_b (value DOUBLE)");
         runtime.execute(
                 "CREATE MATERIALIZED VIEW combined AS "
                 + "SELECT a.value AS val_a, b.value AS val_b "
@@ -1318,7 +1318,7 @@ public class RtBotSqlRuntimeTest {
 
     @Test
     public void catalogDictionaryStorageRoundTrip() {
-        runtime.execute("SELECT STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)");
         InMemoryCatalog catalog = runtime.getCatalog();
 
         StringDictionary dict = catalog.getOrCreateDictionary("sensors.location");
@@ -1339,7 +1339,7 @@ public class RtBotSqlRuntimeTest {
 
     @Test
     public void insertWithStringValueEncodesViaDictionary() {
-        runtime.execute("SELECT STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)");
         runtime.insertMixed("sensors", 1000L, Arrays.asList(1.0, "Bay A", 42.0));
 
         // Verify dictionary was populated
@@ -1351,7 +1351,7 @@ public class RtBotSqlRuntimeTest {
 
     @Test
     public void insertMixedReusesExistingDictionaryIds() {
-        runtime.execute("SELECT STREAM sensors (location TEXT, value DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM sensors (location TEXT, value DOUBLE PRECISION)");
         runtime.insertMixed("sensors", 1000L, Arrays.asList("Bay A", 10.0));
         runtime.insertMixed("sensors", 2000L, Arrays.asList("Bay A", 20.0));
         runtime.insertMixed("sensors", 3000L, Arrays.asList("Bay B", 30.0));
@@ -1365,19 +1365,19 @@ public class RtBotSqlRuntimeTest {
 
     @Test(expected = IllegalArgumentException.class)
     public void insertMixedStringIntoDoubleColumnThrows() {
-        runtime.execute("SELECT STREAM ticks (value DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM ticks (value DOUBLE PRECISION)");
         runtime.insertMixed("ticks", 1000L, Arrays.asList((Object) "hello"));
     }
 
     @Test(expected = IllegalArgumentException.class)
     public void insertMixedDoubleIntoTextColumnThrows() {
-        runtime.execute("SELECT STREAM sensors (location TEXT)");
+        runtime.execute("CREATE STREAM sensors (location TEXT)");
         runtime.insertMixed("sensors", 1000L, Arrays.asList((Object) 42.0));
     }
 
     @Test
     public void insertMixedWithEmptyStringWorks() {
-        runtime.execute("SELECT STREAM sensors (location TEXT, value DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM sensors (location TEXT, value DOUBLE PRECISION)");
         runtime.insertMixed("sensors", 1000L, Arrays.asList("", 42.0));
         StringDictionary dict = runtime.getCatalog().lookupDictionary("sensors.location");
         assertEquals(1, dict.size());
@@ -1390,7 +1390,7 @@ public class RtBotSqlRuntimeTest {
 
     @Test
     public void decodeOutputValuesConvertsTextColumnsToStrings() {
-        runtime.execute("SELECT STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)");
         runtime.insertMixed("sensors", 1000L, List.of(1.0, "Bay A", 42.0));
         runtime.insertMixed("sensors", 2000L, List.of(2.0, "Bay B", 99.0));
 
@@ -1412,7 +1412,7 @@ public class RtBotSqlRuntimeTest {
 
     @Test
     public void decodeRowWithAllDoubleColumnsReturnsDoubles() {
-        runtime.execute("SELECT STREAM ticks (value DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM ticks (value DOUBLE PRECISION)");
         runtime.execute("INSERT INTO ticks VALUES (42)");
 
         Object resultObj = runtime.execute("SELECT * FROM ticks LIMIT 1");
@@ -1433,7 +1433,7 @@ public class RtBotSqlRuntimeTest {
     public void decodeRowOnMaterializedViewDecodesTextColumns() {
         // Create a stream with TEXT columns, insert mixed data, then create
         // a materialized view that passes through TEXT columns.
-        runtime.execute("SELECT STREAM sensors (device_id TEXT, location TEXT, value DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM sensors (device_id TEXT, location TEXT, value DOUBLE PRECISION)");
         runtime.insertMixed("sensors", 1000L, List.of("Pump 01", "Bay A", 42.0));
         runtime.insertMixed("sensors", 2000L, List.of("Pump 02", "Bay B", 99.0));
 
@@ -1464,7 +1464,7 @@ public class RtBotSqlRuntimeTest {
 
     @Test
     public void dictionaryStateSurvivesSerializeRestore() {
-        runtime.execute("SELECT STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)");
         runtime.insertMixed("sensors", 1000L, List.of(1.0, "Bay A", 42.0));
         runtime.insertMixed("sensors", 2000L, List.of(2.0, "Bay B", 99.0));
 
@@ -1475,7 +1475,7 @@ public class RtBotSqlRuntimeTest {
         // Create fresh runtime, restore
         RtBotSqlRuntime runtime2 = new RtBotSqlRuntime();
         runtime2.setCollectMode(true);
-        runtime2.execute("SELECT STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)");
+        runtime2.execute("CREATE STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)");
         runtime2.restoreState(state);
 
         // Dictionary should be restored
@@ -1494,13 +1494,13 @@ public class RtBotSqlRuntimeTest {
 
     @Test
     public void emptyDictionarySerializesCleanly() {
-        runtime.execute("SELECT STREAM ticks (value DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM ticks (value DOUBLE PRECISION)");
         Map<String, String> state = runtime.serializeState();
         assertNotNull(state);
 
         RtBotSqlRuntime runtime2 = new RtBotSqlRuntime();
         runtime2.setCollectMode(true);
-        runtime2.execute("SELECT STREAM ticks (value DOUBLE PRECISION)");
+        runtime2.execute("CREATE STREAM ticks (value DOUBLE PRECISION)");
         runtime2.restoreState(state);
         // No crash, no dictionaries
         assertNull(runtime2.getCatalog().lookupDictionary("ticks.value"));
@@ -1521,7 +1521,7 @@ public class RtBotSqlRuntimeTest {
      */
     @Test
     public void endToEndTextColumnWithGroupBy() {
-        runtime.execute("SELECT STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)");
 
         runtime.insertMixed("sensors", 1000L, List.of(1.0, "Bay A", 10.0));
         runtime.insertMixed("sensors", 2000L, List.of(1.0, "Bay A", 20.0));
@@ -1569,7 +1569,7 @@ public class RtBotSqlRuntimeTest {
     public void endToEndTextColumnWithSubscription() {
         RtBotSqlRuntime subRuntime = new RtBotSqlRuntime();
         try {
-            subRuntime.execute("SELECT STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)");
+            subRuntime.execute("CREATE STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)");
 
             CollectingListener listener = new CollectingListener();
             subRuntime.subscribe("sensors", listener);
@@ -1618,7 +1618,7 @@ public class RtBotSqlRuntimeTest {
      */
     @Test
     public void endToEndSqlInsertWithStringLiteral() {
-        runtime.execute("SELECT STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)");
 
         // SQL INSERT with string literal — C++ compiler encodes 'Bay A' to dictionary ID
         runtime.execute("INSERT INTO sensors VALUES (1, 'Bay A', 42.0)");
@@ -1670,7 +1670,7 @@ public class RtBotSqlRuntimeTest {
      */
     @Test
     public void endToEndInsertMixedThenSelectAndDecode() {
-        runtime.execute("SELECT STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)");
 
         // insertMixed handles dictionary encoding on the Java side
         runtime.insertMixed("sensors", 1000L, List.of(1.0, "Bay A", 42.0));
@@ -1707,7 +1707,7 @@ public class RtBotSqlRuntimeTest {
      */
     @Test
     public void endToEndTextColumnSerializeRestoreAndContinue() {
-        runtime.execute("SELECT STREAM sensors (location TEXT, value DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM sensors (location TEXT, value DOUBLE PRECISION)");
         runtime.insertMixed("sensors", 1000L, List.of("Bay A", 10.0));
         runtime.insertMixed("sensors", 2000L, List.of("Bay B", 20.0));
 
@@ -1726,7 +1726,7 @@ public class RtBotSqlRuntimeTest {
         RtBotSqlRuntime runtime2 = new RtBotSqlRuntime();
         runtime2.setCollectMode(true);
         try {
-            runtime2.execute("SELECT STREAM sensors (location TEXT, value DOUBLE PRECISION)");
+            runtime2.execute("CREATE STREAM sensors (location TEXT, value DOUBLE PRECISION)");
             runtime2.restoreState(state);
 
             // Dictionary should be restored with both entries
@@ -1773,8 +1773,8 @@ public class RtBotSqlRuntimeTest {
     public void multiStreamSubscriberReceivesOnlyMatchingTimestamps() {
         RtBotSqlRuntime rt = new RtBotSqlRuntime();
         try {
-            rt.execute("SELECT STREAM stream_a (value DOUBLE)");
-            rt.execute("SELECT STREAM stream_b (value DOUBLE)");
+            rt.execute("CREATE STREAM stream_a (value DOUBLE)");
+            rt.execute("CREATE STREAM stream_b (value DOUBLE)");
             rt.execute(
                     "CREATE MATERIALIZED VIEW combined AS "
                     + "SELECT a.value AS val_a, b.value AS val_b "
@@ -1805,7 +1805,7 @@ public class RtBotSqlRuntimeTest {
      */
     @Test
     public void sqlInsertStringLiteralSyncsDictionaryToCatalog() {
-        runtime.execute("SELECT STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)");
         runtime.execute("INSERT INTO sensors VALUES (1, 'Bay A', 42.0)");
 
         InMemoryCatalog cat = runtime.getCatalog();
@@ -1820,7 +1820,7 @@ public class RtBotSqlRuntimeTest {
      */
     @Test
     public void consecutiveSqlInsertsWithDifferentStringsProduceDistinctIds() {
-        runtime.execute("SELECT STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)");
         runtime.execute("INSERT INTO sensors VALUES (1, 'Bay A', 42.0)");
         runtime.execute("INSERT INTO sensors VALUES (2, 'Bay B', 99.0)");
         runtime.execute("INSERT INTO sensors VALUES (3, 'Bay A', 55.0)");
@@ -1891,8 +1891,8 @@ public class RtBotSqlRuntimeTest {
         // (bin_units = 1000 for BIN(1s) with ts_units_per_second=1000)
 
         // Per-column streams
-        runtime.execute("SELECT STREAM vibration (value DOUBLE)");
-        runtime.execute("SELECT STREAM bearing_temp (value DOUBLE)");
+        runtime.execute("CREATE STREAM vibration (value DOUBLE)");
+        runtime.execute("CREATE STREAM bearing_temp (value DOUBLE)");
 
         // Binning views
         runtime.execute(
@@ -2085,8 +2085,8 @@ public class RtBotSqlRuntimeTest {
         // The preprocessor expands:
         //   CREATE ALIGNED STREAM input (vibration DOUBLE, bearing_temp DOUBLE) BIN(1s)
         // into:
-        //   1. SELECT STREAM vibration (value DOUBLE)
-        //   2. SELECT STREAM bearing_temp (value DOUBLE)
+        //   1. CREATE STREAM vibration (value DOUBLE)
+        //   2. CREATE STREAM bearing_temp (value DOUBLE)
         //   3. CREATE VIEW vibration_bin AS SELECT AVG(value) AS vibration
         //        FROM vibration GROUP BY FLOOR(TS() / 1000000)
         //   4. CREATE VIEW bearing_temp_bin AS SELECT AVG(value) AS bearing_temp
@@ -2383,7 +2383,7 @@ public class RtBotSqlRuntimeTest {
      */
     @Test
     public void mixedInsertPathsMaintainDictionaryCoherence() {
-        runtime.execute("SELECT STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)");
+        runtime.execute("CREATE STREAM sensors (device_id DOUBLE PRECISION, location TEXT, value DOUBLE PRECISION)");
 
         // insertMixed first — Java dictionary gets Bay A=1.0
         runtime.insertMixed("sensors", 1000L, List.of(1.0, "Bay A", 42.0));

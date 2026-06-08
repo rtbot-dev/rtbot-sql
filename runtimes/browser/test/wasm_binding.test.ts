@@ -64,7 +64,7 @@ describe("Real WASM binding — error location fields", () => {
     expect(err.end_column).toBeGreaterThanOrEqual(1);
   });
 
-  it("compileSqlJson surfaces SELECT STREAM source metadata (default scalar)", () => {
+  it("compileSqlJson surfaces CREATE STREAM source metadata (default scalar)", () => {
     // No TYPE clause → effective type defaults to scalar; type_clause /
     // window_clause are omitted (no user-written tokens to span). The
     // analyzer accepts the omission and emits no diagnostics.
@@ -75,14 +75,14 @@ describe("Real WASM binding — error location fields", () => {
       dictionaries: {},
     });
     const json = wasm!.compileSqlJson(
-      'SELECT STREAM system_cpu (cpu DOUBLE, x TEXT) FROM "ignition://{x}/cpu";',
+      'CREATE STREAM system_cpu (cpu DOUBLE, x TEXT) FROM "ignition://{x}/cpu";',
       catalogJson,
       1_000_000,
     );
     const out = JSON.parse(json);
     const result = out.results[0];
     expect(result.errors).toEqual([]);
-    expect(result.statement_type).toBe("SELECT_STREAM");
+    expect(result.statement_type).toBe("CREATE_STREAM");
     expect(result.stream_schema.name).toBe("system_cpu");
     expect(result.stream_schema.source).toBeDefined();
     const src = result.stream_schema.source;
@@ -105,7 +105,7 @@ describe("Real WASM binding — error location fields", () => {
       dictionaries: {},
     });
     const json = wasm!.compileSqlJson(
-      'SELECT STREAM vibration (amplitude DOUBLE) FROM "ignition://{x}/burst" TYPE csv_burst WINDOW 20480;',
+      'CREATE STREAM vibration (amplitude DOUBLE) FROM "ignition://{x}/burst" TYPE csv_burst WINDOW 20480;',
       catalogJson,
       1_000_000,
     );

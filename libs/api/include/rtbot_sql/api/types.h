@@ -22,7 +22,7 @@ enum class ViewType { SCALAR, KEYED, TOPK };
 enum class EntityType { STREAM, VIEW, MATERIALIZED_VIEW, TABLE };
 
 enum class StatementType {
-  SELECT_STREAM,
+  CREATE_STREAM,
   CREATE_VIEW,
   CREATE_MATERIALIZED_VIEW,
   CREATE_TABLE,
@@ -46,7 +46,7 @@ struct ColumnDef {
 struct StreamSchema {
   std::string name;
   std::vector<ColumnDef> columns;
-  std::optional<Source> source;  // FROM "..." metadata from SELECT STREAM
+  std::optional<Source> source;  // FROM "..." metadata from CREATE STREAM
 
   std::optional<int> column_index(const std::string& col_name) const {
     for (const auto& col : columns) {

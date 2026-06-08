@@ -45,7 +45,7 @@ bool is_known_column_type(const std::string& name) {
 void analyze_create_stream(const parser::ast::CreateStreamStmt& stmt,
                            const CatalogSnapshot& /*catalog*/,
                            DiagnosticBag& bag) {
-  // --- SELECT STREAM source metadata (FROM "..." [TYPE …] [WINDOW …]) ---
+  // --- CREATE STREAM source metadata (FROM "..." [TYPE …] [WINDOW …]) ---
   if (stmt.source.has_value()) {
     const auto& src = *stmt.source;
 
@@ -58,7 +58,7 @@ void analyze_create_stream(const parser::ast::CreateStreamStmt& stmt,
       loc.end_line = src.type->end_line;
       loc.end_column = src.type->end_column;
       bag.error(
-          "SELECT STREAM: unknown TYPE '" + src.type->raw +
+          "CREATE STREAM: unknown TYPE '" + src.type->raw +
               "', expected 'scalar' or 'csv_burst'",
           loc);
     } else {
@@ -71,7 +71,7 @@ void analyze_create_stream(const parser::ast::CreateStreamStmt& stmt,
         loc.column = src.column;
         loc.end_line = src.end_line;
         loc.end_column = src.end_column;
-        bag.error("SELECT STREAM: TYPE csv_burst requires WINDOW", loc);
+        bag.error("CREATE STREAM: TYPE csv_burst requires WINDOW", loc);
       }
       // WINDOW only valid with csv_burst.
       if (src.window.has_value() &&
@@ -82,7 +82,7 @@ void analyze_create_stream(const parser::ast::CreateStreamStmt& stmt,
         loc.end_line = src.window->end_line;
         loc.end_column = src.window->end_column;
         bag.error(
-            "SELECT STREAM: WINDOW is only valid with TYPE csv_burst", loc);
+            "CREATE STREAM: WINDOW is only valid with TYPE csv_burst", loc);
       }
       // WINDOW value must be strictly positive.
       if (src.window.has_value() && src.window->value <= 0) {
@@ -91,7 +91,7 @@ void analyze_create_stream(const parser::ast::CreateStreamStmt& stmt,
         loc.column = src.window->column;
         loc.end_line = src.window->end_line;
         loc.end_column = src.window->end_column;
-        bag.error("SELECT STREAM: WINDOW must be a positive integer", loc);
+        bag.error("CREATE STREAM: WINDOW must be a positive integer", loc);
       }
     }
   }

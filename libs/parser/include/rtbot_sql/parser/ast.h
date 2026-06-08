@@ -10,7 +10,7 @@
 namespace rtbot_sql::parser::ast {
 
 enum class StmtType {
-  SELECT_STREAM,
+  CREATE_STREAM,
   CREATE_VIEW,
   CREATE_MATERIALIZED_VIEW,
   CREATE_TABLE,
@@ -200,7 +200,7 @@ struct SourceWindowClause {
   int end_column = -1;
 };
 
-// Metadata for `FROM "..."` on SELECT STREAM. `name` is the unquoted source
+// Metadata for `FROM "..."` on CREATE STREAM. `name` is the unquoted source
 // identifier; `line`/`column`/`end_line`/`end_column` span the `"..."`
 // token (inclusive start, exclusive end, 1-based).
 //

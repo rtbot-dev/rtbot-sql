@@ -68,7 +68,7 @@ json result_to_json(const CompilationResult& r) {
 
   // Statement type
   static const char* stmt_names[] = {
-      "SELECT_STREAM", "CREATE_VIEW", "CREATE_MATERIALIZED_VIEW",
+      "CREATE_STREAM", "CREATE_VIEW", "CREATE_MATERIALIZED_VIEW",
       "CREATE_TABLE", "INSERT", "SELECT", "SUBSCRIBE", "DROP"};
   j["statement_type"] = stmt_names[static_cast<int>(r.statement_type)];
 
@@ -92,7 +92,7 @@ json result_to_json(const CompilationResult& r) {
 
   // Statement-specific fields
   switch (r.statement_type) {
-    case StatementType::SELECT_STREAM: {
+    case StatementType::CREATE_STREAM: {
       json cols = json::array();
       for (const auto& col : r.stream_schema.columns) {
         cols.push_back({{"name", col.name}, {"index", col.index},

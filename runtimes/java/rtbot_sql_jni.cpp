@@ -259,8 +259,8 @@ CatalogSnapshot catalog_from_json(const std::string& catalog_json) {
 
 std::string statement_type_str(StatementType t) {
   switch (t) {
-    case StatementType::SELECT_STREAM:
-      return "SELECT_STREAM";
+    case StatementType::CREATE_STREAM:
+      return "CREATE_STREAM";
     case StatementType::CREATE_VIEW:
       return "CREATE_VIEW";
     case StatementType::CREATE_MATERIALIZED_VIEW:

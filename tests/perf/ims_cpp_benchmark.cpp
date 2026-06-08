@@ -740,8 +740,8 @@ int main(int argc, char** argv) {
     CatalogSnapshot catalog;
 
     const auto stream = compile_or_die(kStreamSql, catalog, "vibration_raw stream");
-    if (stream.statement_type != StatementType::SELECT_STREAM) {
-      throw std::runtime_error("Expected SELECT_STREAM result for stream SQL");
+    if (stream.statement_type != StatementType::CREATE_STREAM) {
+      throw std::runtime_error("Expected CREATE_STREAM result for stream SQL");
     }
     register_stream(catalog, stream);
 

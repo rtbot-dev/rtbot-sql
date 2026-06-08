@@ -5,7 +5,7 @@ export type ViewType = "SCALAR" | "KEYED" | "TOPK";
 export type EntityType = "STREAM" | "VIEW" | "MATERIALIZED_VIEW" | "TABLE";
 
 export type StatementType =
-  | "SELECT_STREAM"
+  | "CREATE_STREAM"
   | "CREATE_VIEW"
   | "CREATE_MATERIALIZED_VIEW"
   | "CREATE_TABLE"
@@ -23,7 +23,7 @@ export interface ColumnDef {
 }
 
 /**
- * The effective ingest mode for a `SELECT STREAM`. `scalar` is one
+ * The effective ingest mode for a `CREATE STREAM`. `scalar` is one
  * tag-value per event; `csv_burst` parses a comma-separated string of
  * N samples per event with the per-sample interval driven by
  * `window_clause.value` (Hz). When the SQL omits `TYPE`, the C++
@@ -56,7 +56,7 @@ export interface SourceWindowClause {
 }
 
 /**
- * Metadata from `FROM "<pattern>"` on a `SELECT STREAM`. `name` is the
+ * Metadata from `FROM "<pattern>"` on a `CREATE STREAM`. `name` is the
  * unquoted pattern verbatim (e.g. `"ignition://{x}/cpu"`); `{col}`
  * placeholders reference TEXT columns in the schema by name and are
  * resolved at deploy time against the gateway tag tree.

@@ -105,7 +105,7 @@ class RtBotSql:
         raise SqlError(result.errors)
 
       statement = result.statement_type
-      if statement == native.StatementType.SELECT_STREAM:
+      if statement == native.StatementType.CREATE_STREAM:
         self._handle_create_stream(result)
 
       elif statement == native.StatementType.INSERT:

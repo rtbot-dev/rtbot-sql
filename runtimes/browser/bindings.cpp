@@ -16,10 +16,10 @@ namespace {
 
 // Normalize RTBot SQL dialect keywords to their PostgreSQL equivalents so that
 // libpg_query (a PostgreSQL 17 grammar wrapper) can parse them successfully.
-// SELECT STREAM → CREATE TABLE, DROP STREAM → DROP TABLE.
+// CREATE STREAM → CREATE TABLE, DROP STREAM → DROP TABLE.
 std::string normalize_sql(const std::string& sql) {
   std::string out = sql;
-  static const std::regex kCreateStream(R"(\bSELECT\s+STREAM\b)",
+  static const std::regex kCreateStream(R"(\bCREATE\s+STREAM\b)",
                                         std::regex::icase);
   out = std::regex_replace(out, kCreateStream, "CREATE TABLE");
   static const std::regex kDropStream(R"(\bDROP\s+STREAM\b)",
@@ -128,8 +128,8 @@ CatalogSnapshot catalog_from_json(const std::string& catalog_json) {
 
 std::string statement_type_str(StatementType t) {
   switch (t) {
-    case StatementType::SELECT_STREAM:
-      return "SELECT_STREAM";
+    case StatementType::CREATE_STREAM:
+      return "CREATE_STREAM";
     case StatementType::CREATE_VIEW:
       return "CREATE_VIEW";
     case StatementType::CREATE_MATERIALIZED_VIEW:

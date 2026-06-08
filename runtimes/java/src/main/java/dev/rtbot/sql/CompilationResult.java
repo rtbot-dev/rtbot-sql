@@ -130,7 +130,7 @@ public class CompilationResult {
         StatementType st = statementTypeEnum();
         if (st == null) return null;
         switch (st) {
-            case SELECT_STREAM: return EntityType.STREAM;
+            case CREATE_STREAM: return EntityType.STREAM;
             case CREATE_VIEW: return EntityType.VIEW;
             case CREATE_MATERIALIZED_VIEW: return EntityType.MATERIALIZED_VIEW;
             case CREATE_TABLE: return EntityType.TABLE;

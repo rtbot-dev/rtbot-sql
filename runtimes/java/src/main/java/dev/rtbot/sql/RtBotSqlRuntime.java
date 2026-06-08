@@ -26,7 +26,7 @@ import java.util.regex.Pattern;
  *
  * <p>Supports:
  * <ul>
- *   <li>SELECT STREAM / CREATE TABLE</li>
+ *   <li>CREATE STREAM / CREATE TABLE</li>
  *   <li>INSERT INTO</li>
  *   <li>CREATE VIEW / CREATE MATERIALIZED VIEW</li>
  *   <li>DROP</li>
@@ -112,7 +112,7 @@ public class RtBotSqlRuntime {
 
     private static final Pattern LIMIT_PATTERN =
             Pattern.compile("\\bLIMIT\\s+(\\d+)\\b", Pattern.CASE_INSENSITIVE);
-    private static final Pattern SELECT_STREAM_PATTERN =
+    private static final Pattern CREATE_STREAM_PATTERN =
             Pattern.compile("^\\s*CREATE\\s+STREAM\\b", Pattern.CASE_INSENSITIVE);
     private static final Pattern DROP_STREAM_PATTERN =
             Pattern.compile("^\\s*DROP\\s+STREAM\\b", Pattern.CASE_INSENSITIVE);
@@ -157,7 +157,7 @@ public class RtBotSqlRuntime {
             }
 
             switch (stType) {
-                case SELECT_STREAM:
+                case CREATE_STREAM:
                     handleCreateStream(result);
                     break;
                 case INSERT:
@@ -841,11 +841,11 @@ public class RtBotSqlRuntime {
 
     /**
      * Normalize SQL by replacing RTBot-specific syntax with standard SQL.
-     * "SELECT STREAM" -> "CREATE TABLE", "DROP STREAM" -> "DROP TABLE".
+     * "CREATE STREAM" -> "CREATE TABLE", "DROP STREAM" -> "DROP TABLE".
      */
     private static String normalizeSql(String sql) {
         String out = sql.strip();
-        out = SELECT_STREAM_PATTERN.matcher(out).replaceFirst("CREATE TABLE");
+        out = CREATE_STREAM_PATTERN.matcher(out).replaceFirst("CREATE TABLE");
         out = DROP_STREAM_PATTERN.matcher(out).replaceFirst("DROP TABLE");
         return out;
     }
@@ -855,7 +855,7 @@ public class RtBotSqlRuntime {
     // =================================================================
 
     /**
-     * Handle SELECT STREAM: register the stream schema in the catalog.
+     * Handle CREATE STREAM: register the stream schema in the catalog.
      */
     private void handleCreateStream(CompilationResult result) {
         catalog.registerStream(result.entityName, result.streamSchema);

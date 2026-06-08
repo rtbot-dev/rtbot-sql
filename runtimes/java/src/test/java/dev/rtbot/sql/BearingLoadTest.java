@@ -39,7 +39,7 @@ public class BearingLoadTest {
     // -- SQL Definitions (matching Python test exactly) --------------------
 
     private static final String SQL_STREAM =
-        "SELECT STREAM vibration_raw ("
+        "CREATE STREAM vibration_raw ("
         + "device_id DOUBLE, channel_id DOUBLE, amplitude DOUBLE)";
 
     private static final String SQL_BASE_VIEW =
