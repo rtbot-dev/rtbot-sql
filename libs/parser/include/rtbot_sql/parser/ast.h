@@ -229,10 +229,40 @@ struct CreateStreamStmt {
   SourceLocation loc;
 };
 
+// A `{...}` placeholder inside a `TO "<template>"` output tag string.
+// `name` is the text between the braces, with any leading `$` stripped.
+// `is_external` is true for `{$var}` runtime/system variables — these are
+// passed through untouched and are never validated against the view's
+// columns. When false, `name` must resolve to a projected output column
+// of the view (checked in the compiler against the field_map). The span
+// covers the placeholder including its braces (1-based, end exclusive).
+struct OutputPlaceholder {
+  std::string name;
+  bool is_external = false;
+  int line = -1;
+  int column = -1;
+  int end_line = -1;
+  int end_column = -1;
+};
+
+// Metadata for the optional `TO "<template>"` clause on CREATE MATERIALIZED
+// VIEW. `tag_template` is the unquoted string verbatim (placeholders
+// intact). `placeholders` is every `{...}` found in template order. The
+// span covers the `"..."` token (1-based, end exclusive).
+struct OutputTarget {
+  std::string tag_template;
+  std::vector<OutputPlaceholder> placeholders;
+  int line = -1;
+  int column = -1;
+  int end_line = -1;
+  int end_column = -1;
+};
+
 struct CreateViewStmt {
   std::string name;
   bool materialized;
   SelectStmt query;
+  std::optional<OutputTarget> output_target;
   SourceLocation loc;
 };
 

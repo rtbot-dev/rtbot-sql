@@ -45,6 +45,13 @@ std::string normalize_sql(const std::string& sql) {
   static const std::regex kCreateStream(R"(\bCREATE\s+STREAM\b)",
                                         std::regex::icase);
   out = std::regex_replace(out, kCreateStream, "CREATE TABLE");
+  // Strip the optional `TO "<template>"` output target on CREATE MATERIALIZED
+  // VIEW so pg_query (which has no such clause) never sees it. The lookahead
+  // on AS keeps the `TO "..."` matched only in `… TO "…" AS …` position and
+  // leaves the AS keyword in place.
+  static const std::regex kMatViewTo(R"(\bTO\s+"[^"]*"\s+(?=AS\b))",
+                                     std::regex::icase);
+  out = std::regex_replace(out, kMatViewTo, "");
   static const std::regex kDropStream(R"(\bDROP\s+STREAM\b)",
                                       std::regex::icase);
   out = std::regex_replace(out, kDropStream, "DROP TABLE");
@@ -810,6 +817,47 @@ CompilationResult handle_create_mat_view(
                                 ? StatementType::CREATE_MATERIALIZED_VIEW
                                 : StatementType::CREATE_VIEW;
     result.entity_name = stmt.name;
+
+    // Validate and record the optional `TO "<template>"` output target.
+    if (stmt.output_target.has_value()) {
+      const auto& ot = *stmt.output_target;
+      if (!stmt.materialized) {
+        // Defensive: extraction already rejects TO on non-materialized views.
+        CompilationResult err{};
+        err.errors.push_back(
+            {"TO output target is only valid on CREATE MATERIALIZED VIEW",
+             ot.line, ot.column, ot.end_line, ot.end_column});
+        return err;
+      }
+
+      // Each `{col}` placeholder must resolve to a projected output column.
+      std::set<std::string> referenced;
+      for (const auto& ph : ot.placeholders) {
+        if (ph.is_external) continue;  // `{$var}` resolved at runtime.
+        if (result.field_map.find(ph.name) == result.field_map.end()) {
+          CompilationResult err{};
+          err.errors.push_back(
+              {"TO template references unknown column '" + ph.name +
+                   "' (not produced by the view)",
+               ph.line, ph.column, ph.end_line, ph.end_column});
+          return err;
+        }
+        referenced.insert(ph.name);
+      }
+
+      // Payload columns: every projected column not used in a placeholder,
+      // ordered by their position in the output vector.
+      std::vector<std::pair<std::string, int>> cols(result.field_map.begin(),
+                                                    result.field_map.end());
+      std::sort(cols.begin(), cols.end(),
+                [](const auto& a, const auto& b) { return a.second < b.second; });
+      for (const auto& [name, _idx] : cols) {
+        if (referenced.find(name) == referenced.end()) {
+          result.output_payload_columns.push_back(name);
+        }
+      }
+      result.output_target = ot.tag_template;
+    }
   } catch (const std::runtime_error& e) {
     return make_error(e.what());
   }
@@ -1073,6 +1121,84 @@ CompilationResult compile_sql(const std::string& sql,
     }
   }
 
+  // Parse the optional CREATE MATERIALIZED VIEW `TO "<template>"` output
+  // target before normalization strips it. `{col}` placeholders must resolve
+  // to a projected output column (validated against the field_map in
+  // handle_create_mat_view, once it is known); `{$var}` are external runtime
+  // variables passed through untouched. `TO` is valid only on MATERIALIZED
+  // views.
+  std::optional<parser::ast::OutputTarget> output_target;
+  {
+    static const std::regex kMatView(R"(\bMATERIALIZED\s+VIEW\b)",
+                                     std::regex::icase);
+    static const std::regex kToClause(R"re(\bTO\s+"([^"]*)")re",
+                                       std::regex::icase);
+    std::smatch m;
+    if (std::regex_search(sql, m, kToClause)) {
+      auto src = parser::make_source_text(sql);
+      auto loc_error = [&](int byte_offset,
+                           const std::string& msg) -> CompilationResult {
+        auto loc = parser::compute_location(src, byte_offset);
+        CompilationResult r{};
+        r.errors.push_back(
+            {msg, loc.line, loc.column, loc.end_line, loc.end_column});
+        return r;
+      };
+
+      // `TO "..."` is only meaningful on a materialized view.
+      if (!std::regex_search(sql, kMatView)) {
+        return loc_error(
+            static_cast<int>(m.position(0)),
+            "TO output target is only valid on CREATE MATERIALIZED VIEW");
+      }
+
+      parser::ast::OutputTarget ot;
+      ot.tag_template = m[1].str();
+      // Span the `"..."` token (both quotes).
+      int quote_offset = static_cast<int>(m.position(1)) - 1;
+      auto qloc = parser::compute_location(src, quote_offset);
+      ot.line = qloc.line;
+      ot.column = qloc.column;
+      ot.end_line = qloc.end_line;
+      ot.end_column = qloc.end_column;
+
+      // Byte offset in `sql` where the template content (just past the
+      // opening quote) begins, so placeholder spans map back to the source.
+      int content_offset = static_cast<int>(m.position(1));
+      const std::string& tmpl = ot.tag_template;
+      for (std::size_t p = 0; p < tmpl.size(); ++p) {
+        if (tmpl[p] != '{') continue;
+        std::size_t close = tmpl.find('}', p);
+        int open_abs = content_offset + static_cast<int>(p);
+        if (close == std::string::npos) {
+          return loc_error(open_abs,
+                           "TO template has an unterminated `{` placeholder");
+        }
+        int close_abs = content_offset + static_cast<int>(close);
+        std::string inner = tmpl.substr(p + 1, close - p - 1);
+
+        parser::ast::OutputPlaceholder ph;
+        ph.is_external = !inner.empty() && inner[0] == '$';
+        ph.name = ph.is_external ? inner.substr(1) : inner;
+
+        auto sloc = parser::compute_location(src, open_abs);
+        auto eloc = parser::compute_location(src, close_abs);
+        ph.line = sloc.line;
+        ph.column = sloc.column;
+        ph.end_line = eloc.end_line;
+        ph.end_column = eloc.end_column;
+
+        if (ph.name.empty()) {
+          return loc_error(open_abs, "TO template has an empty placeholder");
+        }
+        ot.placeholders.push_back(std::move(ph));
+        p = close;
+      }
+
+      output_target = std::move(ot);
+    }
+  }
+
   const std::string normalized = normalize_sql(sql);
 
   // Step 1: Parse
@@ -1131,6 +1257,14 @@ CompilationResult compile_sql(const std::string& sql,
   if (stream_source.has_value()) {
     if (auto* s = std::get_if<parser::ast::CreateStreamStmt>(&stmt)) {
       s->source = *stream_source;
+    }
+  }
+
+  // Attach the extracted TO "..." output target to the view AST so the
+  // compiler can validate its placeholders against the projected columns.
+  if (output_target.has_value()) {
+    if (auto* s = std::get_if<parser::ast::CreateViewStmt>(&stmt)) {
+      s->output_target = std::move(output_target);
     }
   }
 
@@ -1493,6 +1627,8 @@ void apply_result_to_catalog(CatalogSnapshot& catalog,
       vm.source_streams = r.source_streams;
       vm.program_json = r.program_json;
       vm.key_index = r.key_index;
+      vm.output_target = r.output_target;
+      vm.output_payload_columns = r.output_payload_columns;
       catalog.views[r.entity_name] = vm;
       break;
     }

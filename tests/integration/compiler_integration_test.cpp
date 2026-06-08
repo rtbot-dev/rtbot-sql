@@ -1,6 +1,9 @@
 #include "rtbot_sql/api/compiler.h"
 
+#include <algorithm>
 #include <cmath>
+#include <string>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -1603,6 +1606,114 @@ TEST_F(CompilerIntegrationTest, CreateStreamMultiple) {
   EXPECT_TRUE(session.streams.count("system_cpu"));
   EXPECT_TRUE(session.streams.count("system_memory"));
   EXPECT_TRUE(session.streams.count("system_decay"));
+}
+
+// ---------------------------------------------------------------------------
+// CREATE MATERIALIZED VIEW `TO "<template>"` output target
+// ---------------------------------------------------------------------------
+
+// Worked example: a `{col}` placeholder references a projected column and a
+// `{$var}` placeholder is an external runtime variable. The raw template is
+// stored verbatim, and the payload columns are the projected columns NOT used
+// in any `{col}` placeholder.
+TEST_F(CompilerIntegrationTest, MaterializedViewOutputTargetBasic) {
+  auto r = compile_sql(
+      "CREATE MATERIALIZED VIEW stats "
+      "TO \"ignition://[Coprocessor]{$instance}/stats/{instrument_id}/\" "
+      "AS SELECT MOVING_AVERAGE(price, 20) AS avg, "
+      "STDDEV(price, 20) AS rms, instrument_id "
+      "FROM trades GROUP BY instrument_id",
+      catalog);
+
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  EXPECT_EQ(r.statement_type, StatementType::CREATE_MATERIALIZED_VIEW);
+  ASSERT_TRUE(r.output_target.has_value());
+  EXPECT_EQ(*r.output_target,
+            "ignition://[Coprocessor]{$instance}/stats/{instrument_id}/");
+  // instrument_id is referenced by a `{col}` placeholder; $instance is
+  // external — so the payload is the two aggregates (instrument_id excluded).
+  const auto& payload = r.output_payload_columns;
+  EXPECT_EQ(payload.size(), 2u);
+  EXPECT_NE(std::find(payload.begin(), payload.end(), "avg"), payload.end());
+  EXPECT_NE(std::find(payload.begin(), payload.end(), "rms"), payload.end());
+  EXPECT_EQ(std::find(payload.begin(), payload.end(), "instrument_id"),
+            payload.end());
+}
+
+// A bare `{col}` that doesn't match any projected column is a semantic error,
+// pointing at the placeholder (braces included).
+TEST_F(CompilerIntegrationTest, MaterializedViewOutputTargetUnknownColumn) {
+  const std::string sql =
+      "CREATE MATERIALIZED VIEW stats TO \"ignition://x/{nope}/\" "
+      "AS SELECT AVG(price) AS avg, instrument_id "
+      "FROM trades GROUP BY instrument_id";
+  auto r = compile_sql(sql, catalog);
+
+  ASSERT_TRUE(r.has_errors());
+  EXPECT_NE(r.errors[0].message.find(
+                "TO template references unknown column 'nope'"),
+            std::string::npos);
+  // Span points at `{nope}`.
+  auto brace = sql.find("{nope}");
+  ASSERT_NE(brace, std::string::npos);
+  EXPECT_EQ(r.errors[0].line, 1);
+  EXPECT_EQ(r.errors[0].column, static_cast<int>(brace) + 1);
+  EXPECT_EQ(r.errors[0].end_column, static_cast<int>(brace) + 1 + 6);
+}
+
+// `{$var}` external placeholders are never validated against columns, so a
+// template using only externals registers all projected columns as payload.
+TEST_F(CompilerIntegrationTest, MaterializedViewOutputTargetExternalOnly) {
+  auto r = compile_sql(
+      "CREATE MATERIALIZED VIEW stats TO \"ignition://{$instance}/all/\" "
+      "AS SELECT AVG(price) AS avg, instrument_id "
+      "FROM trades GROUP BY instrument_id",
+      catalog);
+
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  ASSERT_TRUE(r.output_target.has_value());
+  // No `{col}` placeholders → every projected column is payload.
+  const auto& payload = r.output_payload_columns;
+  EXPECT_EQ(payload.size(), 2u);
+  EXPECT_NE(std::find(payload.begin(), payload.end(), "avg"), payload.end());
+  EXPECT_NE(std::find(payload.begin(), payload.end(), "instrument_id"),
+            payload.end());
+}
+
+// `TO` is rejected on a plain (non-materialized) view.
+TEST_F(CompilerIntegrationTest, OutputTargetRejectedOnPlainView) {
+  auto r = compile_sql(
+      "CREATE VIEW v TO \"ignition://x/\" AS SELECT price FROM trades",
+      catalog);
+
+  ASSERT_TRUE(r.has_errors());
+  EXPECT_NE(r.errors[0].message.find(
+                "TO output target is only valid on CREATE MATERIALIZED VIEW"),
+            std::string::npos);
+}
+
+// A materialized view without a TO clause leaves the output metadata unset.
+TEST_F(CompilerIntegrationTest, MaterializedViewWithoutOutputTarget) {
+  auto r = compile_sql(
+      "CREATE MATERIALIZED VIEW stats AS "
+      "SELECT AVG(price) AS avg, instrument_id "
+      "FROM trades GROUP BY instrument_id",
+      catalog);
+
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  EXPECT_FALSE(r.output_target.has_value());
+  EXPECT_TRUE(r.output_payload_columns.empty());
+}
+
+// An empty `{}` placeholder is rejected.
+TEST_F(CompilerIntegrationTest, OutputTargetEmptyPlaceholderRejected) {
+  auto r = compile_sql(
+      "CREATE MATERIALIZED VIEW stats TO \"ignition://{}/\" AS "
+      "SELECT AVG(price) AS avg, instrument_id FROM trades GROUP BY instrument_id",
+      catalog);
+
+  ASSERT_TRUE(r.has_errors());
+  EXPECT_NE(r.errors[0].message.find("empty placeholder"), std::string::npos);
 }
 
 }  // namespace

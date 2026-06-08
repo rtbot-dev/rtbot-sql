@@ -177,6 +177,10 @@ json result_to_json(const CompilationResult& r) {
       static const char* vt_names[] = {"SCALAR", "KEYED", "TOPK"};
       j["view_type"] = vt_names[static_cast<int>(r.view_type)];
       if (r.key_index >= 0) j["key_index"] = r.key_index;
+      if (r.output_target.has_value()) {
+        j["output_target"] = *r.output_target;
+        j["output_payload_columns"] = r.output_payload_columns;
+      }
       break;
     }
     case StatementType::DROP: {
