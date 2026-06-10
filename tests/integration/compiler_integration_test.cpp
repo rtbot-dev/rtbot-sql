@@ -1853,26 +1853,59 @@ TEST_F(CompilerIntegrationTest, MaterializedViewOutputTargetUnknownColumn) {
   EXPECT_EQ(r.errors[0].end_column, static_cast<int>(brace) + 1 + 6);
 }
 
-// `{$var}` external/runtime variables were dropped from the spec — deploy-
-// time values are written literally in the URI. A `$`-prefixed placeholder
-// is rejected with a migration hint, pointing at the placeholder.
-TEST_F(CompilerIntegrationTest, OutputTargetExternalPlaceholderRejected) {
+// `{$instance}` (deploy-time processor name) and `{$view}` (view name) are
+// the two reserved external variables in TO templates. They are stored
+// verbatim, never validated against columns, and the host substitutes them
+// at deploy time — making the same script reusable across processors.
+TEST_F(CompilerIntegrationTest, OutputTargetReservedExternalsAccepted) {
+  auto r = compile_sql(
+      "CREATE MATERIALIZED VIEW stats "
+      "TO \"ignition://[Coprocessor]{$instance}/{$view}/{instrument_id}/\" "
+      "AS SELECT AVG(price) AS avg, instrument_id "
+      "FROM trades GROUP BY instrument_id",
+      text_key_catalog());
+
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  ASSERT_TRUE(r.output_target.has_value());
+  EXPECT_EQ(*r.output_target,
+            "ignition://[Coprocessor]{$instance}/{$view}/{instrument_id}/");
+  // Externals never join the payload computation: payload is still the
+  // numeric projected columns.
+  ASSERT_EQ(r.output_payload_columns.size(), 1u);
+  EXPECT_EQ(r.output_payload_columns[0], "avg");
+}
+
+// Unknown `{$foo}` externals are rejected with the allowed list, span over
+// the placeholder.
+TEST_F(CompilerIntegrationTest, OutputTargetUnknownExternalRejected) {
   const std::string sql =
-      "CREATE MATERIALIZED VIEW stats TO \"ignition://{$instance}/all/\" "
+      "CREATE MATERIALIZED VIEW stats TO \"ignition://{$foo}/all/\" "
       "AS SELECT AVG(price) AS avg, instrument_id "
       "FROM trades GROUP BY instrument_id";
   auto r = compile_sql(sql, text_key_catalog());
 
   ASSERT_TRUE(r.has_errors());
   EXPECT_NE(r.errors[0].message.find(
-                "external placeholders are not supported; write the value "
-                "literally in the URI"),
+                "unknown external variable '{$foo}'; supported: {$instance}, "
+                "{$view}"),
             std::string::npos);
-  auto brace = sql.find("{$instance}");
+  auto brace = sql.find("{$foo}");
   ASSERT_NE(brace, std::string::npos);
   EXPECT_EQ(r.errors[0].line, 1);
   EXPECT_EQ(r.errors[0].column, static_cast<int>(brace) + 1);
-  EXPECT_EQ(r.errors[0].end_column, static_cast<int>(brace) + 1 + 11);
+  EXPECT_EQ(r.errors[0].end_column, static_cast<int>(brace) + 1 + 6);
+}
+
+// FROM sources have no deploy-time variables — externals stay rejected
+// there (the input binding must be a concrete, browsable tag pattern).
+TEST_F(CompilerIntegrationTest, FromExternalStillRejected) {
+  auto r = compile_sql(
+      R"(CREATE STREAM s(value DOUBLE) FROM 'ignition://{$instance}/x';)",
+      catalog);
+  ASSERT_TRUE(r.has_errors());
+  EXPECT_NE(r.errors[0].message.find(
+                "external placeholders are not supported"),
+            std::string::npos);
 }
 
 // `TO` is rejected on a plain (non-materialized) view.

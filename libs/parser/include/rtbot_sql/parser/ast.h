@@ -201,14 +201,21 @@ struct SourceWindowClause {
 };
 
 // A `{...}` placeholder inside a FROM source or TO template URI string.
-// `name` is the text between the braces and must resolve to a column —
-// a declared TEXT column for FROM sources, a projected output column for
-// TO templates. Deploy-time values (processor name, etc.) are written
-// literally in the URI — there are no external/runtime variables. The
-// span covers the placeholder including its braces (1-based, end
+//
+// Column placeholders (`is_external == false`): `name` is the text between
+// the braces and must resolve to a column — a declared TEXT column for
+// FROM sources, a projected TEXT output column for TO templates.
+//
+// External variables (`is_external == true`): `{$instance}` / `{$view}`,
+// valid only in TO templates. `name` keeps the leading `$`. They are
+// stored verbatim and substituted by the host at deploy time (processor
+// name / view name) — never validated against columns.
+//
+// The span covers the placeholder including its braces (1-based, end
 // exclusive).
 struct UriPlaceholder {
   std::string name;
+  bool is_external = false;
   int line = -1;
   int column = -1;
   int end_line = -1;

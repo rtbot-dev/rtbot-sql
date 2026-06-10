@@ -859,6 +859,7 @@ CompilationResult handle_create_mat_view(
       };
 
       for (const auto& ph : ot.placeholders) {
+        if (ph.is_external) continue;  // {$instance}/{$view}: host-resolved.
         if (result.field_map.find(ph.name) == result.field_map.end()) {
           CompilationResult err{};
           err.errors.push_back(
@@ -987,11 +988,18 @@ namespace {
 // `content_offset` is the byte offset in `sql` of the template's first
 // character (just past the opening quote), so each placeholder's span maps
 // back to the source. `context` prefixes diagnostics ("CREATE STREAM: FROM
-// source", "TO template"). Returns an error result for empty, unterminated,
-// or `{$var}` placeholders; std::nullopt on success.
+// source", "TO template").
+//
+// `allow_externals`: TO templates accept the reserved deploy-time
+// variables `{$instance}` / `{$view}` (marked `is_external`, name keeps
+// the `$`); any other `{$...}` is an error. FROM sources pass false —
+// input bindings must be concrete tag patterns.
+//
+// Returns an error result for empty, unterminated, or invalid external
+// placeholders; std::nullopt on success.
 std::optional<CompilationResult> parse_uri_placeholders(
     const parser::SourceText& src, const std::string& tmpl,
-    int content_offset, const std::string& context,
+    int content_offset, const std::string& context, bool allow_externals,
     std::vector<parser::ast::UriPlaceholder>& out) {
   auto loc_error = [&](int byte_offset,
                        const std::string& msg) -> CompilationResult {
@@ -1026,15 +1034,24 @@ std::optional<CompilationResult> parse_uri_placeholders(
       return loc_error(open_abs, context + " has an empty placeholder");
     }
     if (ph.name[0] == '$') {
-      // `{$var}` externals were dropped from the spec — deploy-time values
-      // are written literally in the URI.
-      CompilationResult err{};
-      err.errors.push_back(
-          {context +
-               ": external placeholders are not supported; write the value "
-               "literally in the URI",
-           ph.line, ph.column, ph.end_line, ph.end_column});
-      return err;
+      if (!allow_externals) {
+        CompilationResult err{};
+        err.errors.push_back(
+            {context +
+                 ": external placeholders are not supported; write the "
+                 "value literally in the URI",
+             ph.line, ph.column, ph.end_line, ph.end_column});
+        return err;
+      }
+      if (ph.name != "$instance" && ph.name != "$view") {
+        CompilationResult err{};
+        err.errors.push_back(
+            {context + ": unknown external variable '{" + ph.name +
+                 "}'; supported: {$instance}, {$view}",
+             ph.line, ph.column, ph.end_line, ph.end_column});
+        return err;
+      }
+      ph.is_external = true;
     }
     out.push_back(std::move(ph));
     p = close;
@@ -1095,7 +1112,8 @@ CompilationResult compile_sql(const std::string& sql,
       // (declared, TEXT) happens in the analyzer.
       if (auto err = parse_uri_placeholders(
               src, s.name, static_cast<int>(m.position(2)),
-              "CREATE STREAM: FROM source", s.placeholders)) {
+              "CREATE STREAM: FROM source", /*allow_externals=*/false,
+              s.placeholders)) {
         return *err;
       }
 
@@ -1272,11 +1290,12 @@ CompilationResult compile_sql(const std::string& sql,
       ot.end_line = qloc.end_line;
       ot.end_column = qloc.end_column;
 
-      // Parse `{col}` placeholders. Column resolution (projected, TEXT)
-      // happens in handle_create_mat_view once the field_map is known.
+      // Parse `{col}` placeholders and the `{$instance}`/`{$view}` deploy-
+      // time variables. Column resolution (projected, TEXT) happens in
+      // handle_create_mat_view once the field_map is known.
       if (auto err = parse_uri_placeholders(
               src, ot.tag_template, static_cast<int>(m.position(2)),
-              "TO template", ot.placeholders)) {
+              "TO template", /*allow_externals=*/true, ot.placeholders)) {
         return *err;
       }
 
