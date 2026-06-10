@@ -35,21 +35,22 @@ namespace {
 
 std::string normalize_sql(const std::string& sql) {
   std::string out = sql;
-  // Strip optional FROM "..." [TYPE x] [WINDOW n] source metadata so
+  // Strip optional FROM '...' [TYPE x] [WINDOW n] source metadata so
   // pg_query never sees it. The anchor on ) ensures we only match after a
-  // column-list closing paren, not in SELECT ... FROM clauses.
+  // column-list closing paren, not in SELECT ... FROM clauses. Both quote
+  // styles are accepted; the backreference keeps them paired.
   static const std::regex kStreamFrom(
-      R"(\)\s+FROM\s+"[^"]*"(?:\s+TYPE\s+\w+)?(?:\s+WINDOW\s+\d+)?\s*;?\s*$)",
+      R"(\)\s+FROM\s+(["'])[^"']*\1(?:\s+TYPE\s+\w+)?(?:\s+WINDOW\s+\d+)?\s*;?\s*$)",
       std::regex::icase);
   out = std::regex_replace(out, kStreamFrom, ")");
   static const std::regex kCreateStream(R"(\bCREATE\s+STREAM\b)",
                                         std::regex::icase);
   out = std::regex_replace(out, kCreateStream, "CREATE TABLE");
-  // Strip the optional `TO "<template>"` output target on CREATE MATERIALIZED
+  // Strip the optional `TO '<template>'` output target on CREATE MATERIALIZED
   // VIEW so pg_query (which has no such clause) never sees it. The lookahead
-  // on AS keeps the `TO "..."` matched only in `… TO "…" AS …` position and
-  // leaves the AS keyword in place.
-  static const std::regex kMatViewTo(R"(\bTO\s+"[^"]*"\s+(?=AS\b))",
+  // on AS keeps the `TO '…'` matched only in `… TO '…' AS …` position and
+  // leaves the AS keyword in place. Both quote styles are accepted.
+  static const std::regex kMatViewTo(R"(\bTO\s+(["'])[^"']*\1\s+(?=AS\b))",
                                      std::regex::icase);
   out = std::regex_replace(out, kMatViewTo, "");
   static const std::regex kDropStream(R"(\bDROP\s+STREAM\b)",
@@ -966,8 +967,9 @@ CompilationResult compile_sql(const std::string& sql,
   {
     static const std::regex kCreateStream(R"(\bCREATE\s+STREAM\b)",
                                           std::regex::icase);
+    // Group 1 = quote char (paired via backreference), group 2 = content.
     static const std::regex kStreamFromAnywhere(
-        R"re(\)\s+FROM\s+"([^"]*)")re", std::regex::icase);
+        R"re(\)\s+FROM\s+(["'])([^"']*)\1)re", std::regex::icase);
     static const std::regex kBareFrom(R"re(\)\s+(FROM)\b)re",
                                       std::regex::icase);
 
@@ -986,10 +988,10 @@ CompilationResult compile_sql(const std::string& sql,
 
     if (is_create_stream && std::regex_search(sql, m, kStreamFromAnywhere)) {
       Source s;
-      s.name = m[1].str();
+      s.name = m[2].str();
       auto src = parser::make_source_text(sql);
-      // Span the `"..."` token (both quotes) via find_token_end.
-      int quote_offset = static_cast<int>(m.position(1)) - 1;
+      // Span the quoted token (both quotes) via find_token_end.
+      int quote_offset = static_cast<int>(m.position(2)) - 1;
       auto loc = parser::compute_location(src, quote_offset);
       s.line = loc.line;
       s.column = loc.column;
@@ -1137,7 +1139,8 @@ CompilationResult compile_sql(const std::string& sql,
   {
     static const std::regex kMatView(R"(\bMATERIALIZED\s+VIEW\b)",
                                      std::regex::icase);
-    static const std::regex kToClause(R"re(\bTO\s+"([^"]*)")re",
+    // Group 1 = quote char (paired via backreference), group 2 = content.
+    static const std::regex kToClause(R"re(\bTO\s+(["'])([^"']*)\1)re",
                                        std::regex::icase);
     std::smatch m;
     if (std::regex_search(sql, m, kToClause)) {
@@ -1159,9 +1162,9 @@ CompilationResult compile_sql(const std::string& sql,
       }
 
       parser::ast::OutputTarget ot;
-      ot.tag_template = m[1].str();
-      // Span the `"..."` token (both quotes).
-      int quote_offset = static_cast<int>(m.position(1)) - 1;
+      ot.tag_template = m[2].str();
+      // Span the quoted token (both quotes).
+      int quote_offset = static_cast<int>(m.position(2)) - 1;
       auto qloc = parser::compute_location(src, quote_offset);
       ot.line = qloc.line;
       ot.column = qloc.column;
@@ -1170,7 +1173,7 @@ CompilationResult compile_sql(const std::string& sql,
 
       // Byte offset in `sql` where the template content (just past the
       // opening quote) begins, so placeholder spans map back to the source.
-      int content_offset = static_cast<int>(m.position(1));
+      int content_offset = static_cast<int>(m.position(2));
       const std::string& tmpl = ot.tag_template;
       for (std::size_t p = 0; p < tmpl.size(); ++p) {
         if (tmpl[p] != '{') continue;

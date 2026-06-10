@@ -1469,6 +1469,33 @@ TEST_F(CompilerIntegrationTest, CreateStreamWindowZeroRejected) {
   EXPECT_EQ(r.errors[0].end_column, static_cast<int>(zero_pos) + 1 + 1);
 }
 
+// Single-quoted source strings are the canonical SQL form (double quotes
+// are identifiers in SQL); both quote styles are accepted.
+TEST_F(CompilerIntegrationTest, CreateStreamSingleQuotedSourceAccepted) {
+  const std::string sql =
+      R"(CREATE STREAM s(x DOUBLE) FROM 'ignition://a/b';)";
+  auto r = compile_sql(sql, catalog);
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  ASSERT_TRUE(r.stream_schema.source.has_value());
+  EXPECT_EQ(r.stream_schema.source->name, "ignition://a/b");
+  // Span covers the quoted token, same contract as the double-quote form.
+  auto quote_pos = sql.find('\'');
+  ASSERT_NE(quote_pos, std::string::npos);
+  EXPECT_EQ(r.stream_schema.source->column, static_cast<int>(quote_pos) + 1);
+}
+
+// TYPE/WINDOW metadata parses after a single-quoted source too.
+TEST_F(CompilerIntegrationTest, CreateStreamSingleQuotedSourceWithMetadata) {
+  auto r = compile_sql(
+      R"(CREATE STREAM s(x DOUBLE) FROM 'abc' TYPE csv_burst WINDOW 100;)",
+      catalog);
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  ASSERT_TRUE(r.stream_schema.source.has_value());
+  EXPECT_EQ(r.stream_schema.source->name, "abc");
+  ASSERT_TRUE(r.stream_schema.source->window.has_value());
+  EXPECT_EQ(r.stream_schema.source->window->value, 100);
+}
+
 // A WINDOW value too large for int must produce a diagnostic, not an
 // uncaught std::out_of_range escaping compile_sql (and crossing the
 // WASM/JNI boundary). Span over the digits.
@@ -1657,6 +1684,20 @@ TEST_F(CompilerIntegrationTest, MaterializedViewOutputTargetBasic) {
   EXPECT_NE(std::find(payload.begin(), payload.end(), "rms"), payload.end());
   EXPECT_EQ(std::find(payload.begin(), payload.end(), "instrument_id"),
             payload.end());
+}
+
+// Single-quoted TO templates are accepted (canonical SQL string form).
+TEST_F(CompilerIntegrationTest, MaterializedViewSingleQuotedOutputTarget) {
+  auto r = compile_sql(
+      "CREATE MATERIALIZED VIEW stats "
+      "TO 'ignition://x/stats/{instrument_id}/' "
+      "AS SELECT AVG(price) AS avg, instrument_id "
+      "FROM trades GROUP BY instrument_id",
+      catalog);
+
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  ASSERT_TRUE(r.output_target.has_value());
+  EXPECT_EQ(*r.output_target, "ignition://x/stats/{instrument_id}/");
 }
 
 // A bare `{col}` that doesn't match any projected column is a semantic error,
