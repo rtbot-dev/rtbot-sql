@@ -1084,7 +1084,13 @@ CompilationResult compile_sql(const std::string& sql,
               "CREATE STREAM: WINDOW requires a positive integer");
         }
         SourceWindowClause wc;
-        wc.value = std::stoi(sql.substr(num_start, i - num_start));
+        try {
+          wc.value = std::stoi(sql.substr(num_start, i - num_start));
+        } catch (const std::out_of_range&) {
+          return make_loc_error(
+              static_cast<int>(num_start),
+              "CREATE STREAM: WINDOW value is out of range");
+        }
         auto window_loc = parser::compute_location(
             src, static_cast<int>(num_start));
         wc.line = window_loc.line;

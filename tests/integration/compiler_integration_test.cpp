@@ -1469,6 +1469,25 @@ TEST_F(CompilerIntegrationTest, CreateStreamWindowZeroRejected) {
   EXPECT_EQ(r.errors[0].end_column, static_cast<int>(zero_pos) + 1 + 1);
 }
 
+// A WINDOW value too large for int must produce a diagnostic, not an
+// uncaught std::out_of_range escaping compile_sql (and crossing the
+// WASM/JNI boundary). Span over the digits.
+TEST_F(CompilerIntegrationTest, CreateStreamWindowOverflowRejected) {
+  const std::string sql =
+      R"(CREATE STREAM s(x DOUBLE) FROM "abc" TYPE csv_burst WINDOW 99999999999999)";
+  auto r = compile_sql(sql, catalog);
+  ASSERT_TRUE(r.has_errors());
+  EXPECT_NE(r.errors[0].message.find(
+                "CREATE STREAM: WINDOW value is out of range"),
+            std::string::npos);
+  auto num_pos = sql.find("99999999999999");
+  ASSERT_NE(num_pos, std::string::npos);
+  EXPECT_EQ(r.errors[0].line, 1);
+  EXPECT_EQ(r.errors[0].column, static_cast<int>(num_pos) + 1);
+  EXPECT_EQ(r.errors[0].end_line, 1);
+  EXPECT_EQ(r.errors[0].end_column, static_cast<int>(num_pos) + 1 + 14);
+}
+
 // Content after WINDOW value and before any `;` → fails at the offending
 // token. Cursor has advanced past WINDOW <num>; span over the next token.
 TEST_F(CompilerIntegrationTest, CreateStreamGarbageAfterWindowRejected) {
