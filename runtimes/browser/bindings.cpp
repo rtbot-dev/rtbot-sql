@@ -213,6 +213,10 @@ json result_to_json(const CompilationResult& r) {
   j["key_index"] = r.key_index;
   j["select_tier"] = select_tier_str(r.select_tier);
   j["insert_payload"] = r.insert_payload;
+  if (r.output_target.has_value()) {
+    j["output_target"] = *r.output_target;
+    j["output_payload_columns"] = r.output_payload_columns;
+  }
 
   // stream_schema
   json schema;

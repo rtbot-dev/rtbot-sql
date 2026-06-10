@@ -56,10 +56,11 @@ export interface SourceWindowClause {
 }
 
 /**
- * Metadata from `FROM "<pattern>"` on a `CREATE STREAM`. `name` is the
- * unquoted pattern verbatim (e.g. `"ignition://{x}/cpu"`); `{col}`
- * placeholders reference TEXT columns in the schema by name and are
- * resolved at deploy time against the gateway tag tree.
+ * Metadata from `FROM '<pattern>'` on a `CREATE STREAM`. `name` is the
+ * unquoted pattern verbatim (e.g. `'ignition://{x}/cpu'`); `{col}`
+ * placeholders reference TEXT columns in the schema by name (enforced by
+ * the analyzer) and are resolved at deploy time against the gateway tag
+ * tree.
  *
  * `type` reflects the effective type (defaults to "scalar" when the
  * SQL omits `TYPE`). The optional `type_clause` / `window_clause`
@@ -132,6 +133,20 @@ export interface CompilationResult {
   table_schema: TableSchema;
   drop_entity_name: string;
   drop_entity_type: EntityType;
+  /**
+   * `TO '<template>'` output target of a CREATE MATERIALIZED VIEW: the raw
+   * tag-path template, placeholders intact. `{col}` placeholders reference
+   * projected TEXT columns and resolve per row to path segments. Absent
+   * when the statement has no TO clause.
+   */
+  output_target?: string;
+  /**
+   * The view's NUMERIC projected columns, in output order — the host
+   * writes one tag per payload column under the resolved path (TEXT
+   * columns are path material, never tag values). Present only alongside
+   * `output_target`.
+   */
+  output_payload_columns?: string[];
   errors: CompilationError[];
   dictionary_updates?: Record<string, Record<string, string>>;
 }

@@ -346,6 +346,10 @@ json result_to_json(const CompilationResult& r) {
   j["select_limit"] = r.select_limit;
   j["insert_payload"] = r.insert_payload;
   j["delete_payload"] = r.delete_payload;
+  if (r.output_target.has_value()) {
+    j["output_target"] = *r.output_target;
+    j["output_payload_columns"] = r.output_payload_columns;
+  }
 
   // stream_schema
   json schema;
