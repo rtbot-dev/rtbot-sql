@@ -1469,6 +1469,89 @@ TEST_F(CompilerIntegrationTest, CreateStreamWindowZeroRejected) {
   EXPECT_EQ(r.errors[0].end_column, static_cast<int>(zero_pos) + 1 + 1);
 }
 
+// ---------------------------------------------------------------------------
+// FROM URI `{col}` placeholder validation.
+// ---------------------------------------------------------------------------
+
+// A `{col}` placeholder referencing a declared TEXT column is the intended
+// shape — resolved at deploy time to the matching path segment.
+TEST_F(CompilerIntegrationTest, CreateStreamFromPlaceholderTextColumnAccepted) {
+  auto r = compile_sql(
+      R"(CREATE STREAM s(value DOUBLE, machine_id TEXT) FROM 'ignition://devices/{machine_id}/vibration';)",
+      catalog);
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  ASSERT_TRUE(r.stream_schema.source.has_value());
+  EXPECT_EQ(r.stream_schema.source->name,
+            "ignition://devices/{machine_id}/vibration");
+}
+
+// A placeholder that names no declared column is rejected, span over the
+// placeholder (braces included).
+TEST_F(CompilerIntegrationTest, CreateStreamFromPlaceholderUnknownColumn) {
+  const std::string sql =
+      R"(CREATE STREAM s(value DOUBLE) FROM 'ignition://devices/{nope}/x';)";
+  auto r = compile_sql(sql, catalog);
+  ASSERT_TRUE(r.has_errors());
+  EXPECT_NE(r.errors[0].message.find(
+                "CREATE STREAM: FROM source references unknown column 'nope'"),
+            std::string::npos);
+  auto brace = sql.find("{nope}");
+  ASSERT_NE(brace, std::string::npos);
+  EXPECT_EQ(r.errors[0].line, 1);
+  EXPECT_EQ(r.errors[0].column, static_cast<int>(brace) + 1);
+  EXPECT_EQ(r.errors[0].end_column, static_cast<int>(brace) + 1 + 6);
+}
+
+// A placeholder referencing a non-TEXT column is rejected — path segments
+// are strings, so the binding column must be TEXT.
+TEST_F(CompilerIntegrationTest, CreateStreamFromPlaceholderNonTextColumn) {
+  const std::string sql =
+      R"(CREATE STREAM s(value DOUBLE) FROM 'ignition://devices/{value}/x';)";
+  auto r = compile_sql(sql, catalog);
+  ASSERT_TRUE(r.has_errors());
+  EXPECT_NE(r.errors[0].message.find(
+                "CREATE STREAM: FROM placeholder '{value}' requires a TEXT "
+                "column"),
+            std::string::npos);
+  auto brace = sql.find("{value}");
+  ASSERT_NE(brace, std::string::npos);
+  EXPECT_EQ(r.errors[0].column, static_cast<int>(brace) + 1);
+  EXPECT_EQ(r.errors[0].end_column, static_cast<int>(brace) + 1 + 7);
+}
+
+// Empty `{}` in a FROM source is rejected (same rule as TO templates).
+TEST_F(CompilerIntegrationTest, CreateStreamFromEmptyPlaceholderRejected) {
+  auto r = compile_sql(
+      R"(CREATE STREAM s(value DOUBLE) FROM 'ignition://devices/{}/x';)",
+      catalog);
+  ASSERT_TRUE(r.has_errors());
+  EXPECT_NE(r.errors[0].message.find("FROM source has an empty placeholder"),
+            std::string::npos);
+}
+
+// Unterminated `{` in a FROM source is rejected.
+TEST_F(CompilerIntegrationTest, CreateStreamFromUnterminatedPlaceholder) {
+  auto r = compile_sql(
+      R"(CREATE STREAM s(value DOUBLE, x TEXT) FROM 'ignition://devices/{x/y';)",
+      catalog);
+  ASSERT_TRUE(r.has_errors());
+  EXPECT_NE(r.errors[0].message.find(
+                "FROM source has an unterminated `{` placeholder"),
+            std::string::npos);
+}
+
+// `{$var}` externals are rejected in FROM sources too.
+TEST_F(CompilerIntegrationTest, CreateStreamFromExternalPlaceholderRejected) {
+  auto r = compile_sql(
+      R"(CREATE STREAM s(value DOUBLE) FROM 'ignition://{$instance}/x';)",
+      catalog);
+  ASSERT_TRUE(r.has_errors());
+  EXPECT_NE(r.errors[0].message.find(
+                "external placeholders are not supported; write the value "
+                "literally in the URI"),
+            std::string::npos);
+}
+
 // Single-quoted source strings are the canonical SQL form (double quotes
 // are identifiers in SQL); both quote styles are accepted.
 TEST_F(CompilerIntegrationTest, CreateStreamSingleQuotedSourceAccepted) {
@@ -1658,32 +1741,80 @@ TEST_F(CompilerIntegrationTest, CreateStreamMultiple) {
 // CREATE MATERIALIZED VIEW `TO "<template>"` output target
 // ---------------------------------------------------------------------------
 
-// Worked example: a `{col}` placeholder references a projected column and a
-// `{$var}` placeholder is an external runtime variable. The raw template is
-// stored verbatim, and the payload columns are the projected columns NOT used
-// in any `{col}` placeholder.
+// Catalog where the trades key column is declared TEXT — the shape the
+// Coprocessor produces (tag-path segments are strings). Used by the TO
+// placeholder tests: `{col}` must reference a projected TEXT column.
+static CatalogSnapshot text_key_catalog() {
+  CatalogSnapshot cat;
+  StreamSchema trades{"trades",
+                      {{"instrument_id", 0, ColumnType::TEXT},
+                       {"price", 1},
+                       {"quantity", 2}}};
+  cat.streams["trades"] = trades;
+  return cat;
+}
+
+// Worked example: the template is a literal parent path (deploy-time values
+// like the processor name are written literally) plus `{col}` placeholders
+// picking the value of a projected TEXT column per row. The raw template is
+// stored verbatim; the payload is every NUMERIC projected column — TEXT
+// columns are path material, never tag values.
 TEST_F(CompilerIntegrationTest, MaterializedViewOutputTargetBasic) {
   auto r = compile_sql(
       "CREATE MATERIALIZED VIEW stats "
-      "TO \"ignition://[Coprocessor]{$instance}/stats/{instrument_id}/\" "
+      "TO \"ignition://[Coprocessor]vibration-monitor/stats/{instrument_id}/\" "
       "AS SELECT MOVING_AVERAGE(price, 20) AS avg, "
       "STDDEV(price, 20) AS rms, instrument_id "
       "FROM trades GROUP BY instrument_id",
-      catalog);
+      text_key_catalog());
 
   ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
   EXPECT_EQ(r.statement_type, StatementType::CREATE_MATERIALIZED_VIEW);
   ASSERT_TRUE(r.output_target.has_value());
   EXPECT_EQ(*r.output_target,
-            "ignition://[Coprocessor]{$instance}/stats/{instrument_id}/");
-  // instrument_id is referenced by a `{col}` placeholder; $instance is
-  // external — so the payload is the two aggregates (instrument_id excluded).
+            "ignition://[Coprocessor]vibration-monitor/stats/{instrument_id}/");
+  // The payload is the numeric columns only; instrument_id (TEXT) is
+  // resolved into the path.
   const auto& payload = r.output_payload_columns;
-  EXPECT_EQ(payload.size(), 2u);
+  ASSERT_EQ(payload.size(), 2u);
   EXPECT_NE(std::find(payload.begin(), payload.end(), "avg"), payload.end());
   EXPECT_NE(std::find(payload.begin(), payload.end(), "rms"), payload.end());
-  EXPECT_EQ(std::find(payload.begin(), payload.end(), "instrument_id"),
-            payload.end());
+}
+
+// A projected TEXT column stays out of the payload even when it is NOT
+// referenced by any placeholder — only numeric columns become tags.
+TEST_F(CompilerIntegrationTest, MaterializedViewTextColumnNeverInPayload) {
+  auto r = compile_sql(
+      "CREATE MATERIALIZED VIEW stats "
+      "TO \"ignition://x/stats/\" "
+      "AS SELECT AVG(price) AS avg, instrument_id "
+      "FROM trades GROUP BY instrument_id",
+      text_key_catalog());
+
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  ASSERT_TRUE(r.output_target.has_value());
+  ASSERT_EQ(r.output_payload_columns.size(), 1u);
+  EXPECT_EQ(r.output_payload_columns[0], "avg");
+}
+
+// A `{col}` placeholder referencing a NUMERIC projection (aggregate) is
+// rejected — path segments are strings, so the column must be TEXT.
+TEST_F(CompilerIntegrationTest, MaterializedViewNonTextPlaceholderRejected) {
+  const std::string sql =
+      "CREATE MATERIALIZED VIEW stats TO \"ignition://x/{avg}/\" "
+      "AS SELECT AVG(price) AS avg, instrument_id "
+      "FROM trades GROUP BY instrument_id";
+  auto r = compile_sql(sql, text_key_catalog());
+
+  ASSERT_TRUE(r.has_errors());
+  EXPECT_NE(r.errors[0].message.find(
+                "TO placeholder '{avg}' requires a TEXT column"),
+            std::string::npos);
+  auto brace = sql.find("{avg}");
+  ASSERT_NE(brace, std::string::npos);
+  EXPECT_EQ(r.errors[0].line, 1);
+  EXPECT_EQ(r.errors[0].column, static_cast<int>(brace) + 1);
+  EXPECT_EQ(r.errors[0].end_column, static_cast<int>(brace) + 1 + 5);
 }
 
 // Single-quoted TO templates are accepted (canonical SQL string form).
@@ -1693,27 +1824,28 @@ TEST_F(CompilerIntegrationTest, MaterializedViewSingleQuotedOutputTarget) {
       "TO 'ignition://x/stats/{instrument_id}/' "
       "AS SELECT AVG(price) AS avg, instrument_id "
       "FROM trades GROUP BY instrument_id",
-      catalog);
+      text_key_catalog());
 
   ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
   ASSERT_TRUE(r.output_target.has_value());
   EXPECT_EQ(*r.output_target, "ignition://x/stats/{instrument_id}/");
+  ASSERT_EQ(r.output_payload_columns.size(), 1u);
+  EXPECT_EQ(r.output_payload_columns[0], "avg");
 }
 
-// A bare `{col}` that doesn't match any projected column is a semantic error,
+// A `{col}` that doesn't match any projected column is a semantic error,
 // pointing at the placeholder (braces included).
 TEST_F(CompilerIntegrationTest, MaterializedViewOutputTargetUnknownColumn) {
   const std::string sql =
       "CREATE MATERIALIZED VIEW stats TO \"ignition://x/{nope}/\" "
       "AS SELECT AVG(price) AS avg, instrument_id "
       "FROM trades GROUP BY instrument_id";
-  auto r = compile_sql(sql, catalog);
+  auto r = compile_sql(sql, text_key_catalog());
 
   ASSERT_TRUE(r.has_errors());
   EXPECT_NE(r.errors[0].message.find(
                 "TO template references unknown column 'nope'"),
             std::string::npos);
-  // Span points at `{nope}`.
   auto brace = sql.find("{nope}");
   ASSERT_NE(brace, std::string::npos);
   EXPECT_EQ(r.errors[0].line, 1);
@@ -1721,23 +1853,26 @@ TEST_F(CompilerIntegrationTest, MaterializedViewOutputTargetUnknownColumn) {
   EXPECT_EQ(r.errors[0].end_column, static_cast<int>(brace) + 1 + 6);
 }
 
-// `{$var}` external placeholders are never validated against columns, so a
-// template using only externals registers all projected columns as payload.
-TEST_F(CompilerIntegrationTest, MaterializedViewOutputTargetExternalOnly) {
-  auto r = compile_sql(
+// `{$var}` external/runtime variables were dropped from the spec — deploy-
+// time values are written literally in the URI. A `$`-prefixed placeholder
+// is rejected with a migration hint, pointing at the placeholder.
+TEST_F(CompilerIntegrationTest, OutputTargetExternalPlaceholderRejected) {
+  const std::string sql =
       "CREATE MATERIALIZED VIEW stats TO \"ignition://{$instance}/all/\" "
       "AS SELECT AVG(price) AS avg, instrument_id "
-      "FROM trades GROUP BY instrument_id",
-      catalog);
+      "FROM trades GROUP BY instrument_id";
+  auto r = compile_sql(sql, text_key_catalog());
 
-  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
-  ASSERT_TRUE(r.output_target.has_value());
-  // No `{col}` placeholders → every projected column is payload.
-  const auto& payload = r.output_payload_columns;
-  EXPECT_EQ(payload.size(), 2u);
-  EXPECT_NE(std::find(payload.begin(), payload.end(), "avg"), payload.end());
-  EXPECT_NE(std::find(payload.begin(), payload.end(), "instrument_id"),
-            payload.end());
+  ASSERT_TRUE(r.has_errors());
+  EXPECT_NE(r.errors[0].message.find(
+                "external placeholders are not supported; write the value "
+                "literally in the URI"),
+            std::string::npos);
+  auto brace = sql.find("{$instance}");
+  ASSERT_NE(brace, std::string::npos);
+  EXPECT_EQ(r.errors[0].line, 1);
+  EXPECT_EQ(r.errors[0].column, static_cast<int>(brace) + 1);
+  EXPECT_EQ(r.errors[0].end_column, static_cast<int>(brace) + 1 + 11);
 }
 
 // `TO` is rejected on a plain (non-materialized) view.
@@ -1773,7 +1908,8 @@ TEST_F(CompilerIntegrationTest, OutputTargetEmptyPlaceholderRejected) {
       catalog);
 
   ASSERT_TRUE(r.has_errors());
-  EXPECT_NE(r.errors[0].message.find("empty placeholder"), std::string::npos);
+  EXPECT_NE(r.errors[0].message.find("TO template has an empty placeholder"),
+            std::string::npos);
 }
 
 }  // namespace

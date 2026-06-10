@@ -819,7 +819,10 @@ CompilationResult handle_create_mat_view(
                                 : StatementType::CREATE_VIEW;
     result.entity_name = stmt.name;
 
-    // Validate and record the optional `TO "<template>"` output target.
+    // Validate and record the optional `TO '<template>'` output target.
+    // `{col}` placeholders pick the value of a projected TEXT column per
+    // row (path segments are strings). The payload is every NUMERIC
+    // projected column — TEXT columns are path material, never tag values.
     if (stmt.output_target.has_value()) {
       const auto& ot = *stmt.output_target;
       if (!stmt.materialized) {
@@ -831,10 +834,31 @@ CompilationResult handle_create_mat_view(
         return err;
       }
 
-      // Each `{col}` placeholder must resolve to a projected output column.
-      std::set<std::string> referenced;
+      // TEXT-ness of a projected output column: aggregates and expressions
+      // are numeric; only a bare passthrough column inherits TEXT from the
+      // FROM source schema. (SELECT * expansion is not inspected — starred
+      // columns classify as numeric.)
+      auto output_column_is_text = [&](const std::string& out_name) -> bool {
+        for (const auto& item : stmt.query.select_list) {
+          const auto* cr = std::get_if<parser::ast::ColumnRef>(&item.expr);
+          std::string name;
+          if (item.alias.has_value()) {
+            name = *item.alias;
+          } else if (cr != nullptr) {
+            name = cr->column_name;
+          }
+          if (name != out_name) continue;
+          if (cr == nullptr) return false;
+          const auto schema = lookup_schema(stmt.query.from_table, catalog);
+          for (const auto& c : schema.columns) {
+            if (c.name == cr->column_name) return c.type == ColumnType::TEXT;
+          }
+          return false;
+        }
+        return false;
+      };
+
       for (const auto& ph : ot.placeholders) {
-        if (ph.is_external) continue;  // `{$var}` resolved at runtime.
         if (result.field_map.find(ph.name) == result.field_map.end()) {
           CompilationResult err{};
           err.errors.push_back(
@@ -843,17 +867,22 @@ CompilationResult handle_create_mat_view(
                ph.line, ph.column, ph.end_line, ph.end_column});
           return err;
         }
-        referenced.insert(ph.name);
+        if (!output_column_is_text(ph.name)) {
+          CompilationResult err{};
+          err.errors.push_back(
+              {"TO placeholder '{" + ph.name + "}' requires a TEXT column",
+               ph.line, ph.column, ph.end_line, ph.end_column});
+          return err;
+        }
       }
 
-      // Payload columns: every projected column not used in a placeholder,
-      // ordered by their position in the output vector.
+      // Payload: every numeric projected column, in output order.
       std::vector<std::pair<std::string, int>> cols(result.field_map.begin(),
                                                     result.field_map.end());
       std::sort(cols.begin(), cols.end(),
                 [](const auto& a, const auto& b) { return a.second < b.second; });
       for (const auto& [name, _idx] : cols) {
-        if (referenced.find(name) == referenced.end()) {
+        if (!output_column_is_text(name)) {
           result.output_payload_columns.push_back(name);
         }
       }
@@ -952,6 +981,69 @@ CompilationResult handle_drop(const parser::ast::DropStmt& stmt,
 
 }  // namespace
 
+namespace {
+
+// Parses `{...}` placeholders out of a URI template extracted from `sql`.
+// `content_offset` is the byte offset in `sql` of the template's first
+// character (just past the opening quote), so each placeholder's span maps
+// back to the source. `context` prefixes diagnostics ("CREATE STREAM: FROM
+// source", "TO template"). Returns an error result for empty, unterminated,
+// or `{$var}` placeholders; std::nullopt on success.
+std::optional<CompilationResult> parse_uri_placeholders(
+    const parser::SourceText& src, const std::string& tmpl,
+    int content_offset, const std::string& context,
+    std::vector<parser::ast::UriPlaceholder>& out) {
+  auto loc_error = [&](int byte_offset,
+                       const std::string& msg) -> CompilationResult {
+    auto loc = parser::compute_location(src, byte_offset);
+    CompilationResult r{};
+    r.errors.push_back(
+        {msg, loc.line, loc.column, loc.end_line, loc.end_column});
+    return r;
+  };
+
+  for (std::size_t p = 0; p < tmpl.size(); ++p) {
+    if (tmpl[p] != '{') continue;
+    std::size_t close = tmpl.find('}', p);
+    int open_abs = content_offset + static_cast<int>(p);
+    if (close == std::string::npos) {
+      return loc_error(open_abs,
+                       context + " has an unterminated `{` placeholder");
+    }
+    int close_abs = content_offset + static_cast<int>(close);
+
+    parser::ast::UriPlaceholder ph;
+    ph.name = tmpl.substr(p + 1, close - p - 1);
+
+    auto sloc = parser::compute_location(src, open_abs);
+    auto eloc = parser::compute_location(src, close_abs);
+    ph.line = sloc.line;
+    ph.column = sloc.column;
+    ph.end_line = eloc.end_line;
+    ph.end_column = eloc.end_column;
+
+    if (ph.name.empty()) {
+      return loc_error(open_abs, context + " has an empty placeholder");
+    }
+    if (ph.name[0] == '$') {
+      // `{$var}` externals were dropped from the spec — deploy-time values
+      // are written literally in the URI.
+      CompilationResult err{};
+      err.errors.push_back(
+          {context +
+               ": external placeholders are not supported; write the value "
+               "literally in the URI",
+           ph.line, ph.column, ph.end_line, ph.end_column});
+      return err;
+    }
+    out.push_back(std::move(ph));
+    p = close;
+  }
+  return std::nullopt;
+}
+
+}  // namespace
+
 CompilationResult compile_sql(const std::string& sql,
                               const CatalogSnapshot& catalog) {
   // Parse the optional FROM "..." [TYPE x] [WINDOW n] source metadata before
@@ -997,6 +1089,15 @@ CompilationResult compile_sql(const std::string& sql,
       s.column = loc.column;
       s.end_line = loc.end_line;
       s.end_column = loc.end_column;
+
+      // Parse `{col}` placeholders in the source string. Empty, unterminated
+      // and `$`-prefixed placeholders are rejected here; column resolution
+      // (declared, TEXT) happens in the analyzer.
+      if (auto err = parse_uri_placeholders(
+              src, s.name, static_cast<int>(m.position(2)),
+              "CREATE STREAM: FROM source", s.placeholders)) {
+        return *err;
+      }
 
       // Cursor for parsing TYPE and WINDOW clauses after the closing quote.
       std::size_t i = static_cast<std::size_t>(m.position(0)) +
@@ -1129,12 +1230,12 @@ CompilationResult compile_sql(const std::string& sql,
     }
   }
 
-  // Parse the optional CREATE MATERIALIZED VIEW `TO "<template>"` output
-  // target before normalization strips it. `{col}` placeholders must resolve
-  // to a projected output column (validated against the field_map in
-  // handle_create_mat_view, once it is known); `{$var}` are external runtime
-  // variables passed through untouched. `TO` is valid only on MATERIALIZED
-  // views.
+  // Parse the optional CREATE MATERIALIZED VIEW `TO '<template>'` output
+  // target before normalization strips it. The template is a parent path
+  // with optional `{col}` placeholders, each picking the value of a
+  // projected TEXT column per row (validated in handle_create_mat_view).
+  // The host writes one tag per numeric projected column under the resolved
+  // path. `TO` is valid only on MATERIALIZED views.
   std::optional<parser::ast::OutputTarget> output_target;
   {
     static const std::regex kMatView(R"(\bMATERIALIZED\s+VIEW\b)",
@@ -1171,37 +1272,12 @@ CompilationResult compile_sql(const std::string& sql,
       ot.end_line = qloc.end_line;
       ot.end_column = qloc.end_column;
 
-      // Byte offset in `sql` where the template content (just past the
-      // opening quote) begins, so placeholder spans map back to the source.
-      int content_offset = static_cast<int>(m.position(2));
-      const std::string& tmpl = ot.tag_template;
-      for (std::size_t p = 0; p < tmpl.size(); ++p) {
-        if (tmpl[p] != '{') continue;
-        std::size_t close = tmpl.find('}', p);
-        int open_abs = content_offset + static_cast<int>(p);
-        if (close == std::string::npos) {
-          return loc_error(open_abs,
-                           "TO template has an unterminated `{` placeholder");
-        }
-        int close_abs = content_offset + static_cast<int>(close);
-        std::string inner = tmpl.substr(p + 1, close - p - 1);
-
-        parser::ast::OutputPlaceholder ph;
-        ph.is_external = !inner.empty() && inner[0] == '$';
-        ph.name = ph.is_external ? inner.substr(1) : inner;
-
-        auto sloc = parser::compute_location(src, open_abs);
-        auto eloc = parser::compute_location(src, close_abs);
-        ph.line = sloc.line;
-        ph.column = sloc.column;
-        ph.end_line = eloc.end_line;
-        ph.end_column = eloc.end_column;
-
-        if (ph.name.empty()) {
-          return loc_error(open_abs, "TO template has an empty placeholder");
-        }
-        ot.placeholders.push_back(std::move(ph));
-        p = close;
+      // Parse `{col}` placeholders. Column resolution (projected, TEXT)
+      // happens in handle_create_mat_view once the field_map is known.
+      if (auto err = parse_uri_placeholders(
+              src, ot.tag_template, static_cast<int>(m.position(2)),
+              "TO template", ot.placeholders)) {
+        return *err;
       }
 
       output_target = std::move(ot);

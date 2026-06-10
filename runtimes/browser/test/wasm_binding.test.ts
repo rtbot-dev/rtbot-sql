@@ -105,7 +105,7 @@ describe("Real WASM binding — error location fields", () => {
       dictionaries: {},
     });
     const json = wasm!.compileSqlJson(
-      'CREATE STREAM vibration (amplitude DOUBLE) FROM "ignition://{x}/burst" TYPE csv_burst WINDOW 20480;',
+      'CREATE STREAM vibration (amplitude DOUBLE, x TEXT) FROM "ignition://{x}/burst" TYPE csv_burst WINDOW 20480;',
       catalogJson,
       1_000_000,
     );

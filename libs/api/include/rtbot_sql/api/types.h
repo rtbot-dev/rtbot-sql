@@ -70,7 +70,7 @@ struct ViewMeta {
   std::vector<double> known_keys;
   int key_index;
 
-  // `TO "<template>"` output target metadata (materialized views only).
+  // `TO '<template>'` output target metadata (materialized views only).
   // See CompilationResult for field semantics.
   std::optional<std::string> output_target;
   std::vector<std::string> output_payload_columns;
@@ -119,11 +119,14 @@ struct CompilationResult {
   EntityType drop_entity_type;
   std::map<std::string, std::map<double, std::string>> dictionary_updates;
 
-  // CREATE MATERIALIZED VIEW `TO "<template>"` output target. `output_target`
-  // is the raw tag-path template (placeholders intact); present only when the
-  // statement declared a TO clause. `output_payload_columns` are the view's
-  // projected columns NOT referenced by any `{col}` placeholder — the values
-  // written to the resolved tag path at execution time.
+  // CREATE MATERIALIZED VIEW `TO '<template>'` output target.
+  // `output_target` is the raw tag-path template (placeholders intact);
+  // present only when the statement declared a TO clause. `{col}`
+  // placeholders reference projected TEXT columns and resolve per row to
+  // path segments. `output_payload_columns` are the view's NUMERIC
+  // projected columns, in output order — the host writes one tag per
+  // payload column under the resolved path (TEXT columns are path
+  // material, never tag values).
   std::optional<std::string> output_target;
   std::vector<std::string> output_payload_columns;
 

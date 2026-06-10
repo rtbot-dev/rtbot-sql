@@ -200,8 +200,23 @@ struct SourceWindowClause {
   int end_column = -1;
 };
 
-// Metadata for `FROM "..."` on CREATE STREAM. `name` is the unquoted source
-// identifier; `line`/`column`/`end_line`/`end_column` span the `"..."`
+// A `{...}` placeholder inside a FROM source or TO template URI string.
+// `name` is the text between the braces and must resolve to a column —
+// a declared TEXT column for FROM sources, a projected output column for
+// TO templates. Deploy-time values (processor name, etc.) are written
+// literally in the URI — there are no external/runtime variables. The
+// span covers the placeholder including its braces (1-based, end
+// exclusive).
+struct UriPlaceholder {
+  std::string name;
+  int line = -1;
+  int column = -1;
+  int end_line = -1;
+  int end_column = -1;
+};
+
+// Metadata for `FROM '...'` on CREATE STREAM. `name` is the unquoted source
+// identifier; `line`/`column`/`end_line`/`end_column` span the quoted
 // token (inclusive start, exclusive end, 1-based).
 //
 // `type` and `window` are present only when the user wrote the respective
@@ -210,6 +225,9 @@ struct SourceWindowClause {
 // analyzer (libs/analyzer/src/ddl_analyzer.cpp::analyze_create_stream).
 struct Source {
   std::string name;
+  // Every `{...}` found in `name`, in template order. Each must reference
+  // a declared TEXT column (validated in the analyzer).
+  std::vector<UriPlaceholder> placeholders;
   int line = -1;
   int column = -1;
   int end_line = -1;
@@ -229,29 +247,15 @@ struct CreateStreamStmt {
   SourceLocation loc;
 };
 
-// A `{...}` placeholder inside a `TO "<template>"` output tag string.
-// `name` is the text between the braces, with any leading `$` stripped.
-// `is_external` is true for `{$var}` runtime/system variables — these are
-// passed through untouched and are never validated against the view's
-// columns. When false, `name` must resolve to a projected output column
-// of the view (checked in the compiler against the field_map). The span
-// covers the placeholder including its braces (1-based, end exclusive).
-struct OutputPlaceholder {
-  std::string name;
-  bool is_external = false;
-  int line = -1;
-  int column = -1;
-  int end_line = -1;
-  int end_column = -1;
-};
-
-// Metadata for the optional `TO "<template>"` clause on CREATE MATERIALIZED
+// Metadata for the optional `TO '<template>'` clause on CREATE MATERIALIZED
 // VIEW. `tag_template` is the unquoted string verbatim (placeholders
-// intact). `placeholders` is every `{...}` found in template order. The
-// span covers the `"..."` token (1-based, end exclusive).
+// intact). `placeholders` is every `{...}` found in template order; each
+// must reference a projected TEXT column of the view (checked in the
+// compiler against the field_map and source schema). The span covers the
+// quoted token (1-based, end exclusive).
 struct OutputTarget {
   std::string tag_template;
-  std::vector<OutputPlaceholder> placeholders;
+  std::vector<UriPlaceholder> placeholders;
   int line = -1;
   int column = -1;
   int end_line = -1;

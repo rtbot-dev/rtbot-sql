@@ -40,6 +40,13 @@ bool is_known_column_type(const std::string& name) {
   return false;
 }
 
+// Mirrors the compiler's TEXT mapping (libs/api/src/compiler.cpp,
+// handle_create_stream): text/varchar/bpchar become ColumnType::TEXT.
+bool is_text_column_type(const std::string& name) {
+  std::string n = lower(name);
+  return n == "text" || n == "varchar" || n == "bpchar";
+}
+
 }  // namespace
 
 void analyze_create_stream(const parser::ast::CreateStreamStmt& stmt,
@@ -92,6 +99,32 @@ void analyze_create_stream(const parser::ast::CreateStreamStmt& stmt,
         loc.end_line = src.window->end_line;
         loc.end_column = src.window->end_column;
         bag.error("CREATE STREAM: WINDOW must be a positive integer", loc);
+      }
+    }
+
+    // `{col}` placeholders must reference declared TEXT columns — they
+    // resolve to path segments of the matched tag path, which are strings.
+    for (const auto& ph : src.placeholders) {
+      const parser::ast::ColumnDefAST* col = nullptr;
+      for (const auto& c : stmt.columns) {
+        if (c.name == ph.name) {
+          col = &c;
+          break;
+        }
+      }
+      parser::ast::SourceLocation loc;
+      loc.line = ph.line;
+      loc.column = ph.column;
+      loc.end_line = ph.end_line;
+      loc.end_column = ph.end_column;
+      if (col == nullptr) {
+        bag.error("CREATE STREAM: FROM source references unknown column '" +
+                      ph.name + "'",
+                  loc);
+      } else if (!is_text_column_type(col->type_name)) {
+        bag.error("CREATE STREAM: FROM placeholder '{" + ph.name +
+                      "}' requires a TEXT column",
+                  loc);
       }
     }
   }
