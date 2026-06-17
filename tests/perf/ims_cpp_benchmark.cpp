@@ -5,6 +5,9 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <map>
 #include <iomanip>
 #include <iostream>
 #include <memory>
@@ -19,10 +22,65 @@
 #include "rtbot/Collector.h"
 #include "rtbot/Message.h"
 #include "rtbot/Program.h"
+
+// Feature-gate: the JIT API on Program (send_vector/drain_into/using_jit/...)
+// only exists on rtbot RB-495+. On master we fall back to receive().
+#if __has_include(<rtbot/compiled/jit/JitCompiledProgram.h>)
+#  define RTBOT_HAS_JIT_API 1
+#  include "rtbot/compiled/jit/JitCompiler.h"
+#else
+#  define RTBOT_HAS_JIT_API 0
+#endif
+
 #include "rtbot/fuse/BurstAggregate.h"
 #include "rtbot/fuse/FusedOps.h"
 
 namespace {
+
+// Push (timestamp, values...) into program and invoke `sink(t, v, n)` for
+// every emitted vector message. On RB-495 this uses the JIT fast path
+// (send_vector + drain_into); on master it falls back to receive() and
+// walks the returned batch.
+template <typename Sink>
+inline void send_and_drain(rtbot::Program& program, std::int64_t t,
+                            const double* v, std::size_t n, Sink&& sink) {
+#if RTBOT_HAS_JIT_API
+  program.send_vector(t, v, n);
+  program.drain_into(std::forward<Sink>(sink));
+#else
+  std::vector<double> tmp(v, v + n);
+  auto batch = program.receive(rtbot::create_message<rtbot::VectorNumberData>(
+      static_cast<rtbot::timestamp_t>(t),
+      rtbot::VectorNumberData{std::move(tmp)}));
+  for (const auto& [op_id, op_batch] : batch) {
+    (void)op_id;
+    for (const auto& [port_name, messages] : op_batch) {
+      (void)port_name;
+      for (const auto& message : messages) {
+        if (auto* vm = dynamic_cast<const rtbot::Message<rtbot::VectorNumberData>*>(
+                message.get())) {
+          const auto& vals =
+              vm->data.values ? *vm->data.values : std::vector<double>{};
+          sink(static_cast<std::int64_t>(vm->time), vals.data(), vals.size());
+        } else if (auto* nm = dynamic_cast<const rtbot::Message<rtbot::NumberData>*>(
+                       message.get())) {
+          const double dv = nm->data.value;
+          sink(static_cast<std::int64_t>(nm->time), &dv, std::size_t{1});
+        }
+      }
+    }
+  }
+#endif
+}
+
+inline int using_jit_int(const rtbot::Program& program) {
+#if RTBOT_HAS_JIT_API
+  return program.using_jit() ? 1 : 0;
+#else
+  (void)program;
+  return 0;
+#endif
+}
 
 using rtbot_sql::CatalogSnapshot;
 using rtbot_sql::CompilationResult;
@@ -169,6 +227,7 @@ struct Config {
   bool burst_aggregate = false;
   bool burst_buffer = false;
   bool count_operators = false;
+  bool parity_check = false;
   std::vector<std::string> presets = {
       "01_rms",
       "02_kurtosis",
@@ -255,6 +314,9 @@ void print_help(const char* argv0) {
       << "                          the full ceiling through the productized operator.\n"
       << "  --count-operators       Compile each preset and print operator counts\n"
       << "                          (set RTBOT_DISABLE_FUSION=1 to compare without)\n"
+      << "  --parity-check          Run the IMS workload twice (JIT then forced\n"
+      << "                          interpreter) and bit-exact compare every emission\n"
+      << "                          (timestamp, port_id, values) per preset.\n"
       << "  --list-presets          Print available preset IDs and exit\n"
       << "  --help                  Show this message\n\n"
       << "Example:\n"
@@ -366,6 +428,11 @@ Config parse_args(int argc, char** argv) {
       continue;
     }
 
+    if (arg == "--parity-check") {
+      cfg.parity_check = true;
+      continue;
+    }
+
     throw std::runtime_error("Unknown argument: " + arg);
   }
 
@@ -432,7 +499,7 @@ std::unique_ptr<rtbot::Message<rtbot::VectorNumberData>> make_vector_message(
       timestamp, rtbot::VectorNumberData{std::move(values)});
 }
 
-std::size_t count_total_messages(const rtbot::ProgramMsgBatch& batch) {
+[[maybe_unused]] std::size_t count_total_messages(const rtbot::ProgramMsgBatch& batch) {
   std::size_t count = 0;
   for (const auto& [op_id, op_batch] : batch) {
     (void)op_id;
@@ -660,6 +727,208 @@ int run_pure_cpp(const Config& cfg) {
   return 0;
 }
 
+struct ParityEmission {
+  std::int64_t t;
+  std::int32_t port_id;
+  std::vector<double> values;
+};
+
+inline std::uint64_t dbits(double v) {
+  std::uint64_t b = 0;
+  std::memcpy(&b, &v, sizeof(double));
+  return b;
+}
+
+struct ParityRun {
+  // Per preset id -> list of emissions captured from drain_into.
+  std::map<std::string, std::vector<ParityEmission>> per_preset;
+  // Base view emissions (one entry per produced vector message from the base
+  // program drain).
+  std::vector<ParityEmission> base_view;
+};
+
+ParityRun run_ims_capture(const Config& cfg, const std::string& base_view_json,
+                          const std::vector<PresetDef>& active_presets,
+                          const std::vector<std::string>& preset_jsons,
+                          const std::string& mode_label) {
+  ParityRun run;
+
+  rtbot::Program base_program(base_view_json);
+  std::cerr << "[parity:" << mode_label
+            << "] base_view using_jit=" << using_jit_int(base_program) << "\n";
+
+  std::vector<std::unique_ptr<PipelineInstance>> pipelines;
+  pipelines.reserve(active_presets.size());
+  for (std::size_t i = 0; i < active_presets.size(); ++i) {
+    pipelines.push_back(std::make_unique<PipelineInstance>(
+        active_presets[i].id, active_presets[i].view_name, preset_jsons[i]));
+    std::cerr << "[parity:" << mode_label << "] preset " << active_presets[i].id
+              << " using_jit=" << using_jit_int(pipelines.back()->program) << "\n";
+  }
+
+  rtbot::timestamp_t timestamp = 1'000'000'000'000;
+
+  auto dispatch_base_emit = [&](std::int64_t t, const double* v, std::size_t n) {
+    ParityEmission be;
+    be.t = t;
+    be.port_id = 0;
+    be.values.assign(v, v + n);
+    run.base_view.push_back(std::move(be));
+    for (auto& pipeline : pipelines) {
+      send_and_drain(pipeline->program, t, v, n,
+          [&](std::int64_t et, const double* ev, std::size_t en) {
+            ParityEmission e;
+            e.t = et;
+            e.port_id = 0;
+            e.values.assign(ev, ev + en);
+            run.per_preset[pipeline->id].push_back(std::move(e));
+          });
+    }
+  };
+
+  auto feed_raw = [&](double device_id, double channel_id, double amplitude,
+                      rtbot::timestamp_t msg_ts) {
+    const double row[3] = {device_id, channel_id, amplitude};
+    send_and_drain(base_program, static_cast<std::int64_t>(msg_ts), row, 3,
+                   dispatch_base_emit);
+  };
+
+  for (int burst = 1; burst <= cfg.bursts; ++burst) {
+    for (int bearing = 1; bearing <= cfg.bearings; ++bearing) {
+      for (int sample = 0; sample < cfg.samples_per_burst; ++sample) {
+        feed_raw(static_cast<double>(bearing), 1.0,
+                 synthetic_amplitude(sample), timestamp + sample);
+      }
+      feed_raw(static_cast<double>(bearing), 1.0, 0.0,
+               timestamp + cfg.samples_per_burst);
+      timestamp += cfg.samples_per_burst + 100;
+    }
+  }
+  return run;
+}
+
+bool diff_emissions(const std::string& label,
+                    const std::vector<ParityEmission>& a,
+                    const std::vector<ParityEmission>& b) {
+  if (a.size() != b.size()) {
+    std::cout << "  [" << label << "] FAIL: size mismatch (jit=" << a.size()
+              << " interp=" << b.size() << ")\n";
+    return false;
+  }
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    if (a[i].t != b[i].t || a[i].port_id != b[i].port_id ||
+        a[i].values.size() != b[i].values.size()) {
+      std::cout << "  [" << label << "] FAIL: header mismatch at idx " << i
+                << " jit(t=" << a[i].t << ", port=" << a[i].port_id
+                << ", n=" << a[i].values.size() << ")"
+                << " interp(t=" << b[i].t << ", port=" << b[i].port_id
+                << ", n=" << b[i].values.size() << ")\n";
+      return false;
+    }
+    for (std::size_t k = 0; k < a[i].values.size(); ++k) {
+      const std::uint64_t ab = dbits(a[i].values[k]);
+      const std::uint64_t bb = dbits(b[i].values[k]);
+      if (ab != bb) {
+        std::cout << "  [" << label << "] FAIL: value mismatch at idx " << i
+                  << " value " << k << " t=" << a[i].t << " jit=" << std::hex
+                  << ab << " interp=" << bb << std::dec << " ("
+                  << std::setprecision(17) << a[i].values[k] << " vs "
+                  << b[i].values[k] << std::setprecision(6) << ")\n";
+        return false;
+      }
+    }
+  }
+  std::cout << "  [" << label << "] PASS: " << a.size()
+            << " emissions match bit-exactly\n";
+  return true;
+}
+
+int run_parity_check(const Config& cfg) {
+#if !RTBOT_HAS_JIT_API
+  std::cout << "[parity-check] JIT API not available on this rtbot build; "
+               "parity check requires rtbot RB-495+. Skipping.\n";
+  (void)cfg;
+  return 0;
+#else
+  std::cout << "\n================================================================\n";
+  std::cout << "IMS JIT vs interpreter bit-exact parity check\n";
+  std::cout << "================================================================\n";
+  std::cout << "Config:\n";
+  std::cout << "  bearings            : " << cfg.bearings << "\n";
+  std::cout << "  samples_per_burst   : " << cfg.samples_per_burst << "\n";
+  std::cout << "  bursts              : " << cfg.bursts << "\n";
+  std::cout << "  active presets      : ";
+  for (std::size_t i = 0; i < cfg.presets.size(); ++i) {
+    std::cout << cfg.presets[i];
+    if (i + 1 < cfg.presets.size()) std::cout << ",";
+  }
+  std::cout << "\n----------------------------------------------------------------\n";
+
+  CatalogSnapshot catalog;
+  const auto stream = compile_or_die(kStreamSql, catalog, "vibration_raw stream");
+  register_stream(catalog, stream);
+  const auto base_view =
+      compile_or_die(kBaseViewSql, catalog, "vibration_moments view");
+  register_view(catalog, base_view, EntityType::VIEW);
+
+  std::vector<PresetDef> active_presets;
+  std::vector<std::string> preset_jsons;
+  for (const auto& preset_id : cfg.presets) {
+    const auto* preset = find_preset(preset_id);
+    if (!preset) {
+      throw std::runtime_error("Unknown preset ID: " + preset_id);
+    }
+    const auto compiled = compile_or_die(preset->sql, catalog,
+                                         "preset " + preset->id);
+    register_view(catalog, compiled, EntityType::MATERIALIZED_VIEW);
+    active_presets.push_back(*preset);
+    preset_jsons.push_back(compiled.program_json);
+  }
+
+#if RTBOT_HAS_JIT_API
+  std::cout << "Pass 1: JIT enabled\n";
+  rtbot::Program::set_force_interpreter_for_testing(false);
+  ParityRun jit_run = run_ims_capture(cfg, base_view.program_json,
+                                       active_presets, preset_jsons, "jit");
+
+  std::cout << "Pass 2: forced interpreter\n";
+  rtbot::Program::set_force_interpreter_for_testing(true);
+  ParityRun interp_run = run_ims_capture(cfg, base_view.program_json,
+                                          active_presets, preset_jsons, "interp");
+  rtbot::Program::set_force_interpreter_for_testing(false);
+
+  std::cout << "----------------------------------------------------------------\n";
+  std::cout << "Diff results:\n";
+
+  bool all_pass = true;
+  all_pass &= diff_emissions("base_view (vibration_moments)",
+                              jit_run.base_view, interp_run.base_view);
+  for (const auto& preset : active_presets) {
+    const auto& a = jit_run.per_preset[preset.id];
+    const auto& b = interp_run.per_preset[preset.id];
+    all_pass &= diff_emissions(preset.id + " (" + preset.view_name + ")", a, b);
+  }
+
+  std::cout << "================================================================\n";
+  if (all_pass) {
+    std::cout << "OVERALL: PASS — every JIT emission matches the interpreter "
+                 "bit-exactly.\n";
+  } else {
+    std::cout << "OVERALL: FAIL — see divergence reports above.\n";
+  }
+  std::cout << "================================================================\n";
+  return all_pass ? 0 : 1;
+#else
+  std::cout << "parity-check requires rtbot with the JIT API (RB-495+); "
+               "rtbot master detected, skipping.\n";
+  (void)base_view;
+  (void)active_presets;
+  (void)preset_jsons;
+  return 0;
+#endif
+#endif
+}
+
 int run_count_operators(const Config& cfg) {
   const bool fusion_disabled = std::getenv("RTBOT_DISABLE_FUSION") != nullptr;
 
@@ -737,6 +1006,10 @@ int main(int argc, char** argv) {
       return run_count_operators(cfg);
     }
 
+    if (cfg.parity_check) {
+      return run_parity_check(cfg);
+    }
+
     CatalogSnapshot catalog;
 
     const auto stream = compile_or_die(kStreamSql, catalog, "vibration_raw stream");
@@ -769,11 +1042,38 @@ int main(int argc, char** argv) {
       }
 
       register_view(catalog, compiled, EntityType::MATERIALIZED_VIEW);
+      // Dump the compiled JSON for inspection
+      if (preset->id == "01_rms") {
+        std::ofstream("/tmp/rtbot_sql_preset_01_rms.json") << compiled.program_json;
+      }
+#if RTBOT_HAS_JIT_API
+      // Try to compile via the JIT directly to see the failure reason
+      try {
+        auto jit_p = rtbot::jit::JitCompiler{}.compile(compiled.program_json);
+        std::cerr << "[probe] preset " << preset->id << " JIT compile OK\n";
+      } catch (const std::exception& e) {
+        std::cerr << "[probe] preset " << preset->id << " JIT compile FAILED: " << e.what() << "\n";
+      }
+#endif
       pipelines.push_back(std::make_unique<PipelineInstance>(
           preset->id, preset->view_name, compiled.program_json));
+      std::cerr << "[probe] preset " << preset->id
+                << " using_jit=" << using_jit_int(pipelines.back()->program) << "\n";
     }
 
+    if (true) {
+      std::ofstream("/tmp/rtbot_sql_base_view.json") << base_view.program_json;
+    }
+#if RTBOT_HAS_JIT_API
+    try {
+      auto jit_b = rtbot::jit::JitCompiler{}.compile(base_view.program_json);
+      std::cerr << "[probe] base_view JIT compile OK\n";
+    } catch (const std::exception& e) {
+      std::cerr << "[probe] base_view JIT compile FAILED: " << e.what() << "\n";
+    }
+#endif
     rtbot::Program base_program(base_view.program_json);
+    std::cerr << "[probe] base_view using_jit=" << using_jit_int(base_program) << "\n";
     std::uint64_t ingress_messages = 0;
     std::uint64_t base_outputs = 0;
     std::uint64_t materialized_outputs = 0;
@@ -816,12 +1116,20 @@ int main(int argc, char** argv) {
             }
 
             ++base_outputs;
+            const double* vdata = vec_msg->data.values ? vec_msg->data.values->data()
+                                                        : nullptr;
+            const std::size_t vsize = vec_msg->data.values ? vec_msg->data.values->size()
+                                                            : std::size_t{0};
             for (auto& pipeline : pipelines) {
               ++pipeline->forwarded_messages;
               ++program_receive_calls;
-              auto output_batch = pipeline->program.receive(
-                  make_vector_message(vec_msg->time, *vec_msg->data.values), "i1");
-              const auto produced = count_total_messages(output_batch);
+              std::size_t produced = 0;
+              send_and_drain(pipeline->program,
+                             static_cast<std::int64_t>(vec_msg->time),
+                             vdata, vsize,
+                             [&produced](std::int64_t, const double*, std::size_t) {
+                               ++produced;
+                             });
               pipeline->output_messages += produced;
               materialized_outputs += produced;
             }
@@ -830,13 +1138,32 @@ int main(int argc, char** argv) {
       }
     };
 
+    // Streaming dispatch: forward each base_program emission directly to the
+    // preset pipelines via send_and_drain, avoiding the per-emission
+    // Message<VectorNumberData> allocation that the batch path incurs.
+    auto dispatch_base_emit = [&](std::int64_t t, const double* v,
+                                   std::size_t n) {
+      ++base_outputs;
+      for (auto& pipeline : pipelines) {
+        ++pipeline->forwarded_messages;
+        ++program_receive_calls;
+        std::size_t produced = 0;
+        send_and_drain(pipeline->program, t, v, n,
+                       [&produced](std::int64_t, const double*, std::size_t) {
+                         ++produced;
+                       });
+        pipeline->output_messages += produced;
+        materialized_outputs += produced;
+      }
+    };
+
     auto feed_raw = [&](double device_id, double channel_id, double amplitude,
                         rtbot::timestamp_t msg_ts) {
       ++program_receive_calls;
       ++ingress_messages;
-      auto batch = base_program.receive(
-          make_vector_message(msg_ts, {device_id, channel_id, amplitude}), "i1");
-      dispatch_base_batch(batch);
+      const double row[3] = {device_id, channel_id, amplitude};
+      send_and_drain(base_program, static_cast<std::int64_t>(msg_ts), row, 3,
+                     dispatch_base_emit);
     };
 
     // In batch mode we accumulate a full burst (all amplitude samples plus the
@@ -952,14 +1279,14 @@ int main(int argc, char** argv) {
       ingress_messages += static_cast<std::uint64_t>(cfg.samples_per_burst) + 1;
       ++base_outputs;
       ++program_receive_calls;  // the single aggregate emission
-      auto vec_msg = make_vector_message(
-          boundary_ts,
-          std::vector<double>(agg, agg + 10));
       for (auto& pipeline : pipelines) {
         ++pipeline->forwarded_messages;
-        auto output_batch = pipeline->program.receive(
-            make_vector_message(vec_msg->time, *vec_msg->data.values), "i1");
-        const auto produced = count_total_messages(output_batch);
+        std::size_t produced = 0;
+        send_and_drain(pipeline->program,
+                       static_cast<std::int64_t>(boundary_ts), agg, 10,
+                       [&produced](std::int64_t, const double*, std::size_t) {
+                         ++produced;
+                       });
         pipeline->output_messages += produced;
         materialized_outputs += produced;
       }
@@ -994,11 +1321,18 @@ int main(int argc, char** argv) {
           continue;
         }
         ++base_outputs;
+        const double* vdata = vm->data.values ? vm->data.values->data() : nullptr;
+        const std::size_t vsize = vm->data.values ? vm->data.values->size()
+                                                   : std::size_t{0};
         for (auto& pipeline : pipelines) {
           ++pipeline->forwarded_messages;
-          auto output_batch = pipeline->program.receive(
-              make_vector_message(vm->time, *vm->data.values), "i1");
-          const auto produced = count_total_messages(output_batch);
+          std::size_t produced = 0;
+          send_and_drain(pipeline->program,
+                         static_cast<std::int64_t>(vm->time),
+                         vdata, vsize,
+                         [&produced](std::int64_t, const double*, std::size_t) {
+                           ++produced;
+                         });
           pipeline->output_messages += produced;
           materialized_outputs += produced;
         }
@@ -1043,11 +1377,18 @@ int main(int argc, char** argv) {
           continue;
         }
         ++base_outputs;
+        const double* vdata = vm->data.values ? vm->data.values->data() : nullptr;
+        const std::size_t vsize = vm->data.values ? vm->data.values->size()
+                                                   : std::size_t{0};
         for (auto& pipeline : pipelines) {
           ++pipeline->forwarded_messages;
-          auto output_batch = pipeline->program.receive(
-              make_vector_message(vm->time, *vm->data.values), "i1");
-          const auto produced = count_total_messages(output_batch);
+          std::size_t produced = 0;
+          send_and_drain(pipeline->program,
+                         static_cast<std::int64_t>(vm->time),
+                         vdata, vsize,
+                         [&produced](std::int64_t, const double*, std::size_t) {
+                           ++produced;
+              });
           pipeline->output_messages += produced;
           materialized_outputs += produced;
         }
