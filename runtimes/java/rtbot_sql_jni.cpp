@@ -197,6 +197,14 @@ ViewMeta view_meta_from_json(const json& j) {
     v.view_type = ViewType::SCALAR;
 
   v.field_map = j.at("field_map").get<std::map<std::string, int>>();
+  if (j.contains("field_origins") && j["field_origins"].is_object()) {
+    for (const auto& [alias, origin_j] : j["field_origins"].items()) {
+      FieldOrigin origin;
+      origin.source_stream = origin_j.value("source_stream", "");
+      origin.source_column = origin_j.value("source_column", "");
+      v.field_origins[alias] = origin;
+    }
+  }
   v.source_streams =
       j.at("source_streams").get<std::vector<std::string>>();
   v.program_json = j.value("program_json", "");
@@ -339,6 +347,17 @@ json result_to_json(const CompilationResult& r) {
   j["entity_name"] = r.entity_name;
   j["program_json"] = r.program_json;
   j["field_map"] = r.field_map;
+  // Direct `column AS alias` projections — host runtimes use these to
+  // look up the source TEXT column's StringDictionary at output-path
+  // build time so renamed columns still decode back to the original
+  // string. Aggregates / expressions are absent; their outputs are
+  // DOUBLE and have no source column to decode against.
+  json field_origins = json::object();
+  for (const auto& [alias, origin] : r.field_origins) {
+    field_origins[alias] = {{"source_stream", origin.source_stream},
+                            {"source_column", origin.source_column}};
+  }
+  j["field_origins"] = field_origins;
   j["source_streams"] = r.source_streams;
   j["view_type"] = view_type_str(r.view_type);
   j["key_index"] = r.key_index;

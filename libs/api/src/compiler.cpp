@@ -196,8 +196,11 @@ CompilationResult compile_stream_cross_select(
                                       &source_ports);
   }
 
-  auto [ep, field_map, _seg] = compiler::compile_select_projection(
+  auto sel_result = compiler::compile_select_projection(
       expanded_select, current, scope, builder, &source_ports);
+  auto ep = sel_result.endpoint;
+  auto field_map = sel_result.field_map;
+  auto field_origins = sel_result.field_origins;
   current = ep;
 
   if (!stmt.order_by.empty() && stmt.limit.has_value()) {
@@ -233,6 +236,7 @@ CompilationResult compile_stream_cross_select(
 
   result.program_json = builder.to_json();
   result.field_map = field_map;
+  result.field_origins = field_origins;
   result.source_streams.clear();
   for (const auto& src : stmt.from_tables) {
     result.source_streams.push_back(src.table_name);
@@ -329,23 +333,29 @@ CompilationResult compile_select_to_program(
   }
 
   compiler::FieldMap field_map;
+  compiler::FieldOrigins field_origins;
 
   // GROUP BY
   bool is_segment_only_group_by = false;
   if (!expanded_group_by.empty()) {
-    auto [ep, fm, seg_only] = compiler::compile_group_by(
+    auto gb = compiler::compile_group_by(
         expanded_select, expanded_group_by, expanded_having, current, scope,
         builder, num_input_cols);
-    current = ep;
-    field_map = fm;
-    is_segment_only_group_by = seg_only;
+    current = gb.endpoint;
+    field_map = gb.field_map;
+    field_origins = gb.field_origins;  // empty today; aggregate outputs
+                                        // are DOUBLE so no decoding is
+                                        // needed, but propagate in case
+                                        // group_by_compiler starts
+                                        // populating them.
+    is_segment_only_group_by = gb.is_segment_only;
   } else {
     // SELECT projection. When try_absorb_where is on, we haven't yet emitted
     // compile_where — give the projection a shot at folding it into the FEV.
     const parser::ast::Expr* where_ptr =
         try_absorb_where ? &*expanded_where : nullptr;
     bool where_absorbed = false;
-    auto [ep, fm, _seg2] = compiler::compile_select_projection(
+    auto sel = compiler::compile_select_projection(
         expanded_select, current, scope, builder,
         /*source_endpoints=*/nullptr, where_ptr, &where_absorbed);
     // Absorption is best-effort. If the projection fell back (multi-source
@@ -358,9 +368,11 @@ CompilationResult compile_select_to_program(
                                                         scope, builder);
       current = retry.endpoint;
       field_map = retry.field_map;
+      field_origins = retry.field_origins;
     } else {
-      current = ep;
-      field_map = fm;
+      current = sel.endpoint;
+      field_map = sel.field_map;
+      field_origins = sel.field_origins;
     }
   }
 
@@ -402,6 +414,7 @@ CompilationResult compile_select_to_program(
 
   result.program_json = builder.to_json();
   result.field_map = field_map;
+  result.field_origins = field_origins;
   result.source_streams = {stmt.from_table};
 
   // Determine view type
@@ -588,6 +601,7 @@ CompilationResult handle_select(const parser::ast::SelectStmt& stmt,
       if (compiled.has_errors()) return compiled;
       result.program_json = compiled.program_json;
       result.field_map = compiled.field_map;
+      result.field_origins = compiled.field_origins;
       result.source_streams = compiled.source_streams;
       result.view_type = compiled.view_type;
       result.key_index = compiled.key_index;
@@ -615,6 +629,7 @@ CompilationResult handle_select(const parser::ast::SelectStmt& stmt,
       if (compiled.has_errors()) return compiled;
       result.program_json = compiled.program_json;
       result.field_map = compiled.field_map;
+      result.field_origins = compiled.field_origins;
       result.source_streams = compiled.source_streams;
       result.view_type = compiled.view_type;
       result.key_index = compiled.key_index;
@@ -741,11 +756,13 @@ CompilationResult compile_table_join(
 
   // SELECT projection (or pass-through for SELECT *)
   compiler::FieldMap field_map;
+  compiler::FieldOrigins field_origins;
   if (!stmt.select_list.empty()) {
-    auto [ep, fm, _seg3] = compiler::compile_select_projection(
+    auto sel = compiler::compile_select_projection(
         stmt.select_list, current, scope, builder);
-    current = ep;
-    field_map = fm;
+    current = sel.endpoint;
+    field_map = sel.field_map;
+    field_origins = sel.field_origins;
   } else {
     for (const auto& col : left_schema.columns) {
       field_map[col.name] = col.index;
@@ -770,6 +787,7 @@ CompilationResult compile_table_join(
   result.select_tier = SelectTier::TIER3_EPHEMERAL;
   result.program_json = builder.to_json();
   result.field_map = field_map;
+  result.field_origins = field_origins;
   // source_streams: left stream + table entity name (for dependency checking)
   result.source_streams = {stmt.from_table, join.table_name};
   result.view_type = ViewType::SCALAR;
@@ -921,11 +939,13 @@ CompilationResult handle_select_from_view(const parser::ast::SelectStmt& stmt,
 
   // Apply SELECT projection (if not SELECT *).
   compiler::FieldMap field_map = view_meta.field_map;
+  compiler::FieldOrigins field_origins = view_meta.field_origins;
   if (!stmt.select_list.empty()) {
-    auto [ep, fm, _seg4] = compiler::compile_select_projection(
+    auto sel = compiler::compile_select_projection(
         stmt.select_list, current, scope, builder);
-    current = ep;
-    field_map = fm;
+    current = sel.endpoint;
+    field_map = sel.field_map;
+    field_origins = sel.field_origins;
   }
 
   // Re-wire Output operator.
@@ -953,6 +973,7 @@ CompilationResult handle_select_from_view(const parser::ast::SelectStmt& stmt,
   result.select_tier = SelectTier::TIER3_EPHEMERAL;
   result.program_json = builder.to_json();
   result.field_map = field_map;
+  result.field_origins = field_origins;
   result.source_streams = view_meta.source_streams;
   result.select_limit = *stmt.limit;
   return result;
@@ -1728,6 +1749,7 @@ void apply_result_to_catalog(CatalogSnapshot& catalog,
                             : EntityType::MATERIALIZED_VIEW;
       vm.view_type = r.view_type;
       vm.field_map = r.field_map;
+      vm.field_origins = r.field_origins;
       vm.source_streams = r.source_streams;
       vm.program_json = r.program_json;
       vm.key_index = r.key_index;

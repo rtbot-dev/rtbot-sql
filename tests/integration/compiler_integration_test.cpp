@@ -2021,6 +2021,78 @@ TEST_F(CompilerIntegrationTest, MaterializedViewWithoutOutputTarget) {
   EXPECT_TRUE(r.output_payload_columns.empty());
 }
 
+// ---------------------------------------------------------------------------
+// SELECT projection alias → source-column tracking (FieldOrigins).
+//
+// Host runtimes need this map to decode TEXT columns that have been
+// renamed by a SELECT projection (e.g. `machine AS machine_id`). The
+// dictionary key for the underlying StringDictionary is keyed by the
+// source stream + source column, but the output row only carries the
+// alias — without origin info the decoder can't find the right dict.
+// ---------------------------------------------------------------------------
+
+// Helper: minimal catalog with one TEXT column path-part and one numeric
+// value column on a stream named `cpu` — mirrors the coprocessor's
+// canonical CREATE STREAM ... FROM '.../{machine}/...' shape.
+static CatalogSnapshot cpu_text_catalog() {
+  CatalogSnapshot cat;
+  StreamSchema cpu{"cpu",
+                   {{"machine", 0, ColumnType::TEXT},
+                    {"cpu_usage", 1}}};
+  cat.streams["cpu"] = cpu;
+  return cat;
+}
+
+// A direct `column AS alias` projection records its source so the
+// runtime can locate the source stream's StringDictionary at output-path
+// build time. Aggregate / expression items don't get an entry — they
+// produce DOUBLE outputs that don't need decoding.
+TEST_F(CompilerIntegrationTest, FieldOriginsRecordRenameForColumnRef) {
+  auto cat = cpu_text_catalog();
+  auto r = compile_sql(
+      "CREATE MATERIALIZED VIEW v TO \"[Coprocessor]Usage/{machine_id}\" AS "
+      "SELECT machine AS machine_id, "
+      "MOVING_AVERAGE(cpu_usage, 3) AS cpu_usage_avg "
+      "FROM cpu",
+      cat);
+
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  // The rename is captured: machine_id traces back to cpu.machine.
+  ASSERT_NE(r.field_origins.find("machine_id"), r.field_origins.end());
+  EXPECT_EQ(r.field_origins.at("machine_id").source_stream, "cpu");
+  EXPECT_EQ(r.field_origins.at("machine_id").source_column, "machine");
+  // The aggregate has no source TEXT column — absent from field_origins.
+  EXPECT_EQ(r.field_origins.find("cpu_usage_avg"), r.field_origins.end());
+}
+
+// A projection without a rename (bare ColumnRef) still gets an origin
+// entry — the alias and source column happen to be the same name, but
+// recording it keeps decoder logic uniform and works for the SELECT *
+// rewriting case.
+TEST_F(CompilerIntegrationTest, FieldOriginsRecordBareColumnRef) {
+  auto cat = cpu_text_catalog();
+  auto r = compile_sql(
+      "CREATE MATERIALIZED VIEW v TO \"[Coprocessor]Usage/{machine}\" AS "
+      "SELECT machine, MOVING_AVERAGE(cpu_usage, 3) AS avg FROM cpu", cat);
+
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  ASSERT_NE(r.field_origins.find("machine"), r.field_origins.end());
+  EXPECT_EQ(r.field_origins.at("machine").source_column, "machine");
+}
+
+// A SELECT with no ColumnRefs (only aggregates) produces an empty
+// field_origins map — nothing to decode.
+TEST_F(CompilerIntegrationTest, FieldOriginsEmptyForAggregateOnlySelect) {
+  auto cat = cpu_text_catalog();
+  auto r = compile_sql(
+      "CREATE MATERIALIZED VIEW v AS "
+      "SELECT MOVING_AVERAGE(cpu_usage, 3) AS avg, "
+      "MOVING_SUM(cpu_usage, 3) AS sum FROM cpu", cat);
+
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  EXPECT_TRUE(r.field_origins.empty());
+}
+
 // An empty `{}` placeholder is rejected.
 TEST_F(CompilerIntegrationTest, OutputTargetEmptyPlaceholderRejected) {
   auto r = compile_sql(

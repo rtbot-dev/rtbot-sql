@@ -58,11 +58,23 @@ struct StreamSchema {
   }
 };
 
+// Maps a projected output field to the (source_stream, source_column)
+// it was renamed from in the SELECT. Populated only for direct
+// `column AS alias` projections — expressions (aggregates, arithmetic)
+// have no single source column and are absent. Used by output decoders
+// to look up the source TEXT column's StringDictionary so the alias
+// receives the decoded string rather than the raw dictionary ID.
+struct FieldOrigin {
+  std::string source_stream;
+  std::string source_column;
+};
+
 struct ViewMeta {
   std::string name;
   EntityType entity_type;
   ViewType view_type;
   std::map<std::string, int> field_map;
+  std::map<std::string, FieldOrigin> field_origins;
   std::vector<std::string> source_streams;
   std::string program_json;
   std::string output_stream;
@@ -105,6 +117,10 @@ struct CompilationResult {
   StatementType statement_type;
   std::string program_json;
   std::map<std::string, int> field_map;
+  // See FieldOrigin doc on ViewMeta. Mirror for the compile output so
+  // host runtimes that don't round-trip via the catalog still get the
+  // alias→source map needed for output decoding.
+  std::map<std::string, FieldOrigin> field_origins;
   std::vector<std::string> source_streams;
   ViewType view_type;
   int key_index;
