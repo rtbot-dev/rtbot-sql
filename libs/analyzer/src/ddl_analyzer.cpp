@@ -127,6 +127,51 @@ void analyze_create_stream(const parser::ast::CreateStreamStmt& stmt,
                   loc);
       }
     }
+
+    // Every declared TEXT column must be filled by a `{col}` placeholder
+    // in the FROM string. Non-TEXT columns derive from the tag value
+    // lane; TEXT columns can only come from path parts, so a TEXT column
+    // without a matching placeholder is orphaned and will silently emit
+    // NULL/empty at runtime. Report the column declaration site.
+    for (const auto& col : stmt.columns) {
+      if (!is_text_column_type(col.type_name)) continue;
+      bool bound = false;
+      for (const auto& ph : src.placeholders) {
+        if (ph.name == col.name) {
+          bound = true;
+          break;
+        }
+      }
+      if (!bound) {
+        bag.error("CREATE STREAM: TEXT column '" + col.name +
+                      "' has no source — add a {" + col.name +
+                      "} placeholder in FROM or remove the column",
+                  col.loc);
+      }
+    }
+
+    // Exactly one non-TEXT column is allowed: the tag value lane. Two or
+    // more would compete for the single numeric value delivered per tag
+    // event, with no way to disambiguate which gets it. Report each
+    // surplus column at its declaration site.
+    bool seen_value_column = false;
+    for (const auto& col : stmt.columns) {
+      if (is_text_column_type(col.type_name)) continue;
+      if (!is_known_column_type(col.type_name)) continue;  // unknown-type
+                                                            // error fires
+                                                            // elsewhere
+      if (!seen_value_column) {
+        seen_value_column = true;
+        continue;
+      }
+      bag.error(
+          "CREATE STREAM: only one non-TEXT column is allowed (the tag "
+          "value lane); column '" +
+              col.name + "' is a second value column — make it TEXT and "
+              "bind it with a {" + col.name + "} placeholder in FROM, or "
+              "remove it",
+          col.loc);
+    }
   }
 
   // Composite primary keys are not yet supported. Mirrors the throw at

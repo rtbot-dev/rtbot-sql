@@ -1068,7 +1068,7 @@ TEST_F(CompilerIntegrationTest, CreateStreamSyntax) {
 
 TEST_F(CompilerIntegrationTest, CreateStreamWithSource) {
   const std::string sql =
-      R"(CREATE STREAM system_cpu(cpu DOUBLE, x TEXT) FROM "abcdeg")";
+      R"(CREATE STREAM system_cpu(cpu DOUBLE, x TEXT) FROM "abcdeg/{x}")";
   auto r = compile_sql(sql, catalog);
 
   ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
@@ -1076,26 +1076,26 @@ TEST_F(CompilerIntegrationTest, CreateStreamWithSource) {
   EXPECT_EQ(r.entity_name, "system_cpu");
   ASSERT_EQ(r.stream_schema.columns.size(), 2u);
   ASSERT_TRUE(r.stream_schema.source.has_value());
-  EXPECT_EQ(r.stream_schema.source->name, "abcdeg");
+  EXPECT_EQ(r.stream_schema.source->name, "abcdeg/{x}");
 
-  // Span should cover the entire `"abcdeg"` token including both quotes.
+  // Span should cover the entire `"abcdeg/{x}"` token including both quotes.
   const auto& s = *r.stream_schema.source;
   auto quote_pos = sql.find('"');
   ASSERT_NE(quote_pos, std::string::npos);
   EXPECT_EQ(s.line, 1);
   EXPECT_EQ(s.column, static_cast<int>(quote_pos) + 1);
   EXPECT_EQ(s.end_line, 1);
-  EXPECT_EQ(s.end_column, static_cast<int>(quote_pos) + 1 + 8);  // "abcdeg" = 8 chars
+  EXPECT_EQ(s.end_column, static_cast<int>(quote_pos) + 1 + 12);  // "abcdeg/{x}" = 12 chars
 }
 
 TEST_F(CompilerIntegrationTest, CreateStreamWithSourceCaseInsensitive) {
   const std::string sql =
-      R"(CREATE STREAM system_cpu(cpu DOUBLE, x TEXT) from "my-source")";
+      R"(CREATE STREAM system_cpu(cpu DOUBLE, x TEXT) from "my-source/{x}")";
   auto r = compile_sql(sql, catalog);
 
   ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
   ASSERT_TRUE(r.stream_schema.source.has_value());
-  EXPECT_EQ(r.stream_schema.source->name, "my-source");
+  EXPECT_EQ(r.stream_schema.source->name, "my-source/{x}");
 
   // Span must still be populated when FROM is lowercase.
   const auto& s = *r.stream_schema.source;
@@ -1104,7 +1104,7 @@ TEST_F(CompilerIntegrationTest, CreateStreamWithSourceCaseInsensitive) {
   EXPECT_EQ(s.line, 1);
   EXPECT_EQ(s.column, static_cast<int>(quote_pos) + 1);
   EXPECT_EQ(s.end_line, 1);
-  EXPECT_EQ(s.end_column, static_cast<int>(quote_pos) + 1 + 11);  // "my-source" = 11 chars
+  EXPECT_EQ(s.end_column, static_cast<int>(quote_pos) + 1 + 15);  // "my-source/{x}" = 15 chars
 }
 
 // Source on a different line — verifies the line-offset table picks up
@@ -1540,6 +1540,94 @@ TEST_F(CompilerIntegrationTest, CreateStreamFromUnterminatedPlaceholder) {
             std::string::npos);
 }
 
+// A declared TEXT column with no matching `{col}` placeholder in FROM has
+// no source — path parts are its only input lane. Report the column
+// declaration site, not the FROM string.
+TEST_F(CompilerIntegrationTest, CreateStreamFromTextColumnWithoutPlaceholderRejected) {
+  const std::string sql =
+      R"(CREATE STREAM s(machine TEXT, value DOUBLE) FROM 'ignition://devices/x';)";
+  auto r = compile_sql(sql, catalog);
+  ASSERT_TRUE(r.has_errors());
+  EXPECT_NE(r.errors[0].message.find(
+                "CREATE STREAM: TEXT column 'machine' has no source — add "
+                "a {machine} placeholder in FROM or remove the column"),
+            std::string::npos);
+  // Span points at the column name in the declaration list. The analyzer
+  // reports positions against the post-`CREATE STREAM`→`CREATE TABLE`
+  // normalization (1 char shorter), so the offset is `find(...)` in the
+  // original SQL with no +1 adjustment — the dropped char cancels the
+  // 0→1-based shift.
+  auto col_pos = sql.find("machine");
+  ASSERT_NE(col_pos, std::string::npos);
+  EXPECT_EQ(r.errors[0].line, 1);
+  EXPECT_EQ(r.errors[0].column, static_cast<int>(col_pos));
+}
+
+// Multiple TEXT columns: only the unbound one fires. The bound one is
+// silent so the user sees exactly the column they need to fix.
+TEST_F(CompilerIntegrationTest,
+       CreateStreamFromOnlyUnboundTextColumnsReported) {
+  const std::string sql =
+      R"(CREATE STREAM s(zone TEXT, unit TEXT, value DOUBLE) FROM 'ignition://{zone}/x';)";
+  auto r = compile_sql(sql, catalog);
+  ASSERT_TRUE(r.has_errors());
+  // Exactly one diagnostic and it names `unit`, not `zone`.
+  ASSERT_EQ(r.errors.size(), 1u);
+  EXPECT_NE(r.errors[0].message.find("TEXT column 'unit'"), std::string::npos);
+  EXPECT_EQ(r.errors[0].message.find("TEXT column 'zone'"), std::string::npos);
+}
+
+// A stream with no TEXT columns and a FROM with no placeholders is the
+// canonical scalar-source shape — the single non-TEXT column takes the
+// tag value and the new check must stay silent.
+TEST_F(CompilerIntegrationTest,
+       CreateStreamFromNoTextColumnsNoPlaceholdersAccepted) {
+  auto r = compile_sql(
+      R"(CREATE STREAM s(value DOUBLE) FROM 'ignition://a/b';)", catalog);
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+}
+
+// Only one value lane per tag event — a second non-TEXT column has no
+// distinct source. Fire the diagnostic on the second column's declaration,
+// not the first.
+TEST_F(CompilerIntegrationTest, CreateStreamFromTwoValueColumnsRejected) {
+  const std::string sql =
+      R"(CREATE STREAM s(cpu DOUBLE, mem DOUBLE) FROM 'ignition://a/b';)";
+  auto r = compile_sql(sql, catalog);
+  ASSERT_TRUE(r.has_errors());
+  ASSERT_EQ(r.errors.size(), 1u);
+  EXPECT_NE(r.errors[0].message.find(
+                "only one non-TEXT column is allowed (the tag value lane); "
+                "column 'mem' is a second value column"),
+            std::string::npos);
+}
+
+// Three non-TEXT columns: each surplus column fires its own diagnostic so
+// the user sees every offender at once.
+TEST_F(CompilerIntegrationTest,
+       CreateStreamFromThreeValueColumnsAllSurplusReported) {
+  const std::string sql =
+      R"(CREATE STREAM s(a DOUBLE, b DOUBLE, c DOUBLE) FROM 'ignition://a/b';)";
+  auto r = compile_sql(sql, catalog);
+  ASSERT_TRUE(r.has_errors());
+  // Two surplus columns → two errors; first lane (`a`) stays silent.
+  ASSERT_EQ(r.errors.size(), 2u);
+  EXPECT_NE(r.errors[0].message.find("column 'b' is a second value column"),
+            std::string::npos);
+  EXPECT_NE(r.errors[1].message.find("column 'c' is a second value column"),
+            std::string::npos);
+}
+
+// Canonical shape: one numeric value lane + N TEXT columns each bound by a
+// `{name}` placeholder in FROM. The new checks must both stay silent.
+TEST_F(CompilerIntegrationTest,
+       CreateStreamFromOneValueAndBoundTextColumnsAccepted) {
+  auto r = compile_sql(
+      R"(CREATE STREAM s(zone TEXT, unit TEXT, value DOUBLE) FROM 'ignition://{zone}/{unit}/cpu';)",
+      catalog);
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+}
+
 // `{$var}` externals are rejected in FROM sources too.
 TEST_F(CompilerIntegrationTest, CreateStreamFromExternalPlaceholderRejected) {
   auto r = compile_sql(
@@ -1691,7 +1779,7 @@ TEST_F(CompilerIntegrationTest, CreateStreamMultiple) {
   CatalogSnapshot session;
 
   auto r1 = compile_sql_expanded(
-      R"(CREATE STREAM system_cpu(cpu DOUBLE, x TEXT) FROM "Aleluya";)",
+      R"(CREATE STREAM system_cpu(cpu DOUBLE, x TEXT) FROM "Aleluya/{x}";)",
       session, 1000);
   ASSERT_EQ(r1.results.size(), 1u);
   ASSERT_FALSE(r1.results[0].has_errors()) << r1.results[0].errors[0].message;
@@ -1703,7 +1791,7 @@ TEST_F(CompilerIntegrationTest, CreateStreamMultiple) {
   EXPECT_EQ(r1.results[0].stream_schema.columns[1].name, "x");
   EXPECT_EQ(r1.results[0].stream_schema.columns[1].type, ColumnType::TEXT);
   ASSERT_TRUE(r1.results[0].stream_schema.source.has_value());
-  EXPECT_EQ(r1.results[0].stream_schema.source->name, "Aleluya");
+  EXPECT_EQ(r1.results[0].stream_schema.source->name, "Aleluya/{x}");
   session.streams["system_cpu"] = r1.results[0].stream_schema;
 
   auto r2 = compile_sql_expanded(
