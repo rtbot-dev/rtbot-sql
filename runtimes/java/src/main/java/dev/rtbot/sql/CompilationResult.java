@@ -29,6 +29,15 @@ public class CompilationResult {
     @SerializedName("field_map")
     public Map<String, Integer> fieldMap;
 
+    // Output alias → (source_stream, source_column) for direct
+    // `column AS alias` projections. Populated for ColumnRef select items;
+    // aggregate / expression outputs are absent (no single source column).
+    // Used by output decoders to look up the source TEXT column's
+    // StringDictionary at output-path-build time so renamed columns
+    // resolve back to the original string instead of the raw dict ID.
+    @SerializedName("field_origins")
+    public Map<String, FieldOrigin> fieldOrigins;
+
     @SerializedName("source_streams")
     public List<String> sourceStreams;
 

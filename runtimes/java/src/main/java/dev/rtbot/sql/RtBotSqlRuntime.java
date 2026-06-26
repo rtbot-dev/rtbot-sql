@@ -737,6 +737,48 @@ public class RtBotSqlRuntime {
     }
 
     /**
+     * Decode a single dictionary ID back to its source string for a
+     * renamed view output column. Use this at output-path-build time:
+     * the view's `fieldOrigins` records that `alias = source_column`
+     * from `source_stream`, so a `{alias}` placeholder in a TO template
+     * can resolve to the original tag-path segment instead of the raw
+     * encoded double.
+     *
+     * <p>Returns {@code null} when:
+     * <ul>
+     *   <li>The view is unknown.</li>
+     *   <li>The field has no recorded origin (it wasn't a direct
+     *       `column AS alias` projection — aggregates / expressions
+     *       have no source TEXT column).</li>
+     *   <li>The source dictionary is missing or doesn't contain the
+     *       supplied ID. Callers fall back to whatever value they
+     *       already had.</li>
+     * </ul>
+     *
+     * @param viewName  the materialized view name
+     * @param fieldName the output column (alias) to decode
+     * @param dictId    the raw dictionary ID emitted by the runtime
+     */
+    public String decodeTextFieldForPath(String viewName, String fieldName, double dictId) {
+        ViewMeta view = catalog.lookupView(viewName);
+        if (view == null || view.fieldOrigins == null) {
+            return null;
+        }
+        FieldOrigin origin = view.fieldOrigins.get(fieldName);
+        if (origin == null
+                || origin.sourceStream == null
+                || origin.sourceColumn == null) {
+            return null;
+        }
+        String dictKey = origin.sourceStream + "." + origin.sourceColumn;
+        StringDictionary dict = catalog.lookupDictionary(dictKey);
+        if (dict == null) {
+            return null;
+        }
+        return dict.decode(dictId);
+    }
+
+    /**
      * Decode using a stream schema directly — the stream name is used as the
      * dictionary key prefix.
      */
@@ -916,6 +958,7 @@ public class RtBotSqlRuntime {
                 : EntityType.VIEW.name();
         viewMeta.viewType = result.viewType;
         viewMeta.fieldMap = result.fieldMap != null ? new HashMap<>(result.fieldMap) : new HashMap<>();
+        viewMeta.fieldOrigins = result.fieldOrigins != null ? new HashMap<>(result.fieldOrigins) : new HashMap<>();
         viewMeta.sourceStreams = result.sourceStreams != null ? new ArrayList<>(result.sourceStreams) : new ArrayList<>();
         viewMeta.programJson = result.programJson;
         viewMeta.outputStream = name;

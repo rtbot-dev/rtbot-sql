@@ -1,6 +1,9 @@
 #include "rtbot_sql/api/compiler.h"
 
+#include <algorithm>
 #include <cmath>
+#include <string>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -1058,6 +1061,1048 @@ TEST_F(CompilerIntegrationTest, CreateStreamSyntax) {
   EXPECT_EQ(r.stream_schema.columns[0].index, 0);
   EXPECT_EQ(r.stream_schema.columns[1].name, "price");
   EXPECT_EQ(r.stream_schema.columns[2].name, "quantity");
+  EXPECT_FALSE(r.stream_schema.source.has_value());
+}
+
+// --- CreateStreamWithSource: optional FROM "..." metadata ---
+
+TEST_F(CompilerIntegrationTest, CreateStreamWithSource) {
+  const std::string sql =
+      R"(CREATE STREAM system_cpu(cpu DOUBLE, x TEXT) FROM "abcdeg/{x}")";
+  auto r = compile_sql(sql, catalog);
+
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  EXPECT_EQ(r.statement_type, StatementType::CREATE_STREAM);
+  EXPECT_EQ(r.entity_name, "system_cpu");
+  ASSERT_EQ(r.stream_schema.columns.size(), 2u);
+  ASSERT_TRUE(r.stream_schema.source.has_value());
+  EXPECT_EQ(r.stream_schema.source->name, "abcdeg/{x}");
+
+  // Span should cover the entire `"abcdeg/{x}"` token including both quotes.
+  const auto& s = *r.stream_schema.source;
+  auto quote_pos = sql.find('"');
+  ASSERT_NE(quote_pos, std::string::npos);
+  EXPECT_EQ(s.line, 1);
+  EXPECT_EQ(s.column, static_cast<int>(quote_pos) + 1);
+  EXPECT_EQ(s.end_line, 1);
+  EXPECT_EQ(s.end_column, static_cast<int>(quote_pos) + 1 + 12);  // "abcdeg/{x}" = 12 chars
+}
+
+TEST_F(CompilerIntegrationTest, CreateStreamWithSourceCaseInsensitive) {
+  const std::string sql =
+      R"(CREATE STREAM system_cpu(cpu DOUBLE, x TEXT) from "my-source/{x}")";
+  auto r = compile_sql(sql, catalog);
+
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  ASSERT_TRUE(r.stream_schema.source.has_value());
+  EXPECT_EQ(r.stream_schema.source->name, "my-source/{x}");
+
+  // Span must still be populated when FROM is lowercase.
+  const auto& s = *r.stream_schema.source;
+  auto quote_pos = sql.find('"');
+  ASSERT_NE(quote_pos, std::string::npos);
+  EXPECT_EQ(s.line, 1);
+  EXPECT_EQ(s.column, static_cast<int>(quote_pos) + 1);
+  EXPECT_EQ(s.end_line, 1);
+  EXPECT_EQ(s.end_column, static_cast<int>(quote_pos) + 1 + 15);  // "my-source/{x}" = 15 chars
+}
+
+// Source on a different line — verifies the line-offset table picks up
+// (line ≠ 1, end_line ≠ 1) and the column resets to 1-based on that line.
+TEST_F(CompilerIntegrationTest, CreateStreamSourceLocationMultiLine) {
+  const std::string sql =
+      "CREATE STREAM system_cpu(cpu DOUBLE)\n"
+      "FROM \"line-two\"";
+  auto r = compile_sql(sql, catalog);
+
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  ASSERT_TRUE(r.stream_schema.source.has_value());
+  const auto& s = *r.stream_schema.source;
+  EXPECT_EQ(s.name, "line-two");
+  EXPECT_EQ(s.line, 2);
+  EXPECT_EQ(s.end_line, 2);
+  // "line-two" starts after `FROM ` (5 chars) on line 2.
+  EXPECT_EQ(s.column, 6);
+  // "line-two" + both quotes = 10 chars; end_column is exclusive (1 past).
+  EXPECT_EQ(s.end_column, 16);
+}
+
+// Internal spaces in the source name must not split the span — the entire
+// "..." token (including the closing quote) is captured.
+TEST_F(CompilerIntegrationTest, CreateStreamSourceLocationCoversInternalSpaces) {
+  const std::string sql =
+      R"(CREATE STREAM s(x DOUBLE) FROM "two words")";
+  auto r = compile_sql(sql, catalog);
+
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  ASSERT_TRUE(r.stream_schema.source.has_value());
+  const auto& s = *r.stream_schema.source;
+  EXPECT_EQ(s.name, "two words");
+  EXPECT_EQ(s.line, 1);
+  auto quote_pos = sql.find('"');
+  ASSERT_NE(quote_pos, std::string::npos);
+  EXPECT_EQ(s.column, static_cast<int>(quote_pos) + 1);
+  // "two words" + both quotes = 11 chars.
+  EXPECT_EQ(s.end_column, static_cast<int>(quote_pos) + 1 + 11);
+
+  // Extracting the substring spanned by [start..end) must yield the full
+  // quoted token verbatim.
+  std::size_t span_len =
+      static_cast<std::size_t>(s.end_column - s.column);
+  EXPECT_EQ(sql.substr(quote_pos, span_len), R"("two words")");
+}
+
+// When the statement has no `FROM "..."` clause, the source is absent and
+// every location field stays at its -1 default.
+TEST_F(CompilerIntegrationTest, CreateStreamSourceLocationAbsentWhenNoSource) {
+  auto r = compile_sql("CREATE STREAM system_cpu(cpu DOUBLE)", catalog);
+
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  EXPECT_FALSE(r.stream_schema.source.has_value());
+}
+
+// FROM keyword present without a quoted source name → semantic error
+// pointing at the FROM token. Caught before libpg_query so the user sees a
+// purposeful message instead of a generic syntax error.
+TEST_F(CompilerIntegrationTest, CreateStreamBareFromRejected) {
+  const std::string sql = "CREATE STREAM system_cpu(cpu DOUBLE) FROM";
+  auto r = compile_sql(sql, catalog);
+
+  ASSERT_TRUE(r.has_errors());
+  EXPECT_NE(r.errors[0].message.find(
+                "CREATE STREAM: FROM requires a quoted source name"),
+            std::string::npos);
+  auto from_pos = sql.find("FROM");
+  ASSERT_NE(from_pos, std::string::npos);
+  EXPECT_EQ(r.errors[0].line, 1);
+  EXPECT_EQ(r.errors[0].column, static_cast<int>(from_pos) + 1);
+  EXPECT_EQ(r.errors[0].end_line, 1);
+  EXPECT_EQ(r.errors[0].end_column, static_cast<int>(from_pos) + 1 + 4);
+}
+
+// FROM followed by an unquoted identifier — also rejected; the rule is "a
+// quoted source name", not "any source name".
+TEST_F(CompilerIntegrationTest, CreateStreamFromUnquotedSourceRejected) {
+  auto r = compile_sql("CREATE STREAM s(x DOUBLE) FROM unquoted_name",
+                       catalog);
+
+  ASSERT_TRUE(r.has_errors());
+  EXPECT_NE(r.errors[0].message.find(
+                "CREATE STREAM: FROM requires a quoted source name"),
+            std::string::npos);
+}
+
+// `FROM "abc"` followed by another statement *without* a `;` between → error
+// pointing at the unexpected content (the `S` of the following SELECT).
+TEST_F(CompilerIntegrationTest, CreateStreamMissingSemiBeforeNextStatement) {
+  const std::string sql =
+      R"(CREATE STREAM s(x DOUBLE) FROM "abc" SELECT * FROM trades)";
+  auto r = compile_sql(sql, catalog);
+
+  ASSERT_TRUE(r.has_errors());
+  EXPECT_NE(r.errors[0].message.find(
+                "CREATE STREAM: expected `;` after source name"),
+            std::string::npos);
+  // Points at the `S` of `SELECT` that follows the source. Token = `SELECT`
+  // (6 chars), so end_column = start + 6.
+  auto close_quote_pos = sql.find('"', sql.find('"') + 1);
+  ASSERT_NE(close_quote_pos, std::string::npos);
+  auto offending_pos = sql.find_first_not_of(" \t\n", close_quote_pos + 1);
+  ASSERT_NE(offending_pos, std::string::npos);
+  EXPECT_EQ(r.errors[0].line, 1);
+  EXPECT_EQ(r.errors[0].column, static_cast<int>(offending_pos) + 1);
+  EXPECT_EQ(r.errors[0].end_line, 1);
+  EXPECT_EQ(r.errors[0].end_column, static_cast<int>(offending_pos) + 1 + 6);
+}
+
+// Trailing whitespace alone (no next statement) is allowed.
+TEST_F(CompilerIntegrationTest, CreateStreamTrailingWhitespaceAccepted) {
+  auto r = compile_sql(
+      R"(CREATE STREAM s(x DOUBLE) FROM "abc"   )", catalog);
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  ASSERT_TRUE(r.stream_schema.source.has_value());
+  EXPECT_EQ(r.stream_schema.source->name, "abc");
+}
+
+// A `;` (with or without surrounding whitespace) between source and the next
+// statement satisfies the rule — accepted at this layer.
+TEST_F(CompilerIntegrationTest, CreateStreamSemiBeforeNextStatementAccepted) {
+  auto r = compile_sql(
+      R"(CREATE STREAM s(x DOUBLE) FROM "abc"   ;   )", catalog);
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  ASSERT_TRUE(r.stream_schema.source.has_value());
+  EXPECT_EQ(r.stream_schema.source->name, "abc");
+}
+
+// ---------------------------------------------------------------------------
+// Optional TYPE / WINDOW clauses after FROM "<source>".
+// ---------------------------------------------------------------------------
+
+// No TYPE clause → effective_type defaults to SCALAR, window absent.
+TEST_F(CompilerIntegrationTest, CreateStreamSourceTypeDefaultsToScalar) {
+  auto r = compile_sql(R"(CREATE STREAM s(x DOUBLE) FROM "abc")", catalog);
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  ASSERT_TRUE(r.stream_schema.source.has_value());
+  EXPECT_FALSE(r.stream_schema.source->type.has_value());
+  EXPECT_EQ(r.stream_schema.source->effective_type(), SourceType::SCALAR);
+  EXPECT_FALSE(r.stream_schema.source->window.has_value());
+}
+
+// Explicit TYPE scalar is accepted.
+TEST_F(CompilerIntegrationTest, CreateStreamSourceTypeScalarExplicit) {
+  auto r = compile_sql(
+      R"(CREATE STREAM s(x DOUBLE) FROM "abc" TYPE scalar)", catalog);
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  ASSERT_TRUE(r.stream_schema.source.has_value());
+  ASSERT_TRUE(r.stream_schema.source->type.has_value());
+  EXPECT_EQ(r.stream_schema.source->type->value, SourceType::SCALAR);
+}
+
+// TYPE csv_burst with WINDOW: both fields populated; window is 100.
+TEST_F(CompilerIntegrationTest, CreateStreamSourceCsvBurstWithWindow) {
+  auto r = compile_sql(
+      R"(CREATE STREAM s(x DOUBLE) FROM "abc" TYPE csv_burst WINDOW 100)",
+      catalog);
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  ASSERT_TRUE(r.stream_schema.source.has_value());
+  ASSERT_TRUE(r.stream_schema.source->type.has_value());
+  EXPECT_EQ(r.stream_schema.source->type->value, SourceType::CSV_BURST);
+  ASSERT_TRUE(r.stream_schema.source->window.has_value());
+  EXPECT_EQ(r.stream_schema.source->window->value, 100);
+}
+
+// TYPE/WINDOW keywords are case-insensitive (consistent with SQL).
+TEST_F(CompilerIntegrationTest, CreateStreamSourceTypeWindowCaseInsensitive) {
+  auto r = compile_sql(
+      R"(CREATE STREAM s(x DOUBLE) FROM "abc" type CSV_BURST window 42)",
+      catalog);
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  ASSERT_TRUE(r.stream_schema.source.has_value());
+  ASSERT_TRUE(r.stream_schema.source->type.has_value());
+  EXPECT_EQ(r.stream_schema.source->type->value, SourceType::CSV_BURST);
+  EXPECT_EQ(r.stream_schema.source->window->value, 42);
+}
+
+// TYPE csv_burst with no WINDOW → semantic error. Span points at the
+// `"<source>"` token (the analyzer flags the source the missing WINDOW
+// belongs to).
+TEST_F(CompilerIntegrationTest, CreateStreamSourceCsvBurstRequiresWindow) {
+  const std::string sql =
+      R"(CREATE STREAM s(x DOUBLE) FROM "abc" TYPE csv_burst)";
+  auto r = compile_sql(sql, catalog);
+  ASSERT_TRUE(r.has_errors());
+  EXPECT_NE(r.errors[0].message.find(
+                "CREATE STREAM: TYPE csv_burst requires WINDOW"),
+            std::string::npos);
+  auto quote_pos = sql.find('"');
+  ASSERT_NE(quote_pos, std::string::npos);
+  EXPECT_EQ(r.errors[0].line, 1);
+  EXPECT_EQ(r.errors[0].column, static_cast<int>(quote_pos) + 1);
+  EXPECT_EQ(r.errors[0].end_line, 1);
+  // `"abc"` = 5 chars including both quotes.
+  EXPECT_EQ(r.errors[0].end_column, static_cast<int>(quote_pos) + 1 + 5);
+}
+
+// Unknown TYPE value → semantic error.
+TEST_F(CompilerIntegrationTest, CreateStreamSourceUnknownTypeRejected) {
+  auto r = compile_sql(
+      R"(CREATE STREAM s(x DOUBLE) FROM "abc" TYPE binary)", catalog);
+  ASSERT_TRUE(r.has_errors());
+  EXPECT_NE(r.errors[0].message.find("unknown TYPE 'binary'"),
+            std::string::npos);
+}
+
+// WINDOW without an integer value → semantic error.
+TEST_F(CompilerIntegrationTest, CreateStreamSourceWindowMissingNumber) {
+  auto r = compile_sql(
+      R"(CREATE STREAM s(x DOUBLE) FROM "abc" TYPE csv_burst WINDOW foo)",
+      catalog);
+  ASSERT_TRUE(r.has_errors());
+  EXPECT_NE(r.errors[0].message.find(
+                "WINDOW requires a positive integer"),
+            std::string::npos);
+}
+
+// WINDOW outside a `TYPE csv_burst` clause is rejected — the keyword has
+// meaning only for csv_burst. Error span underlines the numeric value so
+// editors can flag the dead clause.
+TEST_F(CompilerIntegrationTest, CreateStreamSourceWindowRejectedForScalar) {
+  const std::string sql =
+      R"(CREATE STREAM s(x DOUBLE) FROM "abc" WINDOW 50)";
+  auto r = compile_sql(sql, catalog);
+  ASSERT_TRUE(r.has_errors());
+  EXPECT_NE(r.errors[0].message.find(
+                "WINDOW is only valid with TYPE csv_burst"),
+            std::string::npos);
+  auto value_pos = sql.find("50");
+  ASSERT_NE(value_pos, std::string::npos);
+  EXPECT_EQ(r.errors[0].line, 1);
+  EXPECT_EQ(r.errors[0].column, static_cast<int>(value_pos) + 1);
+  EXPECT_EQ(r.errors[0].end_line, 1);
+  EXPECT_EQ(r.errors[0].end_column, static_cast<int>(value_pos) + 1 + 2);
+}
+
+// Same rejection when TYPE is explicitly `scalar`. Span over the WINDOW
+// numeric value.
+TEST_F(CompilerIntegrationTest,
+       CreateStreamSourceWindowRejectedForExplicitScalar) {
+  const std::string sql =
+      R"(CREATE STREAM s(x DOUBLE) FROM "abc" TYPE scalar WINDOW 50)";
+  auto r = compile_sql(sql, catalog);
+  ASSERT_TRUE(r.has_errors());
+  EXPECT_NE(r.errors[0].message.find(
+                "WINDOW is only valid with TYPE csv_burst"),
+            std::string::npos);
+  auto value_pos = sql.find("50");
+  ASSERT_NE(value_pos, std::string::npos);
+  EXPECT_EQ(r.errors[0].line, 1);
+  EXPECT_EQ(r.errors[0].column, static_cast<int>(value_pos) + 1);
+  EXPECT_EQ(r.errors[0].end_line, 1);
+  EXPECT_EQ(r.errors[0].end_column, static_cast<int>(value_pos) + 1 + 2);
+}
+
+// Trailing `;` after TYPE/WINDOW metadata is still accepted.
+TEST_F(CompilerIntegrationTest, CreateStreamSourceMetadataThenSemiAccepted) {
+  auto r = compile_sql(
+      R"(CREATE STREAM s(x DOUBLE) FROM "abc" TYPE csv_burst WINDOW 100;)",
+      catalog);
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  ASSERT_TRUE(r.stream_schema.source.has_value());
+  ASSERT_TRUE(r.stream_schema.source->type.has_value());
+  EXPECT_EQ(r.stream_schema.source->type->value, SourceType::CSV_BURST);
+  EXPECT_EQ(r.stream_schema.source->window->value, 100);
+}
+
+// `;` after explicit TYPE (no WINDOW) is accepted — TYPE was the last
+// clause written, so the terminator goes there.
+TEST_F(CompilerIntegrationTest, CreateStreamSemiAfterTypeAccepted) {
+  auto r = compile_sql(
+      R"(CREATE STREAM s(x DOUBLE) FROM "abc" TYPE scalar;)", catalog);
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  ASSERT_TRUE(r.stream_schema.source.has_value());
+  ASSERT_TRUE(r.stream_schema.source->type.has_value());
+  EXPECT_EQ(r.stream_schema.source->type->value, SourceType::SCALAR);
+  EXPECT_FALSE(r.stream_schema.source->window.has_value());
+}
+
+// `;` directly after WINDOW value (no whitespace) is accepted.
+TEST_F(CompilerIntegrationTest, CreateStreamSemiDirectlyAfterWindowAccepted) {
+  auto r = compile_sql(
+      R"(CREATE STREAM s(x DOUBLE) FROM "abc" TYPE csv_burst WINDOW 100;)",
+      catalog);
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  ASSERT_TRUE(r.stream_schema.source->window.has_value());
+  EXPECT_EQ(r.stream_schema.source->window->value, 100);
+}
+
+// Content after TYPE clause and before any `;` → fails at the offending
+// token, NOT at the source closing quote — the cursor has already advanced
+// past TYPE. Span points at the next non-whitespace token after TYPE.
+TEST_F(CompilerIntegrationTest, CreateStreamGarbageAfterTypeRejected) {
+  const std::string sql =
+      R"(CREATE STREAM s(x DOUBLE) FROM "abc" TYPE scalar garbage)";
+  auto r = compile_sql(sql, catalog);
+  ASSERT_TRUE(r.has_errors());
+  EXPECT_NE(r.errors[0].message.find(
+                "CREATE STREAM: expected `;` after source name"),
+            std::string::npos);
+  auto bad_pos = sql.find("garbage");
+  ASSERT_NE(bad_pos, std::string::npos);
+  EXPECT_EQ(r.errors[0].line, 1);
+  EXPECT_EQ(r.errors[0].column, static_cast<int>(bad_pos) + 1);
+  EXPECT_EQ(r.errors[0].end_line, 1);
+  EXPECT_EQ(r.errors[0].end_column, static_cast<int>(bad_pos) + 1 + 7);
+}
+
+// Only one TYPE clause is allowed. Span over the duplicate keyword.
+TEST_F(CompilerIntegrationTest, CreateStreamDuplicateTypeRejected) {
+  const std::string sql =
+      R"(CREATE STREAM s(x DOUBLE) FROM "abc" TYPE scalar TYPE csv_burst)";
+  auto r = compile_sql(sql, catalog);
+  ASSERT_TRUE(r.has_errors());
+  EXPECT_NE(r.errors[0].message.find(
+                "CREATE STREAM: duplicate TYPE clause"),
+            std::string::npos);
+  // The duplicate `TYPE` is the second occurrence (4 chars).
+  auto first_type = sql.find("TYPE");
+  auto dup_pos = sql.find("TYPE", first_type + 1);
+  ASSERT_NE(dup_pos, std::string::npos);
+  EXPECT_EQ(r.errors[0].line, 1);
+  EXPECT_EQ(r.errors[0].column, static_cast<int>(dup_pos) + 1);
+  EXPECT_EQ(r.errors[0].end_line, 1);
+  EXPECT_EQ(r.errors[0].end_column, static_cast<int>(dup_pos) + 1 + 4);
+}
+
+// Only one WINDOW clause is allowed. Span over the duplicate keyword.
+TEST_F(CompilerIntegrationTest, CreateStreamDuplicateWindowRejected) {
+  const std::string sql =
+      R"(CREATE STREAM s(x DOUBLE) FROM "abc" TYPE csv_burst WINDOW 100 WINDOW 200)";
+  auto r = compile_sql(sql, catalog);
+  ASSERT_TRUE(r.has_errors());
+  EXPECT_NE(r.errors[0].message.find(
+                "CREATE STREAM: duplicate WINDOW clause"),
+            std::string::npos);
+  auto first_win = sql.find("WINDOW");
+  auto dup_pos = sql.find("WINDOW", first_win + 1);
+  ASSERT_NE(dup_pos, std::string::npos);
+  EXPECT_EQ(r.errors[0].line, 1);
+  EXPECT_EQ(r.errors[0].column, static_cast<int>(dup_pos) + 1);
+  EXPECT_EQ(r.errors[0].end_line, 1);
+  EXPECT_EQ(r.errors[0].end_column, static_cast<int>(dup_pos) + 1 + 6);
+}
+
+// WINDOW must be strictly positive — `WINDOW 0` is rejected with the span
+// over the digit.
+TEST_F(CompilerIntegrationTest, CreateStreamWindowZeroRejected) {
+  const std::string sql =
+      R"(CREATE STREAM s(x DOUBLE) FROM "abc" TYPE csv_burst WINDOW 0)";
+  auto r = compile_sql(sql, catalog);
+  ASSERT_TRUE(r.has_errors());
+  EXPECT_NE(r.errors[0].message.find(
+                "CREATE STREAM: WINDOW must be a positive integer"),
+            std::string::npos);
+  auto zero_pos = sql.find_last_of('0');
+  ASSERT_NE(zero_pos, std::string::npos);
+  EXPECT_EQ(r.errors[0].line, 1);
+  EXPECT_EQ(r.errors[0].column, static_cast<int>(zero_pos) + 1);
+  EXPECT_EQ(r.errors[0].end_line, 1);
+  EXPECT_EQ(r.errors[0].end_column, static_cast<int>(zero_pos) + 1 + 1);
+}
+
+// ---------------------------------------------------------------------------
+// FROM URI `{col}` placeholder validation.
+// ---------------------------------------------------------------------------
+
+// A `{col}` placeholder referencing a declared TEXT column is the intended
+// shape — resolved at deploy time to the matching path segment.
+TEST_F(CompilerIntegrationTest, CreateStreamFromPlaceholderTextColumnAccepted) {
+  auto r = compile_sql(
+      R"(CREATE STREAM s(value DOUBLE, machine_id TEXT) FROM 'ignition://devices/{machine_id}/vibration';)",
+      catalog);
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  ASSERT_TRUE(r.stream_schema.source.has_value());
+  EXPECT_EQ(r.stream_schema.source->name,
+            "ignition://devices/{machine_id}/vibration");
+}
+
+// A placeholder that names no declared column is rejected, span over the
+// placeholder (braces included).
+TEST_F(CompilerIntegrationTest, CreateStreamFromPlaceholderUnknownColumn) {
+  const std::string sql =
+      R"(CREATE STREAM s(value DOUBLE) FROM 'ignition://devices/{nope}/x';)";
+  auto r = compile_sql(sql, catalog);
+  ASSERT_TRUE(r.has_errors());
+  EXPECT_NE(r.errors[0].message.find(
+                "CREATE STREAM: FROM source references unknown column 'nope'"),
+            std::string::npos);
+  auto brace = sql.find("{nope}");
+  ASSERT_NE(brace, std::string::npos);
+  EXPECT_EQ(r.errors[0].line, 1);
+  EXPECT_EQ(r.errors[0].column, static_cast<int>(brace) + 1);
+  EXPECT_EQ(r.errors[0].end_column, static_cast<int>(brace) + 1 + 6);
+}
+
+// A placeholder referencing a non-TEXT column is rejected — path segments
+// are strings, so the binding column must be TEXT.
+TEST_F(CompilerIntegrationTest, CreateStreamFromPlaceholderNonTextColumn) {
+  const std::string sql =
+      R"(CREATE STREAM s(value DOUBLE) FROM 'ignition://devices/{value}/x';)";
+  auto r = compile_sql(sql, catalog);
+  ASSERT_TRUE(r.has_errors());
+  EXPECT_NE(r.errors[0].message.find(
+                "CREATE STREAM: FROM placeholder '{value}' requires a TEXT "
+                "column"),
+            std::string::npos);
+  auto brace = sql.find("{value}");
+  ASSERT_NE(brace, std::string::npos);
+  EXPECT_EQ(r.errors[0].column, static_cast<int>(brace) + 1);
+  EXPECT_EQ(r.errors[0].end_column, static_cast<int>(brace) + 1 + 7);
+}
+
+// Empty `{}` in a FROM source is rejected (same rule as TO templates).
+TEST_F(CompilerIntegrationTest, CreateStreamFromEmptyPlaceholderRejected) {
+  auto r = compile_sql(
+      R"(CREATE STREAM s(value DOUBLE) FROM 'ignition://devices/{}/x';)",
+      catalog);
+  ASSERT_TRUE(r.has_errors());
+  EXPECT_NE(r.errors[0].message.find("FROM source has an empty placeholder"),
+            std::string::npos);
+}
+
+// Unterminated `{` in a FROM source is rejected.
+TEST_F(CompilerIntegrationTest, CreateStreamFromUnterminatedPlaceholder) {
+  auto r = compile_sql(
+      R"(CREATE STREAM s(value DOUBLE, x TEXT) FROM 'ignition://devices/{x/y';)",
+      catalog);
+  ASSERT_TRUE(r.has_errors());
+  EXPECT_NE(r.errors[0].message.find(
+                "FROM source has an unterminated `{` placeholder"),
+            std::string::npos);
+}
+
+// A declared TEXT column with no matching `{col}` placeholder in FROM has
+// no source — path parts are its only input lane. Report the column
+// declaration site, not the FROM string.
+TEST_F(CompilerIntegrationTest, CreateStreamFromTextColumnWithoutPlaceholderRejected) {
+  const std::string sql =
+      R"(CREATE STREAM s(machine TEXT, value DOUBLE) FROM 'ignition://devices/x';)";
+  auto r = compile_sql(sql, catalog);
+  ASSERT_TRUE(r.has_errors());
+  EXPECT_NE(r.errors[0].message.find(
+                "CREATE STREAM: TEXT column 'machine' has no source — add "
+                "a {machine} placeholder in FROM or remove the column"),
+            std::string::npos);
+  // Span points at the column name in the declaration list. The analyzer
+  // reports positions against the post-`CREATE STREAM`→`CREATE TABLE`
+  // normalization (1 char shorter), so the offset is `find(...)` in the
+  // original SQL with no +1 adjustment — the dropped char cancels the
+  // 0→1-based shift.
+  auto col_pos = sql.find("machine");
+  ASSERT_NE(col_pos, std::string::npos);
+  EXPECT_EQ(r.errors[0].line, 1);
+  EXPECT_EQ(r.errors[0].column, static_cast<int>(col_pos));
+}
+
+// Multiple TEXT columns: only the unbound one fires. The bound one is
+// silent so the user sees exactly the column they need to fix.
+TEST_F(CompilerIntegrationTest,
+       CreateStreamFromOnlyUnboundTextColumnsReported) {
+  const std::string sql =
+      R"(CREATE STREAM s(zone TEXT, unit TEXT, value DOUBLE) FROM 'ignition://{zone}/x';)";
+  auto r = compile_sql(sql, catalog);
+  ASSERT_TRUE(r.has_errors());
+  // Exactly one diagnostic and it names `unit`, not `zone`.
+  ASSERT_EQ(r.errors.size(), 1u);
+  EXPECT_NE(r.errors[0].message.find("TEXT column 'unit'"), std::string::npos);
+  EXPECT_EQ(r.errors[0].message.find("TEXT column 'zone'"), std::string::npos);
+}
+
+// A stream with no TEXT columns and a FROM with no placeholders is the
+// canonical scalar-source shape — the single non-TEXT column takes the
+// tag value and the new check must stay silent.
+TEST_F(CompilerIntegrationTest,
+       CreateStreamFromNoTextColumnsNoPlaceholdersAccepted) {
+  auto r = compile_sql(
+      R"(CREATE STREAM s(value DOUBLE) FROM 'ignition://a/b';)", catalog);
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+}
+
+// Only one value lane per tag event — a second non-TEXT column has no
+// distinct source. Fire the diagnostic on the second column's declaration,
+// not the first.
+TEST_F(CompilerIntegrationTest, CreateStreamFromTwoValueColumnsRejected) {
+  const std::string sql =
+      R"(CREATE STREAM s(cpu DOUBLE, mem DOUBLE) FROM 'ignition://a/b';)";
+  auto r = compile_sql(sql, catalog);
+  ASSERT_TRUE(r.has_errors());
+  ASSERT_EQ(r.errors.size(), 1u);
+  EXPECT_NE(r.errors[0].message.find(
+                "only one non-TEXT column is allowed (the tag value lane); "
+                "column 'mem' is a second value column"),
+            std::string::npos);
+}
+
+// Three non-TEXT columns: each surplus column fires its own diagnostic so
+// the user sees every offender at once.
+TEST_F(CompilerIntegrationTest,
+       CreateStreamFromThreeValueColumnsAllSurplusReported) {
+  const std::string sql =
+      R"(CREATE STREAM s(a DOUBLE, b DOUBLE, c DOUBLE) FROM 'ignition://a/b';)";
+  auto r = compile_sql(sql, catalog);
+  ASSERT_TRUE(r.has_errors());
+  // Two surplus columns → two errors; first lane (`a`) stays silent.
+  ASSERT_EQ(r.errors.size(), 2u);
+  EXPECT_NE(r.errors[0].message.find("column 'b' is a second value column"),
+            std::string::npos);
+  EXPECT_NE(r.errors[1].message.find("column 'c' is a second value column"),
+            std::string::npos);
+}
+
+// Canonical shape: one numeric value lane + N TEXT columns each bound by a
+// `{name}` placeholder in FROM. The new checks must both stay silent.
+TEST_F(CompilerIntegrationTest,
+       CreateStreamFromOneValueAndBoundTextColumnsAccepted) {
+  auto r = compile_sql(
+      R"(CREATE STREAM s(zone TEXT, unit TEXT, value DOUBLE) FROM 'ignition://{zone}/{unit}/cpu';)",
+      catalog);
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+}
+
+// `{$var}` externals are rejected in FROM sources too.
+TEST_F(CompilerIntegrationTest, CreateStreamFromExternalPlaceholderRejected) {
+  auto r = compile_sql(
+      R"(CREATE STREAM s(value DOUBLE) FROM 'ignition://{$instance}/x';)",
+      catalog);
+  ASSERT_TRUE(r.has_errors());
+  EXPECT_NE(r.errors[0].message.find(
+                "external placeholders are not supported; write the value "
+                "literally in the URI"),
+            std::string::npos);
+}
+
+// Single-quoted source strings are the canonical SQL form (double quotes
+// are identifiers in SQL); both quote styles are accepted.
+TEST_F(CompilerIntegrationTest, CreateStreamSingleQuotedSourceAccepted) {
+  const std::string sql =
+      R"(CREATE STREAM s(x DOUBLE) FROM 'ignition://a/b';)";
+  auto r = compile_sql(sql, catalog);
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  ASSERT_TRUE(r.stream_schema.source.has_value());
+  EXPECT_EQ(r.stream_schema.source->name, "ignition://a/b");
+  // Span covers the quoted token, same contract as the double-quote form.
+  auto quote_pos = sql.find('\'');
+  ASSERT_NE(quote_pos, std::string::npos);
+  EXPECT_EQ(r.stream_schema.source->column, static_cast<int>(quote_pos) + 1);
+}
+
+// TYPE/WINDOW metadata parses after a single-quoted source too.
+TEST_F(CompilerIntegrationTest, CreateStreamSingleQuotedSourceWithMetadata) {
+  auto r = compile_sql(
+      R"(CREATE STREAM s(x DOUBLE) FROM 'abc' TYPE csv_burst WINDOW 100;)",
+      catalog);
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  ASSERT_TRUE(r.stream_schema.source.has_value());
+  EXPECT_EQ(r.stream_schema.source->name, "abc");
+  ASSERT_TRUE(r.stream_schema.source->window.has_value());
+  EXPECT_EQ(r.stream_schema.source->window->value, 100);
+}
+
+// A WINDOW value too large for int must produce a diagnostic, not an
+// uncaught std::out_of_range escaping compile_sql (and crossing the
+// WASM/JNI boundary). Span over the digits.
+TEST_F(CompilerIntegrationTest, CreateStreamWindowOverflowRejected) {
+  const std::string sql =
+      R"(CREATE STREAM s(x DOUBLE) FROM "abc" TYPE csv_burst WINDOW 99999999999999)";
+  auto r = compile_sql(sql, catalog);
+  ASSERT_TRUE(r.has_errors());
+  EXPECT_NE(r.errors[0].message.find(
+                "CREATE STREAM: WINDOW value is out of range"),
+            std::string::npos);
+  auto num_pos = sql.find("99999999999999");
+  ASSERT_NE(num_pos, std::string::npos);
+  EXPECT_EQ(r.errors[0].line, 1);
+  EXPECT_EQ(r.errors[0].column, static_cast<int>(num_pos) + 1);
+  EXPECT_EQ(r.errors[0].end_line, 1);
+  EXPECT_EQ(r.errors[0].end_column, static_cast<int>(num_pos) + 1 + 14);
+}
+
+// Content after WINDOW value and before any `;` → fails at the offending
+// token. Cursor has advanced past WINDOW <num>; span over the next token.
+TEST_F(CompilerIntegrationTest, CreateStreamGarbageAfterWindowRejected) {
+  const std::string sql =
+      R"(CREATE STREAM s(x DOUBLE) FROM "abc" TYPE csv_burst WINDOW 100 garbage)";
+  auto r = compile_sql(sql, catalog);
+  ASSERT_TRUE(r.has_errors());
+  EXPECT_NE(r.errors[0].message.find(
+                "CREATE STREAM: expected `;` after source name"),
+            std::string::npos);
+  auto bad_pos = sql.find("garbage");
+  ASSERT_NE(bad_pos, std::string::npos);
+  EXPECT_EQ(r.errors[0].line, 1);
+  EXPECT_EQ(r.errors[0].column, static_cast<int>(bad_pos) + 1);
+  EXPECT_EQ(r.errors[0].end_line, 1);
+  EXPECT_EQ(r.errors[0].end_column, static_cast<int>(bad_pos) + 1 + 7);
+}
+
+// Non-`;` content after TYPE/WINDOW metadata → "expected `;`" error.
+TEST_F(CompilerIntegrationTest, CreateStreamMissingSemiAfterMetadata) {
+  auto r = compile_sql(
+      R"(CREATE STREAM s(x DOUBLE) FROM "abc" TYPE csv_burst WINDOW 100 SELECT *)",
+      catalog);
+  ASSERT_TRUE(r.has_errors());
+  EXPECT_NE(r.errors[0].message.find(
+                "CREATE STREAM: expected `;` after source name"),
+            std::string::npos);
+}
+
+// TYPE value token gets line/column/end_line/end_column spanning the
+// identifier exactly. WINDOW value token gets its own span over the digits.
+TEST_F(CompilerIntegrationTest, CreateStreamTypeAndWindowSpans) {
+  const std::string sql =
+      R"(CREATE STREAM s(x DOUBLE) FROM "abc" TYPE csv_burst WINDOW 100)";
+  auto r = compile_sql(sql, catalog);
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  ASSERT_TRUE(r.stream_schema.source.has_value());
+  const auto& s = *r.stream_schema.source;
+
+  // TYPE value `csv_burst` — 9 chars.
+  ASSERT_TRUE(s.type.has_value());
+  auto type_pos = sql.find("csv_burst");
+  ASSERT_NE(type_pos, std::string::npos);
+  EXPECT_EQ(s.type->line, 1);
+  EXPECT_EQ(s.type->column, static_cast<int>(type_pos) + 1);
+  EXPECT_EQ(s.type->end_line, 1);
+  EXPECT_EQ(s.type->end_column, static_cast<int>(type_pos) + 1 + 9);
+
+  // WINDOW value `100` — 3 chars.
+  ASSERT_TRUE(s.window.has_value());
+  auto win_pos = sql.find("100");
+  ASSERT_NE(win_pos, std::string::npos);
+  EXPECT_EQ(s.window->line, 1);
+  EXPECT_EQ(s.window->column, static_cast<int>(win_pos) + 1);
+  EXPECT_EQ(s.window->end_line, 1);
+  EXPECT_EQ(s.window->end_column, static_cast<int>(win_pos) + 1 + 3);
+}
+
+// When TYPE/WINDOW clauses are absent, the optional clauses are nullopt.
+TEST_F(CompilerIntegrationTest, CreateStreamTypeWindowSpansAbsentByDefault) {
+  auto r = compile_sql(R"(CREATE STREAM s(x DOUBLE) FROM "abc")", catalog);
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  ASSERT_TRUE(r.stream_schema.source.has_value());
+  EXPECT_FALSE(r.stream_schema.source->type.has_value());
+  EXPECT_FALSE(r.stream_schema.source->window.has_value());
+}
+
+// On an unknown TYPE value, the diagnostic span covers exactly the offending
+// identifier — editors can underline the bad token directly.
+TEST_F(CompilerIntegrationTest, CreateStreamUnknownTypeSpansIdentifier) {
+  const std::string sql =
+      R"(CREATE STREAM s(x DOUBLE) FROM "abc" TYPE binary)";
+  auto r = compile_sql(sql, catalog);
+  ASSERT_TRUE(r.has_errors());
+  EXPECT_NE(r.errors[0].message.find("unknown TYPE 'binary'"),
+            std::string::npos);
+  auto bad_pos = sql.find("binary");
+  ASSERT_NE(bad_pos, std::string::npos);
+  EXPECT_EQ(r.errors[0].line, 1);
+  EXPECT_EQ(r.errors[0].column, static_cast<int>(bad_pos) + 1);
+  EXPECT_EQ(r.errors[0].end_line, 1);
+  EXPECT_EQ(r.errors[0].end_column, static_cast<int>(bad_pos) + 1 + 6);
+}
+
+// --- CreateStreamMultiple: three streams compiled as a sequential program ---
+// The current API compiles one statement at a time; this test models the
+// real session workflow where each statement is compiled in order and the
+// catalog is updated between steps so later statements see earlier definitions.
+
+TEST_F(CompilerIntegrationTest, CreateStreamMultiple) {
+  CatalogSnapshot session;
+
+  auto r1 = compile_sql_expanded(
+      R"(CREATE STREAM system_cpu(cpu DOUBLE, x TEXT) FROM "Aleluya/{x}";)",
+      session, 1000);
+  ASSERT_EQ(r1.results.size(), 1u);
+  ASSERT_FALSE(r1.results[0].has_errors()) << r1.results[0].errors[0].message;
+  EXPECT_EQ(r1.results[0].statement_type, StatementType::CREATE_STREAM);
+  EXPECT_EQ(r1.results[0].entity_name, "system_cpu");
+  ASSERT_EQ(r1.results[0].stream_schema.columns.size(), 2u);
+  EXPECT_EQ(r1.results[0].stream_schema.columns[0].name, "cpu");
+  EXPECT_EQ(r1.results[0].stream_schema.columns[0].type, ColumnType::DOUBLE);
+  EXPECT_EQ(r1.results[0].stream_schema.columns[1].name, "x");
+  EXPECT_EQ(r1.results[0].stream_schema.columns[1].type, ColumnType::TEXT);
+  ASSERT_TRUE(r1.results[0].stream_schema.source.has_value());
+  EXPECT_EQ(r1.results[0].stream_schema.source->name, "Aleluya/{x}");
+  session.streams["system_cpu"] = r1.results[0].stream_schema;
+
+  auto r2 = compile_sql_expanded(
+      R"(CREATE STREAM system_memory(memory DOUBLE) FROM "Maria Morena";)",
+      session, 1000);
+  ASSERT_EQ(r2.results.size(), 1u);
+  ASSERT_FALSE(r2.results[0].has_errors()) << r2.results[0].errors[0].message;
+  EXPECT_EQ(r2.results[0].statement_type, StatementType::CREATE_STREAM);
+  EXPECT_EQ(r2.results[0].entity_name, "system_memory");
+  ASSERT_EQ(r2.results[0].stream_schema.columns.size(), 1u);
+  EXPECT_EQ(r2.results[0].stream_schema.columns[0].name, "memory");
+  EXPECT_EQ(r2.results[0].stream_schema.columns[0].type, ColumnType::DOUBLE);
+  ASSERT_TRUE(r2.results[0].stream_schema.source.has_value());
+  EXPECT_EQ(r2.results[0].stream_schema.source->name, "Maria Morena");
+  session.streams["system_memory"] = r2.results[0].stream_schema;
+
+  auto r3 = compile_sql_expanded(
+      "CREATE STREAM system_decay(cpu DOUBLE, x TEXT);",
+      session, 1000);
+  ASSERT_EQ(r3.results.size(), 1u);
+  ASSERT_FALSE(r3.results[0].has_errors()) << r3.results[0].errors[0].message;
+  EXPECT_EQ(r3.results[0].statement_type, StatementType::CREATE_STREAM);
+  EXPECT_EQ(r3.results[0].entity_name, "system_decay");
+  ASSERT_EQ(r3.results[0].stream_schema.columns.size(), 2u);
+  EXPECT_FALSE(r3.results[0].stream_schema.source.has_value());
+  session.streams["system_decay"] = r3.results[0].stream_schema;
+
+  EXPECT_EQ(session.streams.size(), 3u);
+  EXPECT_TRUE(session.streams.count("system_cpu"));
+  EXPECT_TRUE(session.streams.count("system_memory"));
+  EXPECT_TRUE(session.streams.count("system_decay"));
+}
+
+// ---------------------------------------------------------------------------
+// CREATE MATERIALIZED VIEW `TO "<template>"` output target
+// ---------------------------------------------------------------------------
+
+// Catalog where the trades key column is declared TEXT — the shape the
+// Coprocessor produces (tag-path segments are strings). Used by the TO
+// placeholder tests: `{col}` must reference a projected TEXT column.
+static CatalogSnapshot text_key_catalog() {
+  CatalogSnapshot cat;
+  StreamSchema trades{"trades",
+                      {{"instrument_id", 0, ColumnType::TEXT},
+                       {"price", 1},
+                       {"quantity", 2}}};
+  cat.streams["trades"] = trades;
+  return cat;
+}
+
+// Worked example: the template is a literal parent path (deploy-time values
+// like the processor name are written literally) plus `{col}` placeholders
+// picking the value of a projected TEXT column per row. The raw template is
+// stored verbatim; the payload is every NUMERIC projected column — TEXT
+// columns are path material, never tag values.
+TEST_F(CompilerIntegrationTest, MaterializedViewOutputTargetBasic) {
+  auto r = compile_sql(
+      "CREATE MATERIALIZED VIEW stats "
+      "TO \"ignition://[Coprocessor]vibration-monitor/stats/{instrument_id}/\" "
+      "AS SELECT MOVING_AVERAGE(price, 20) AS avg, "
+      "STDDEV(price, 20) AS rms, instrument_id "
+      "FROM trades GROUP BY instrument_id",
+      text_key_catalog());
+
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  EXPECT_EQ(r.statement_type, StatementType::CREATE_MATERIALIZED_VIEW);
+  ASSERT_TRUE(r.output_target.has_value());
+  EXPECT_EQ(*r.output_target,
+            "ignition://[Coprocessor]vibration-monitor/stats/{instrument_id}/");
+  // The payload is the numeric columns only; instrument_id (TEXT) is
+  // resolved into the path.
+  const auto& payload = r.output_payload_columns;
+  ASSERT_EQ(payload.size(), 2u);
+  EXPECT_NE(std::find(payload.begin(), payload.end(), "avg"), payload.end());
+  EXPECT_NE(std::find(payload.begin(), payload.end(), "rms"), payload.end());
+}
+
+// A projected TEXT column stays out of the payload even when it is NOT
+// referenced by any placeholder — only numeric columns become tags.
+TEST_F(CompilerIntegrationTest, MaterializedViewTextColumnNeverInPayload) {
+  auto r = compile_sql(
+      "CREATE MATERIALIZED VIEW stats "
+      "TO \"ignition://x/stats/\" "
+      "AS SELECT AVG(price) AS avg, instrument_id "
+      "FROM trades GROUP BY instrument_id",
+      text_key_catalog());
+
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  ASSERT_TRUE(r.output_target.has_value());
+  ASSERT_EQ(r.output_payload_columns.size(), 1u);
+  EXPECT_EQ(r.output_payload_columns[0], "avg");
+}
+
+// A `{col}` placeholder referencing a NUMERIC projection (aggregate) is
+// rejected — path segments are strings, so the column must be TEXT.
+TEST_F(CompilerIntegrationTest, MaterializedViewNonTextPlaceholderRejected) {
+  const std::string sql =
+      "CREATE MATERIALIZED VIEW stats TO \"ignition://x/{avg}/\" "
+      "AS SELECT AVG(price) AS avg, instrument_id "
+      "FROM trades GROUP BY instrument_id";
+  auto r = compile_sql(sql, text_key_catalog());
+
+  ASSERT_TRUE(r.has_errors());
+  EXPECT_NE(r.errors[0].message.find(
+                "TO placeholder '{avg}' requires a TEXT column"),
+            std::string::npos);
+  auto brace = sql.find("{avg}");
+  ASSERT_NE(brace, std::string::npos);
+  EXPECT_EQ(r.errors[0].line, 1);
+  EXPECT_EQ(r.errors[0].column, static_cast<int>(brace) + 1);
+  EXPECT_EQ(r.errors[0].end_column, static_cast<int>(brace) + 1 + 5);
+}
+
+// Single-quoted TO templates are accepted (canonical SQL string form).
+TEST_F(CompilerIntegrationTest, MaterializedViewSingleQuotedOutputTarget) {
+  auto r = compile_sql(
+      "CREATE MATERIALIZED VIEW stats "
+      "TO 'ignition://x/stats/{instrument_id}/' "
+      "AS SELECT AVG(price) AS avg, instrument_id "
+      "FROM trades GROUP BY instrument_id",
+      text_key_catalog());
+
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  ASSERT_TRUE(r.output_target.has_value());
+  EXPECT_EQ(*r.output_target, "ignition://x/stats/{instrument_id}/");
+  ASSERT_EQ(r.output_payload_columns.size(), 1u);
+  EXPECT_EQ(r.output_payload_columns[0], "avg");
+}
+
+// A `{col}` that doesn't match any projected column is a semantic error,
+// pointing at the placeholder (braces included).
+TEST_F(CompilerIntegrationTest, MaterializedViewOutputTargetUnknownColumn) {
+  const std::string sql =
+      "CREATE MATERIALIZED VIEW stats TO \"ignition://x/{nope}/\" "
+      "AS SELECT AVG(price) AS avg, instrument_id "
+      "FROM trades GROUP BY instrument_id";
+  auto r = compile_sql(sql, text_key_catalog());
+
+  ASSERT_TRUE(r.has_errors());
+  EXPECT_NE(r.errors[0].message.find(
+                "TO template references unknown column 'nope'"),
+            std::string::npos);
+  auto brace = sql.find("{nope}");
+  ASSERT_NE(brace, std::string::npos);
+  EXPECT_EQ(r.errors[0].line, 1);
+  EXPECT_EQ(r.errors[0].column, static_cast<int>(brace) + 1);
+  EXPECT_EQ(r.errors[0].end_column, static_cast<int>(brace) + 1 + 6);
+}
+
+// `{$instance}` (deploy-time processor name) and `{$view}` (view name) are
+// the two reserved external variables in TO templates. They are stored
+// verbatim, never validated against columns, and the host substitutes them
+// at deploy time — making the same script reusable across processors.
+TEST_F(CompilerIntegrationTest, OutputTargetReservedExternalsAccepted) {
+  auto r = compile_sql(
+      "CREATE MATERIALIZED VIEW stats "
+      "TO \"ignition://[Coprocessor]{$instance}/{$view}/{instrument_id}/\" "
+      "AS SELECT AVG(price) AS avg, instrument_id "
+      "FROM trades GROUP BY instrument_id",
+      text_key_catalog());
+
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  ASSERT_TRUE(r.output_target.has_value());
+  EXPECT_EQ(*r.output_target,
+            "ignition://[Coprocessor]{$instance}/{$view}/{instrument_id}/");
+  // Externals never join the payload computation: payload is still the
+  // numeric projected columns.
+  ASSERT_EQ(r.output_payload_columns.size(), 1u);
+  EXPECT_EQ(r.output_payload_columns[0], "avg");
+}
+
+// Unknown `{$foo}` externals are rejected with the allowed list, span over
+// the placeholder.
+TEST_F(CompilerIntegrationTest, OutputTargetUnknownExternalRejected) {
+  const std::string sql =
+      "CREATE MATERIALIZED VIEW stats TO \"ignition://{$foo}/all/\" "
+      "AS SELECT AVG(price) AS avg, instrument_id "
+      "FROM trades GROUP BY instrument_id";
+  auto r = compile_sql(sql, text_key_catalog());
+
+  ASSERT_TRUE(r.has_errors());
+  EXPECT_NE(r.errors[0].message.find(
+                "unknown external variable '{$foo}'; supported: {$instance}, "
+                "{$view}"),
+            std::string::npos);
+  auto brace = sql.find("{$foo}");
+  ASSERT_NE(brace, std::string::npos);
+  EXPECT_EQ(r.errors[0].line, 1);
+  EXPECT_EQ(r.errors[0].column, static_cast<int>(brace) + 1);
+  EXPECT_EQ(r.errors[0].end_column, static_cast<int>(brace) + 1 + 6);
+}
+
+// FROM sources have no deploy-time variables — externals stay rejected
+// there (the input binding must be a concrete, browsable tag pattern).
+TEST_F(CompilerIntegrationTest, FromExternalStillRejected) {
+  auto r = compile_sql(
+      R"(CREATE STREAM s(value DOUBLE) FROM 'ignition://{$instance}/x';)",
+      catalog);
+  ASSERT_TRUE(r.has_errors());
+  EXPECT_NE(r.errors[0].message.find(
+                "external placeholders are not supported"),
+            std::string::npos);
+}
+
+// `TO` is rejected on a plain (non-materialized) view.
+TEST_F(CompilerIntegrationTest, OutputTargetRejectedOnPlainView) {
+  auto r = compile_sql(
+      "CREATE VIEW v TO \"ignition://x/\" AS SELECT price FROM trades",
+      catalog);
+
+  ASSERT_TRUE(r.has_errors());
+  EXPECT_NE(r.errors[0].message.find(
+                "TO output target is only valid on CREATE MATERIALIZED VIEW"),
+            std::string::npos);
+}
+
+// A materialized view without a TO clause leaves the output metadata unset.
+TEST_F(CompilerIntegrationTest, MaterializedViewWithoutOutputTarget) {
+  auto r = compile_sql(
+      "CREATE MATERIALIZED VIEW stats AS "
+      "SELECT AVG(price) AS avg, instrument_id "
+      "FROM trades GROUP BY instrument_id",
+      catalog);
+
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  EXPECT_FALSE(r.output_target.has_value());
+  EXPECT_TRUE(r.output_payload_columns.empty());
+}
+
+// ---------------------------------------------------------------------------
+// SELECT projection alias → source-column tracking (FieldOrigins).
+//
+// Host runtimes need this map to decode TEXT columns that have been
+// renamed by a SELECT projection (e.g. `machine AS machine_id`). The
+// dictionary key for the underlying StringDictionary is keyed by the
+// source stream + source column, but the output row only carries the
+// alias — without origin info the decoder can't find the right dict.
+// ---------------------------------------------------------------------------
+
+// Helper: minimal catalog with one TEXT column path-part and one numeric
+// value column on a stream named `cpu` — mirrors the coprocessor's
+// canonical CREATE STREAM ... FROM '.../{machine}/...' shape.
+static CatalogSnapshot cpu_text_catalog() {
+  CatalogSnapshot cat;
+  StreamSchema cpu{"cpu",
+                   {{"machine", 0, ColumnType::TEXT},
+                    {"cpu_usage", 1}}};
+  cat.streams["cpu"] = cpu;
+  return cat;
+}
+
+// A direct `column AS alias` projection records its source so the
+// runtime can locate the source stream's StringDictionary at output-path
+// build time. Aggregate / expression items don't get an entry — they
+// produce DOUBLE outputs that don't need decoding.
+TEST_F(CompilerIntegrationTest, FieldOriginsRecordRenameForColumnRef) {
+  auto cat = cpu_text_catalog();
+  auto r = compile_sql(
+      "CREATE MATERIALIZED VIEW v TO \"[Coprocessor]Usage/{machine_id}\" AS "
+      "SELECT machine AS machine_id, "
+      "MOVING_AVERAGE(cpu_usage, 3) AS cpu_usage_avg "
+      "FROM cpu",
+      cat);
+
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  // The rename is captured: machine_id traces back to cpu.machine.
+  ASSERT_NE(r.field_origins.find("machine_id"), r.field_origins.end());
+  EXPECT_EQ(r.field_origins.at("machine_id").source_stream, "cpu");
+  EXPECT_EQ(r.field_origins.at("machine_id").source_column, "machine");
+  // The aggregate has no source TEXT column — absent from field_origins.
+  EXPECT_EQ(r.field_origins.find("cpu_usage_avg"), r.field_origins.end());
+}
+
+// A projection without a rename (bare ColumnRef) still gets an origin
+// entry — the alias and source column happen to be the same name, but
+// recording it keeps decoder logic uniform and works for the SELECT *
+// rewriting case.
+TEST_F(CompilerIntegrationTest, FieldOriginsRecordBareColumnRef) {
+  auto cat = cpu_text_catalog();
+  auto r = compile_sql(
+      "CREATE MATERIALIZED VIEW v TO \"[Coprocessor]Usage/{machine}\" AS "
+      "SELECT machine, MOVING_AVERAGE(cpu_usage, 3) AS avg FROM cpu", cat);
+
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  ASSERT_NE(r.field_origins.find("machine"), r.field_origins.end());
+  EXPECT_EQ(r.field_origins.at("machine").source_column, "machine");
+}
+
+// A SELECT with no ColumnRefs (only aggregates) produces an empty
+// field_origins map — nothing to decode.
+TEST_F(CompilerIntegrationTest, FieldOriginsEmptyForAggregateOnlySelect) {
+  auto cat = cpu_text_catalog();
+  auto r = compile_sql(
+      "CREATE MATERIALIZED VIEW v AS "
+      "SELECT MOVING_AVERAGE(cpu_usage, 3) AS avg, "
+      "MOVING_SUM(cpu_usage, 3) AS sum FROM cpu", cat);
+
+  ASSERT_FALSE(r.has_errors()) << r.errors[0].message;
+  EXPECT_TRUE(r.field_origins.empty());
+}
+
+// An empty `{}` placeholder is rejected.
+TEST_F(CompilerIntegrationTest, OutputTargetEmptyPlaceholderRejected) {
+  auto r = compile_sql(
+      "CREATE MATERIALIZED VIEW stats TO \"ignition://{}/\" AS "
+      "SELECT AVG(price) AS avg, instrument_id FROM trades GROUP BY instrument_id",
+      catalog);
+
+  ASSERT_TRUE(r.has_errors());
+  EXPECT_NE(r.errors[0].message.find("TO template has an empty placeholder"),
+            std::string::npos);
 }
 
 }  // namespace

@@ -40,11 +40,140 @@ bool is_known_column_type(const std::string& name) {
   return false;
 }
 
+// Mirrors the compiler's TEXT mapping (libs/api/src/compiler.cpp,
+// handle_create_stream): text/varchar/bpchar become ColumnType::TEXT.
+bool is_text_column_type(const std::string& name) {
+  std::string n = lower(name);
+  return n == "text" || n == "varchar" || n == "bpchar";
+}
+
 }  // namespace
 
 void analyze_create_stream(const parser::ast::CreateStreamStmt& stmt,
                            const CatalogSnapshot& /*catalog*/,
                            DiagnosticBag& bag) {
+  // --- CREATE STREAM source metadata (FROM "..." [TYPE …] [WINDOW …]) ---
+  if (stmt.source.has_value()) {
+    const auto& src = *stmt.source;
+
+    // Unknown TYPE value — points at the bad identifier.
+    if (src.type.has_value() &&
+        src.type->value == parser::ast::SourceType::UNKNOWN) {
+      parser::ast::SourceLocation loc;
+      loc.line = src.type->line;
+      loc.column = src.type->column;
+      loc.end_line = src.type->end_line;
+      loc.end_column = src.type->end_column;
+      bag.error(
+          "CREATE STREAM: unknown TYPE '" + src.type->raw +
+              "', expected 'scalar' or 'csv_burst'",
+          loc);
+    } else {
+      // Only run csv_burst↔WINDOW correlation when TYPE is well-defined.
+      // CSV_BURST requires WINDOW.
+      if (src.effective_type() == parser::ast::SourceType::CSV_BURST &&
+          !src.window.has_value()) {
+        parser::ast::SourceLocation loc;
+        loc.line = src.line;
+        loc.column = src.column;
+        loc.end_line = src.end_line;
+        loc.end_column = src.end_column;
+        bag.error("CREATE STREAM: TYPE csv_burst requires WINDOW", loc);
+      }
+      // WINDOW only valid with csv_burst.
+      if (src.window.has_value() &&
+          src.effective_type() != parser::ast::SourceType::CSV_BURST) {
+        parser::ast::SourceLocation loc;
+        loc.line = src.window->line;
+        loc.column = src.window->column;
+        loc.end_line = src.window->end_line;
+        loc.end_column = src.window->end_column;
+        bag.error(
+            "CREATE STREAM: WINDOW is only valid with TYPE csv_burst", loc);
+      }
+      // WINDOW value must be strictly positive.
+      if (src.window.has_value() && src.window->value <= 0) {
+        parser::ast::SourceLocation loc;
+        loc.line = src.window->line;
+        loc.column = src.window->column;
+        loc.end_line = src.window->end_line;
+        loc.end_column = src.window->end_column;
+        bag.error("CREATE STREAM: WINDOW must be a positive integer", loc);
+      }
+    }
+
+    // `{col}` placeholders must reference declared TEXT columns — they
+    // resolve to path segments of the matched tag path, which are strings.
+    for (const auto& ph : src.placeholders) {
+      const parser::ast::ColumnDefAST* col = nullptr;
+      for (const auto& c : stmt.columns) {
+        if (c.name == ph.name) {
+          col = &c;
+          break;
+        }
+      }
+      parser::ast::SourceLocation loc;
+      loc.line = ph.line;
+      loc.column = ph.column;
+      loc.end_line = ph.end_line;
+      loc.end_column = ph.end_column;
+      if (col == nullptr) {
+        bag.error("CREATE STREAM: FROM source references unknown column '" +
+                      ph.name + "'",
+                  loc);
+      } else if (!is_text_column_type(col->type_name)) {
+        bag.error("CREATE STREAM: FROM placeholder '{" + ph.name +
+                      "}' requires a TEXT column",
+                  loc);
+      }
+    }
+
+    // Every declared TEXT column must be filled by a `{col}` placeholder
+    // in the FROM string. Non-TEXT columns derive from the tag value
+    // lane; TEXT columns can only come from path parts, so a TEXT column
+    // without a matching placeholder is orphaned and will silently emit
+    // NULL/empty at runtime. Report the column declaration site.
+    for (const auto& col : stmt.columns) {
+      if (!is_text_column_type(col.type_name)) continue;
+      bool bound = false;
+      for (const auto& ph : src.placeholders) {
+        if (ph.name == col.name) {
+          bound = true;
+          break;
+        }
+      }
+      if (!bound) {
+        bag.error("CREATE STREAM: TEXT column '" + col.name +
+                      "' has no source — add a {" + col.name +
+                      "} placeholder in FROM or remove the column",
+                  col.loc);
+      }
+    }
+
+    // Exactly one non-TEXT column is allowed: the tag value lane. Two or
+    // more would compete for the single numeric value delivered per tag
+    // event, with no way to disambiguate which gets it. Report each
+    // surplus column at its declaration site.
+    bool seen_value_column = false;
+    for (const auto& col : stmt.columns) {
+      if (is_text_column_type(col.type_name)) continue;
+      if (!is_known_column_type(col.type_name)) continue;  // unknown-type
+                                                            // error fires
+                                                            // elsewhere
+      if (!seen_value_column) {
+        seen_value_column = true;
+        continue;
+      }
+      bag.error(
+          "CREATE STREAM: only one non-TEXT column is allowed (the tag "
+          "value lane); column '" +
+              col.name + "' is a second value column — make it TEXT and "
+              "bind it with a {" + col.name + "} placeholder in FROM, or "
+              "remove it",
+          col.loc);
+    }
+  }
+
   // Composite primary keys are not yet supported. Mirrors the throw at
   // libs/api/src/compiler.cpp:467-468.
   int pk_count = 0;

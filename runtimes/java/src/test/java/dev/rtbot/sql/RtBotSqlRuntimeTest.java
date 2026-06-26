@@ -1459,6 +1459,58 @@ public class RtBotSqlRuntimeTest {
     }
 
     // -----------------------------------------------------------------
+    // decodeTextFieldForPath() — alias → source-column dictionary lookup
+    // -----------------------------------------------------------------
+
+    @Test
+    public void decodeTextFieldForPathResolvesRenamedTextColumn() {
+        // CREATE STREAM with a TEXT path-part column; CREATE MATERIALIZED
+        // VIEW renames it via `column AS alias`. The runtime must follow
+        // field_origins back to the source dictionary.
+        runtime.execute("CREATE STREAM cpu (machine TEXT, cpu_usage DOUBLE PRECISION)");
+        runtime.insertMixed("cpu", 1000L, List.of("Performance", 42.0));
+        runtime.insertMixed("cpu", 2000L, List.of("Memory", 99.0));
+        runtime.execute("CREATE MATERIALIZED VIEW v AS SELECT machine AS machine_id FROM cpu");
+
+        StringDictionary dict = runtime.getCatalog().lookupDictionary("cpu.machine");
+        assertNotNull("source stream dictionary must exist", dict);
+        double idPerformance = dict.encode("Performance");
+        double idMemory = dict.encode("Memory");
+
+        assertEquals("Performance",
+                runtime.decodeTextFieldForPath("v", "machine_id", idPerformance));
+        assertEquals("Memory",
+                runtime.decodeTextFieldForPath("v", "machine_id", idMemory));
+    }
+
+    @Test
+    public void decodeTextFieldForPathReturnsNullWhenViewUnknown() {
+        assertNull(runtime.decodeTextFieldForPath("no_such_view", "x", 1.0));
+    }
+
+    @Test
+    public void decodeTextFieldForPathReturnsNullWhenFieldHasNoOrigin() {
+        // Aggregate outputs (no source TEXT column) get no field_origins
+        // entry — the lookup must return null so the caller falls back.
+        runtime.execute("CREATE STREAM cpu (machine TEXT, cpu_usage DOUBLE PRECISION)");
+        runtime.insertMixed("cpu", 1000L, List.of("Performance", 42.0));
+        runtime.execute("CREATE MATERIALIZED VIEW v AS "
+                + "SELECT MOVING_AVERAGE(cpu_usage, 3) AS cpu_avg FROM cpu");
+
+        assertNull(runtime.decodeTextFieldForPath("v", "cpu_avg", 1.0));
+    }
+
+    @Test
+    public void decodeTextFieldForPathReturnsNullForUnknownAlias() {
+        runtime.execute("CREATE STREAM cpu (machine TEXT, cpu_usage DOUBLE PRECISION)");
+        runtime.insertMixed("cpu", 1000L, List.of("Performance", 42.0));
+        runtime.execute("CREATE MATERIALIZED VIEW v AS SELECT machine AS machine_id FROM cpu");
+
+        // Field name that wasn't projected — no origin entry → null.
+        assertNull(runtime.decodeTextFieldForPath("v", "nonexistent", 1.0));
+    }
+
+    // -----------------------------------------------------------------
     // Dictionary persistence across serialize/restore
     // -----------------------------------------------------------------
 

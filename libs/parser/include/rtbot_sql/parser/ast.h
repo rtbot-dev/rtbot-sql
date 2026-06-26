@@ -175,16 +175,105 @@ struct ColumnDefAST {
   SourceLocation loc;
 };
 
+enum class SourceType { SCALAR, CSV_BURST, UNKNOWN };
+
+// The `TYPE <scalar|csv_burst>` clause. `raw` preserves the user-written
+// identifier verbatim — used by the analyzer when emitting "unknown TYPE"
+// diagnostics. `value` is UNKNOWN when `raw` is neither "scalar" nor
+// "csv_burst" (case-insensitive), so the analyzer can flag it. The span
+// covers the value identifier (inclusive start, exclusive end, 1-based).
+struct SourceTypeClause {
+  SourceType value = SourceType::SCALAR;
+  std::string raw;
+  int line = -1;
+  int column = -1;
+  int end_line = -1;
+  int end_column = -1;
+};
+
+// The `WINDOW <int>` clause. Span over the digits.
+struct SourceWindowClause {
+  int value = 0;
+  int line = -1;
+  int column = -1;
+  int end_line = -1;
+  int end_column = -1;
+};
+
+// A `{...}` placeholder inside a FROM source or TO template URI string.
+//
+// Column placeholders (`is_external == false`): `name` is the text between
+// the braces and must resolve to a column — a declared TEXT column for
+// FROM sources, a projected TEXT output column for TO templates.
+//
+// External variables (`is_external == true`): `{$instance}` / `{$view}`,
+// valid only in TO templates. `name` keeps the leading `$`. They are
+// stored verbatim and substituted by the host at deploy time (processor
+// name / view name) — never validated against columns.
+//
+// The span covers the placeholder including its braces (1-based, end
+// exclusive).
+struct UriPlaceholder {
+  std::string name;
+  bool is_external = false;
+  int line = -1;
+  int column = -1;
+  int end_line = -1;
+  int end_column = -1;
+};
+
+// Metadata for `FROM '...'` on CREATE STREAM. `name` is the unquoted source
+// identifier; `line`/`column`/`end_line`/`end_column` span the quoted
+// token (inclusive start, exclusive end, 1-based).
+//
+// `type` and `window` are present only when the user wrote the respective
+// clauses. Validation of their contents — unknown TYPE values, csv_burst
+// requiring WINDOW, WINDOW being valid only with csv_burst — lives in the
+// analyzer (libs/analyzer/src/ddl_analyzer.cpp::analyze_create_stream).
+struct Source {
+  std::string name;
+  // Every `{...}` found in `name`, in template order. Each must reference
+  // a declared TEXT column (validated in the analyzer).
+  std::vector<UriPlaceholder> placeholders;
+  int line = -1;
+  int column = -1;
+  int end_line = -1;
+  int end_column = -1;
+  std::optional<SourceTypeClause> type;
+  std::optional<SourceWindowClause> window;
+
+  SourceType effective_type() const {
+    return type.has_value() ? type->value : SourceType::SCALAR;
+  }
+};
+
 struct CreateStreamStmt {
   std::string name;
   std::vector<ColumnDefAST> columns;
+  std::optional<Source> source;
   SourceLocation loc;
+};
+
+// Metadata for the optional `TO '<template>'` clause on CREATE MATERIALIZED
+// VIEW. `tag_template` is the unquoted string verbatim (placeholders
+// intact). `placeholders` is every `{...}` found in template order; each
+// must reference a projected TEXT column of the view (checked in the
+// compiler against the field_map and source schema). The span covers the
+// quoted token (1-based, end exclusive).
+struct OutputTarget {
+  std::string tag_template;
+  std::vector<UriPlaceholder> placeholders;
+  int line = -1;
+  int column = -1;
+  int end_line = -1;
+  int end_column = -1;
 };
 
 struct CreateViewStmt {
   std::string name;
   bool materialized;
   SelectStmt query;
+  std::optional<OutputTarget> output_target;
   SourceLocation loc;
 };
 

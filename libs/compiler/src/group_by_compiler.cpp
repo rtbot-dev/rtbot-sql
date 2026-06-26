@@ -688,7 +688,7 @@ SelectResult compile_group_by(
       for (size_t i = 0; i < field_names.size(); ++i) {
         field_map[field_names[i]] = static_cast<int>(i);
       }
-      return {{keyed_id, "o1"}, field_map, /*is_segment_only=*/false};
+      return {{keyed_id, "o1"}, field_map, {}, /*is_segment_only=*/false};
     }
 
     auto inner_proto_id = builder.next_id("proto");
@@ -770,14 +770,14 @@ SelectResult compile_group_by(
       for (size_t i = 0; i < field_names.size(); ++i) {
         field_map[field_names[i]] = static_cast<int>(i);
       }
-      return {{keyed_id, "o1"}, field_map, /*is_segment_only=*/false};
+      return {{keyed_id, "o1"}, field_map, {}, /*is_segment_only=*/false};
     } else {
       // Single key: key at index 0 (prepended by KeyedPipeline), aggregates at 1, 2, ...
       FieldMap field_map;
       for (size_t i = 0; i < field_names.size(); ++i) {
         field_map[field_names[i]] = static_cast<int>(i);
       }
-      return {{keyed_id, "o1"}, field_map, /*is_segment_only=*/false};
+      return {{keyed_id, "o1"}, field_map, {}, /*is_segment_only=*/false};
     }
   }
 
@@ -916,7 +916,7 @@ SelectResult compile_group_by(
       field_map[field_names[i]] = static_cast<int>(i);
     }
 
-    return {pipeline_output, field_map, /*is_segment_only=*/true};
+    return {pipeline_output, field_map, {}, /*is_segment_only=*/true};
   }
 
   // --- Step 1: Identify key column(s) (persistent keys only) ---
