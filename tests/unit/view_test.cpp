@@ -382,3 +382,25 @@ TEST(ViewTest, OrderByAscLimitCompilesTopKAscending) {
 
 }  // namespace
 }  // namespace rtbot_sql::api
+
+namespace rtbot_sql::api {
+TEST(ViewTextTypeTest, PreservesRenamedTextAcrossViewsForOutputRouting) {
+  CatalogSnapshot catalog;
+  catalog.streams["s"] = StreamSchema{"s", {{"asset",0,ColumnType::TEXT},{"value",1}}};
+  for (const auto& sql : {
+      "CREATE VIEW first_view AS SELECT asset AS machine, value FROM s",
+      "CREATE VIEW second_view AS SELECT machine AS destination, value FROM first_view"}) {
+    const auto r = compile_sql(sql,catalog);
+    ASSERT_FALSE(r.has_errors());
+    ViewMeta meta{};
+    meta.name=r.entity_name; meta.field_map=r.field_map;
+    meta.field_origins=r.field_origins; meta.source_streams=r.source_streams;
+    catalog.views[meta.name]=meta;
+  }
+  auto good=compile_sql("CREATE MATERIALIZED VIEW output TO '[default]/{destination}' AS SELECT destination,value FROM second_view",catalog);
+  ASSERT_FALSE(good.has_errors()) << (good.errors.empty()?"":good.errors[0].message);
+  EXPECT_EQ(good.output_payload_columns,(std::vector<std::string>{"value"}));
+  auto bad=compile_sql("CREATE MATERIALIZED VIEW wrong TO '[default]/{value}' AS SELECT destination,value FROM second_view",catalog);
+  EXPECT_TRUE(bad.has_errors());
+}
+}

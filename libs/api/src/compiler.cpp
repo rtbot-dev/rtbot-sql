@@ -96,7 +96,19 @@ StreamSchema lookup_schema(const std::string& source,
               [](const auto& a, const auto& b) { return a.second < b.second; });
 
     for (int i = 0; i < static_cast<int>(sorted_entries.size()); ++i) {
-      schema.columns.push_back({sorted_entries[i].first, i});
+      ColumnType type = ColumnType::DOUBLE;
+      const auto origin = it_view->second.field_origins.find(sorted_entries[i].first);
+      if (origin != it_view->second.field_origins.end() &&
+          origin->second.source_stream != source) {
+        const auto upstream = lookup_schema(origin->second.source_stream, catalog);
+        for (const auto& column : upstream.columns) {
+          if (column.name == origin->second.source_column) {
+            type = column.type;
+            break;
+          }
+        }
+      }
+      schema.columns.push_back({sorted_entries[i].first, i, type});
     }
     return schema;
   }
