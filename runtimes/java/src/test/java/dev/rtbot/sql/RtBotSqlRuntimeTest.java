@@ -2461,4 +2461,19 @@ public class RtBotSqlRuntimeTest {
         assertEquals("Bay B", runtime.decodeRow("sensors", result.rows.get(1)).get(locIdx));
         assertEquals("Bay A", runtime.decodeRow("sensors", result.rows.get(2)).get(locIdx));
     }
+    @Test
+    public void groupedTextOriginSurvivesCatalogSnapshotAndDecodesOutputPath() {
+        runtime.execute("CREATE STREAM vibration (asset TEXT, amplitude DOUBLE)");
+        runtime.execute("CREATE VIEW moments AS SELECT asset, AVG(amplitude) AS mean_value, COUNT(*) AS n FROM vibration GROUP BY asset, amplitude > -100000000");
+        runtime.execute("CREATE MATERIALIZED VIEW metrics TO '[default]/{machine}' AS SELECT asset AS machine, mean_value, n FROM moments WHERE n > 1");
+        double id = runtime.encodeText("vibration", "asset", "Pump-001");
+        runtime.insertBatch("vibration", new long[]{1000,1001,1002,1003},
+                new double[][]{{id,id,id,id},{1,0,2,-1000000000}});
+        SelectResult result=(SelectResult) runtime.execute("SELECT * FROM metrics LIMIT 10");
+        assertEquals(1,result.rows.size());
+        assertEquals(3.0,result.rows.get(0).get(result.columns.indexOf("n")),0.0);
+        assertEquals(1.0,result.rows.get(0).get(result.columns.indexOf("mean_value")),1e-9);
+        assertEquals("Pump-001",runtime.decodeTextFieldForPath("metrics","machine",id));
+    }
+
 }

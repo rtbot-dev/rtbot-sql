@@ -200,6 +200,7 @@ public class InMemoryCatalog {
             copy.entityType = original.entityType;
             copy.viewType = original.viewType;
             copy.fieldMap = new HashMap<>(original.fieldMap);
+            copy.fieldOrigins = new HashMap<>(original.fieldOrigins);
             copy.sourceStreams = new ArrayList<>(original.sourceStreams);
             copy.programJson = original.programJson;
             copy.outputStream = original.outputStream;

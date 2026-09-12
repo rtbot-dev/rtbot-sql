@@ -854,7 +854,16 @@ CompilationResult handle_create_mat_view(
       for (const auto& item : stmt.query.select_list) {
         if (const auto* column = std::get_if<parser::ast::ColumnRef>(&item.expr)) {
           const auto name = item.alias.value_or(column->column_name);
-          result.field_origins[name] = {stmt.query.from_table, column->column_name};
+          FieldOrigin origin{stmt.query.from_table, column->column_name};
+          // Preserve the original dictionary owner through a view chain.
+          for (size_t depth = 0; depth < catalog.views.size(); ++depth) {
+            const auto upstream = catalog.views.find(origin.source_stream);
+            if (upstream == catalog.views.end()) break;
+            const auto previous = upstream->second.field_origins.find(origin.source_column);
+            if (previous == upstream->second.field_origins.end()) break;
+            origin = previous->second;
+          }
+          result.field_origins[name] = origin;
         }
       }
     }
