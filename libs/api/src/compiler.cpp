@@ -848,6 +848,16 @@ CompilationResult handle_create_mat_view(
                                 ? StatementType::CREATE_MATERIALIZED_VIEW
                                 : StatementType::CREATE_VIEW;
     result.entity_name = stmt.name;
+    // Grouped outputs still preserve the origin of bare projected keys.
+    // Arithmetic and aggregate outputs remain numeric and have no origin.
+    if (stmt.query.from_tables.size() <= 1 && stmt.query.join_clauses.empty()) {
+      for (const auto& item : stmt.query.select_list) {
+        if (const auto* column = std::get_if<parser::ast::ColumnRef>(&item.expr)) {
+          const auto name = item.alias.value_or(column->column_name);
+          result.field_origins[name] = {stmt.query.from_table, column->column_name};
+        }
+      }
+    }
 
     // Validate and record the optional `TO '<template>'` output target.
     // `{col}` placeholders pick the value of a projected TEXT column per

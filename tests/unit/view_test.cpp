@@ -388,10 +388,10 @@ TEST(ViewTextTypeTest, PreservesRenamedTextAcrossViewsForOutputRouting) {
   CatalogSnapshot catalog;
   catalog.streams["s"] = StreamSchema{"s", {{"asset",0,ColumnType::TEXT},{"value",1}}};
   for (const auto& sql : {
-      "CREATE VIEW first_view AS SELECT asset AS machine, value FROM s",
-      "CREATE VIEW second_view AS SELECT machine AS destination, value FROM first_view"}) {
+      "CREATE VIEW first_view AS SELECT asset, AVG(value) AS average_value FROM s GROUP BY asset, value > -100000000",
+      "CREATE VIEW second_view AS SELECT asset AS destination, average_value AS value FROM first_view"}) {
     const auto r = compile_sql(sql,catalog);
-    ASSERT_FALSE(r.has_errors());
+    ASSERT_FALSE(r.has_errors()) << (r.errors.empty()?"":r.errors[0].message);
     ViewMeta meta{};
     meta.name=r.entity_name; meta.field_map=r.field_map;
     meta.field_origins=r.field_origins; meta.source_streams=r.source_streams;
