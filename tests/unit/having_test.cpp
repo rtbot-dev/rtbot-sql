@@ -58,7 +58,7 @@ TEST_F(HavingTest, HavingWithSharedCount) {
   // HAVING COUNT(*) > 5
   Expr having = cmp(">", func_expr("COUNT", {}), num(5));
 
-  auto [ep, field_map, _seg1] =
+  auto [ep, field_map, _origins, _seg1] =
       compile_group_by(select_list, group_by, std::move(having), input, scope,
                        builder);
 
@@ -106,7 +106,7 @@ TEST_F(HavingTest, HavingWithSharedSum) {
   sum_args2.push_back(col("quantity"));
   Expr having = cmp(">", func_expr("SUM", std::move(sum_args2)), num(1000));
 
-  auto [ep, field_map, _seg2] =
+  auto [ep, field_map, _origins, _seg2] =
       compile_group_by(select_list, group_by, std::move(having), input, scope,
                        builder);
 
@@ -153,7 +153,7 @@ TEST_F(HavingTest, VelocityPatternBuildsOuterPrefilter) {
   mc_args.push_back(num(5));
   Expr having = cmp(">", func_expr("MOVING_COUNT", std::move(mc_args)), num(3));
 
-  auto [ep, field_map, _seg3] =
+  auto [ep, field_map, _origins, _seg3] =
       compile_group_by(select_list, group_by, std::move(having), input, scope,
                        builder);
 
@@ -337,7 +337,7 @@ TEST_F(HavingTest, SegmentHavingPostPipelineFilter) {
   having_sum_args.push_back(col("quantity"));
   Expr having = cmp(">", func_expr("SUM", std::move(having_sum_args)), num(100));
 
-  auto [ep, field_map, is_seg] =
+  auto [ep, field_map, _origins, is_seg] =
       compile_group_by(select_list, group_by, std::move(having), input, scope,
                        builder);
 

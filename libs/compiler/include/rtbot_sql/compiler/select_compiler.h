@@ -5,16 +5,21 @@
 #include <vector>
 
 #include "rtbot_sql/analyzer/scope.h"
+#include "rtbot_sql/api/types.h"
 #include "rtbot_sql/compiler/graph_builder.h"
 #include "rtbot_sql/parser/ast.h"
 
 namespace rtbot_sql::compiler {
 
 using FieldMap = std::map<std::string, int>;
+// Output-column alias → (source_stream, source_column) for direct
+// `column AS alias` projections. See rtbot_sql::FieldOrigin docs.
+using FieldOrigins = std::map<std::string, rtbot_sql::FieldOrigin>;
 
 struct SelectResult {
   Endpoint endpoint;
   FieldMap field_map;
+  FieldOrigins field_origins;
   bool is_segment_only = false;  // true when GROUP BY has only segment expressions (no persistent keys)
 };
 

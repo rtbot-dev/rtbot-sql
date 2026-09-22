@@ -344,3 +344,14 @@ java_test(
         "@maven//:com_google_code_gson_gson",
     ],
 )
+
+java_test(
+    name = "binding-metadata-test",
+    srcs = ["src/test/java/dev/rtbot/sql/BindingMetadataTest.java"],
+    test_class = "dev.rtbot.sql.BindingMetadataTest",
+    deps = [
+        ":rtbot-sql-java-runtime",
+        "@maven//:junit_junit",
+        "@maven//:com_google_code_gson_gson",
+    ],
+)

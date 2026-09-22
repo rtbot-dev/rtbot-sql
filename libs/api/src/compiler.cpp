@@ -35,9 +35,24 @@ namespace {
 
 std::string normalize_sql(const std::string& sql) {
   std::string out = sql;
+  // Strip optional FROM '...' [TYPE x] [WINDOW n] source metadata so
+  // pg_query never sees it. The anchor on ) ensures we only match after a
+  // column-list closing paren, not in SELECT ... FROM clauses. Both quote
+  // styles are accepted; the backreference keeps them paired.
+  static const std::regex kStreamFrom(
+      R"(\)\s+FROM\s+(["'])[^"']*\1(?:\s+TYPE\s+\w+)?(?:\s+WINDOW\s+\d+)?\s*;?\s*$)",
+      std::regex::icase);
+  out = std::regex_replace(out, kStreamFrom, ")");
   static const std::regex kCreateStream(R"(\bCREATE\s+STREAM\b)",
                                         std::regex::icase);
   out = std::regex_replace(out, kCreateStream, "CREATE TABLE");
+  // Strip the optional `TO '<template>'` output target on CREATE MATERIALIZED
+  // VIEW so pg_query (which has no such clause) never sees it. The lookahead
+  // on AS keeps the `TO '…'` matched only in `… TO '…' AS …` position and
+  // leaves the AS keyword in place. Both quote styles are accepted.
+  static const std::regex kMatViewTo(R"(\bTO\s+(["'])[^"']*\1\s+(?=AS\b))",
+                                     std::regex::icase);
+  out = std::regex_replace(out, kMatViewTo, "");
   static const std::regex kDropStream(R"(\bDROP\s+STREAM\b)",
                                       std::regex::icase);
   out = std::regex_replace(out, kDropStream, "DROP TABLE");
@@ -181,8 +196,11 @@ CompilationResult compile_stream_cross_select(
                                       &source_ports);
   }
 
-  auto [ep, field_map, _seg] = compiler::compile_select_projection(
+  auto sel_result = compiler::compile_select_projection(
       expanded_select, current, scope, builder, &source_ports);
+  auto ep = sel_result.endpoint;
+  auto field_map = sel_result.field_map;
+  auto field_origins = sel_result.field_origins;
   current = ep;
 
   if (!stmt.order_by.empty() && stmt.limit.has_value()) {
@@ -218,6 +236,7 @@ CompilationResult compile_stream_cross_select(
 
   result.program_json = builder.to_json();
   result.field_map = field_map;
+  result.field_origins = field_origins;
   result.source_streams.clear();
   for (const auto& src : stmt.from_tables) {
     result.source_streams.push_back(src.table_name);
@@ -314,23 +333,29 @@ CompilationResult compile_select_to_program(
   }
 
   compiler::FieldMap field_map;
+  compiler::FieldOrigins field_origins;
 
   // GROUP BY
   bool is_segment_only_group_by = false;
   if (!expanded_group_by.empty()) {
-    auto [ep, fm, seg_only] = compiler::compile_group_by(
+    auto gb = compiler::compile_group_by(
         expanded_select, expanded_group_by, expanded_having, current, scope,
         builder, num_input_cols);
-    current = ep;
-    field_map = fm;
-    is_segment_only_group_by = seg_only;
+    current = gb.endpoint;
+    field_map = gb.field_map;
+    field_origins = gb.field_origins;  // empty today; aggregate outputs
+                                        // are DOUBLE so no decoding is
+                                        // needed, but propagate in case
+                                        // group_by_compiler starts
+                                        // populating them.
+    is_segment_only_group_by = gb.is_segment_only;
   } else {
     // SELECT projection. When try_absorb_where is on, we haven't yet emitted
     // compile_where — give the projection a shot at folding it into the FEV.
     const parser::ast::Expr* where_ptr =
         try_absorb_where ? &*expanded_where : nullptr;
     bool where_absorbed = false;
-    auto [ep, fm, _seg2] = compiler::compile_select_projection(
+    auto sel = compiler::compile_select_projection(
         expanded_select, current, scope, builder,
         /*source_endpoints=*/nullptr, where_ptr, &where_absorbed);
     // Absorption is best-effort. If the projection fell back (multi-source
@@ -343,9 +368,11 @@ CompilationResult compile_select_to_program(
                                                         scope, builder);
       current = retry.endpoint;
       field_map = retry.field_map;
+      field_origins = retry.field_origins;
     } else {
-      current = ep;
-      field_map = fm;
+      current = sel.endpoint;
+      field_map = sel.field_map;
+      field_origins = sel.field_origins;
     }
   }
 
@@ -387,6 +414,7 @@ CompilationResult compile_select_to_program(
 
   result.program_json = builder.to_json();
   result.field_map = field_map;
+  result.field_origins = field_origins;
   result.source_streams = {stmt.from_table};
 
   // Determine view type
@@ -435,6 +463,7 @@ CompilationResult handle_create_stream(
     schema.columns.push_back(
         {stmt.columns[i].name, static_cast<int>(i), col_type});
   }
+  schema.source = stmt.source;
   result.stream_schema = schema;
   return result;
 }
@@ -572,6 +601,7 @@ CompilationResult handle_select(const parser::ast::SelectStmt& stmt,
       if (compiled.has_errors()) return compiled;
       result.program_json = compiled.program_json;
       result.field_map = compiled.field_map;
+      result.field_origins = compiled.field_origins;
       result.source_streams = compiled.source_streams;
       result.view_type = compiled.view_type;
       result.key_index = compiled.key_index;
@@ -599,6 +629,7 @@ CompilationResult handle_select(const parser::ast::SelectStmt& stmt,
       if (compiled.has_errors()) return compiled;
       result.program_json = compiled.program_json;
       result.field_map = compiled.field_map;
+      result.field_origins = compiled.field_origins;
       result.source_streams = compiled.source_streams;
       result.view_type = compiled.view_type;
       result.key_index = compiled.key_index;
@@ -725,11 +756,13 @@ CompilationResult compile_table_join(
 
   // SELECT projection (or pass-through for SELECT *)
   compiler::FieldMap field_map;
+  compiler::FieldOrigins field_origins;
   if (!stmt.select_list.empty()) {
-    auto [ep, fm, _seg3] = compiler::compile_select_projection(
+    auto sel = compiler::compile_select_projection(
         stmt.select_list, current, scope, builder);
-    current = ep;
-    field_map = fm;
+    current = sel.endpoint;
+    field_map = sel.field_map;
+    field_origins = sel.field_origins;
   } else {
     for (const auto& col : left_schema.columns) {
       field_map[col.name] = col.index;
@@ -754,6 +787,7 @@ CompilationResult compile_table_join(
   result.select_tier = SelectTier::TIER3_EPHEMERAL;
   result.program_json = builder.to_json();
   result.field_map = field_map;
+  result.field_origins = field_origins;
   // source_streams: left stream + table entity name (for dependency checking)
   result.source_streams = {stmt.from_table, join.table_name};
   result.view_type = ViewType::SCALAR;
@@ -802,6 +836,77 @@ CompilationResult handle_create_mat_view(
                                 ? StatementType::CREATE_MATERIALIZED_VIEW
                                 : StatementType::CREATE_VIEW;
     result.entity_name = stmt.name;
+
+    // Validate and record the optional `TO '<template>'` output target.
+    // `{col}` placeholders pick the value of a projected TEXT column per
+    // row (path segments are strings). The payload is every NUMERIC
+    // projected column — TEXT columns are path material, never tag values.
+    if (stmt.output_target.has_value()) {
+      const auto& ot = *stmt.output_target;
+      if (!stmt.materialized) {
+        // Defensive: extraction already rejects TO on non-materialized views.
+        CompilationResult err{};
+        err.errors.push_back(
+            {"TO output target is only valid on CREATE MATERIALIZED VIEW",
+             ot.line, ot.column, ot.end_line, ot.end_column});
+        return err;
+      }
+
+      // TEXT-ness of a projected output column: aggregates and expressions
+      // are numeric; only a bare passthrough column inherits TEXT from the
+      // FROM source schema. (SELECT * expansion is not inspected — starred
+      // columns classify as numeric.)
+      auto output_column_is_text = [&](const std::string& out_name) -> bool {
+        for (const auto& item : stmt.query.select_list) {
+          const auto* cr = std::get_if<parser::ast::ColumnRef>(&item.expr);
+          std::string name;
+          if (item.alias.has_value()) {
+            name = *item.alias;
+          } else if (cr != nullptr) {
+            name = cr->column_name;
+          }
+          if (name != out_name) continue;
+          if (cr == nullptr) return false;
+          const auto schema = lookup_schema(stmt.query.from_table, catalog);
+          for (const auto& c : schema.columns) {
+            if (c.name == cr->column_name) return c.type == ColumnType::TEXT;
+          }
+          return false;
+        }
+        return false;
+      };
+
+      for (const auto& ph : ot.placeholders) {
+        if (ph.is_external) continue;  // {$instance}/{$view}: host-resolved.
+        if (result.field_map.find(ph.name) == result.field_map.end()) {
+          CompilationResult err{};
+          err.errors.push_back(
+              {"TO template references unknown column '" + ph.name +
+                   "' (not produced by the view)",
+               ph.line, ph.column, ph.end_line, ph.end_column});
+          return err;
+        }
+        if (!output_column_is_text(ph.name)) {
+          CompilationResult err{};
+          err.errors.push_back(
+              {"TO placeholder '{" + ph.name + "}' requires a TEXT column",
+               ph.line, ph.column, ph.end_line, ph.end_column});
+          return err;
+        }
+      }
+
+      // Payload: every numeric projected column, in output order.
+      std::vector<std::pair<std::string, int>> cols(result.field_map.begin(),
+                                                    result.field_map.end());
+      std::sort(cols.begin(), cols.end(),
+                [](const auto& a, const auto& b) { return a.second < b.second; });
+      for (const auto& [name, _idx] : cols) {
+        if (!output_column_is_text(name)) {
+          result.output_payload_columns.push_back(name);
+        }
+      }
+      result.output_target = ot.tag_template;
+    }
   } catch (const std::runtime_error& e) {
     return make_error(e.what());
   }
@@ -834,11 +939,13 @@ CompilationResult handle_select_from_view(const parser::ast::SelectStmt& stmt,
 
   // Apply SELECT projection (if not SELECT *).
   compiler::FieldMap field_map = view_meta.field_map;
+  compiler::FieldOrigins field_origins = view_meta.field_origins;
   if (!stmt.select_list.empty()) {
-    auto [ep, fm, _seg4] = compiler::compile_select_projection(
+    auto sel = compiler::compile_select_projection(
         stmt.select_list, current, scope, builder);
-    current = ep;
-    field_map = fm;
+    current = sel.endpoint;
+    field_map = sel.field_map;
+    field_origins = sel.field_origins;
   }
 
   // Re-wire Output operator.
@@ -866,6 +973,7 @@ CompilationResult handle_select_from_view(const parser::ast::SelectStmt& stmt,
   result.select_tier = SelectTier::TIER3_EPHEMERAL;
   result.program_json = builder.to_json();
   result.field_map = field_map;
+  result.field_origins = field_origins;
   result.source_streams = view_meta.source_streams;
   result.select_limit = *stmt.limit;
   return result;
@@ -895,8 +1003,327 @@ CompilationResult handle_drop(const parser::ast::DropStmt& stmt,
 
 }  // namespace
 
+namespace {
+
+// Parses `{...}` placeholders out of a URI template extracted from `sql`.
+// `content_offset` is the byte offset in `sql` of the template's first
+// character (just past the opening quote), so each placeholder's span maps
+// back to the source. `context` prefixes diagnostics ("CREATE STREAM: FROM
+// source", "TO template").
+//
+// `allow_externals`: TO templates accept the reserved deploy-time
+// variables `{$instance}` / `{$view}` (marked `is_external`, name keeps
+// the `$`); any other `{$...}` is an error. FROM sources pass false —
+// input bindings must be concrete tag patterns.
+//
+// Returns an error result for empty, unterminated, or invalid external
+// placeholders; std::nullopt on success.
+std::optional<CompilationResult> parse_uri_placeholders(
+    const parser::SourceText& src, const std::string& tmpl,
+    int content_offset, const std::string& context, bool allow_externals,
+    std::vector<parser::ast::UriPlaceholder>& out) {
+  auto loc_error = [&](int byte_offset,
+                       const std::string& msg) -> CompilationResult {
+    auto loc = parser::compute_location(src, byte_offset);
+    CompilationResult r{};
+    r.errors.push_back(
+        {msg, loc.line, loc.column, loc.end_line, loc.end_column});
+    return r;
+  };
+
+  for (std::size_t p = 0; p < tmpl.size(); ++p) {
+    if (tmpl[p] != '{') continue;
+    std::size_t close = tmpl.find('}', p);
+    int open_abs = content_offset + static_cast<int>(p);
+    if (close == std::string::npos) {
+      return loc_error(open_abs,
+                       context + " has an unterminated `{` placeholder");
+    }
+    int close_abs = content_offset + static_cast<int>(close);
+
+    parser::ast::UriPlaceholder ph;
+    ph.name = tmpl.substr(p + 1, close - p - 1);
+
+    auto sloc = parser::compute_location(src, open_abs);
+    auto eloc = parser::compute_location(src, close_abs);
+    ph.line = sloc.line;
+    ph.column = sloc.column;
+    ph.end_line = eloc.end_line;
+    ph.end_column = eloc.end_column;
+
+    if (ph.name.empty()) {
+      return loc_error(open_abs, context + " has an empty placeholder");
+    }
+    if (ph.name[0] == '$') {
+      if (!allow_externals) {
+        CompilationResult err{};
+        err.errors.push_back(
+            {context +
+                 ": external placeholders are not supported; write the "
+                 "value literally in the URI",
+             ph.line, ph.column, ph.end_line, ph.end_column});
+        return err;
+      }
+      if (ph.name != "$instance" && ph.name != "$view") {
+        CompilationResult err{};
+        err.errors.push_back(
+            {context + ": unknown external variable '{" + ph.name +
+                 "}'; supported: {$instance}, {$view}",
+             ph.line, ph.column, ph.end_line, ph.end_column});
+        return err;
+      }
+      ph.is_external = true;
+    }
+    out.push_back(std::move(ph));
+    p = close;
+  }
+  return std::nullopt;
+}
+
+}  // namespace
+
 CompilationResult compile_sql(const std::string& sql,
                               const CatalogSnapshot& catalog) {
+  // Parse the optional FROM "..." [TYPE x] [WINDOW n] source metadata before
+  // normalization strips it. Validation rules:
+  //   * `CREATE STREAM ... ) FROM`            → "FROM requires a quoted source name"
+  //   * `... FROM "<unknown TYPE>`            → "unknown TYPE '...'"
+  //   * `... FROM "src" TYPE csv_burst` (no WINDOW)
+  //                                            → "TYPE csv_burst requires WINDOW"
+  //   * `... FROM "src" WINDOW <not-a-number>` → "WINDOW requires a positive integer"
+  //   * `... FROM "src" <non-`;` after metadata>` → "expected `;` after source name"
+  //   * Otherwise accepted; source/type/window populated.
+  std::optional<Source> stream_source;
+  {
+    static const std::regex kCreateStream(R"(\bCREATE\s+STREAM\b)",
+                                          std::regex::icase);
+    // Group 1 = quote char (paired via backreference), group 2 = content.
+    static const std::regex kStreamFromAnywhere(
+        R"re(\)\s+FROM\s+(["'])([^"']*)\1)re", std::regex::icase);
+    static const std::regex kBareFrom(R"re(\)\s+(FROM)\b)re",
+                                      std::regex::icase);
+
+    bool is_create_stream = std::regex_search(sql, kCreateStream);
+    std::smatch m;
+
+    auto make_loc_error = [&](int byte_offset,
+                              const std::string& msg) -> CompilationResult {
+      auto src = parser::make_source_text(sql);
+      auto loc = parser::compute_location(src, byte_offset);
+      CompilationResult r{};
+      r.errors.push_back(
+          {msg, loc.line, loc.column, loc.end_line, loc.end_column});
+      return r;
+    };
+
+    if (is_create_stream && std::regex_search(sql, m, kStreamFromAnywhere)) {
+      Source s;
+      s.name = m[2].str();
+      auto src = parser::make_source_text(sql);
+      // Span the quoted token (both quotes) via find_token_end.
+      int quote_offset = static_cast<int>(m.position(2)) - 1;
+      auto loc = parser::compute_location(src, quote_offset);
+      s.line = loc.line;
+      s.column = loc.column;
+      s.end_line = loc.end_line;
+      s.end_column = loc.end_column;
+
+      // Parse `{col}` placeholders in the source string. Empty, unterminated
+      // and `$`-prefixed placeholders are rejected here; column resolution
+      // (declared, TEXT) happens in the analyzer.
+      if (auto err = parse_uri_placeholders(
+              src, s.name, static_cast<int>(m.position(2)),
+              "CREATE STREAM: FROM source", /*allow_externals=*/false,
+              s.placeholders)) {
+        return *err;
+      }
+
+      // Cursor for parsing TYPE and WINDOW clauses after the closing quote.
+      std::size_t i = static_cast<std::size_t>(m.position(0)) +
+                       static_cast<std::size_t>(m.length(0));
+      auto skip_ws = [&]() {
+        while (i < sql.size() &&
+               std::isspace(static_cast<unsigned char>(sql[i])))
+          ++i;
+      };
+      auto match_keyword = [&](const std::string& kw) -> bool {
+        if (i + kw.size() > sql.size()) return false;
+        for (std::size_t k = 0; k < kw.size(); ++k) {
+          if (std::tolower(static_cast<unsigned char>(sql[i + k])) !=
+              std::tolower(static_cast<unsigned char>(kw[k])))
+            return false;
+        }
+        if (i + kw.size() < sql.size()) {
+          unsigned char next =
+              static_cast<unsigned char>(sql[i + kw.size()]);
+          if (std::isalnum(next) || next == '_') return false;
+        }
+        return true;
+      };
+      auto read_word = [&]() -> std::string {
+        std::size_t start = i;
+        while (i < sql.size() &&
+               (std::isalnum(static_cast<unsigned char>(sql[i])) ||
+                sql[i] == '_'))
+          ++i;
+        return sql.substr(start, i - start);
+      };
+
+      skip_ws();
+
+      // Optional TYPE clause.
+      if (match_keyword("TYPE")) {
+        i += 4;
+        skip_ws();
+        std::size_t id_start = i;
+        std::string type_str = read_word();
+        if (type_str.empty()) {
+          return make_loc_error(
+              static_cast<int>(id_start),
+              "CREATE STREAM: TYPE requires a value (scalar or csv_burst)");
+        }
+        std::string type_lower = type_str;
+        std::transform(type_lower.begin(), type_lower.end(),
+                       type_lower.begin(), ::tolower);
+        SourceTypeClause tc;
+        tc.raw = type_str;
+        auto type_loc = parser::compute_location(
+            src, static_cast<int>(id_start));
+        tc.line = type_loc.line;
+        tc.column = type_loc.column;
+        tc.end_line = type_loc.end_line;
+        tc.end_column = type_loc.end_column;
+        if (type_lower == "scalar") {
+          tc.value = SourceType::SCALAR;
+        } else if (type_lower == "csv_burst") {
+          tc.value = SourceType::CSV_BURST;
+        } else {
+          // Preserve the raw identifier; the analyzer will flag UNKNOWN.
+          tc.value = SourceType::UNKNOWN;
+        }
+        s.type = tc;
+        skip_ws();
+        // Reject a second TYPE clause. Span over the duplicate keyword.
+        if (match_keyword("TYPE")) {
+          return make_loc_error(
+              static_cast<int>(i),
+              "CREATE STREAM: duplicate TYPE clause");
+        }
+      }
+
+      // Optional WINDOW clause.
+      if (match_keyword("WINDOW")) {
+        std::size_t window_offset = i;
+        i += 6;
+        skip_ws();
+        std::size_t num_start = i;
+        while (i < sql.size() &&
+               std::isdigit(static_cast<unsigned char>(sql[i])))
+          ++i;
+        if (num_start == i) {
+          return make_loc_error(
+              static_cast<int>(window_offset),
+              "CREATE STREAM: WINDOW requires a positive integer");
+        }
+        SourceWindowClause wc;
+        try {
+          wc.value = std::stoi(sql.substr(num_start, i - num_start));
+        } catch (const std::out_of_range&) {
+          return make_loc_error(
+              static_cast<int>(num_start),
+              "CREATE STREAM: WINDOW value is out of range");
+        }
+        auto window_loc = parser::compute_location(
+            src, static_cast<int>(num_start));
+        wc.line = window_loc.line;
+        wc.column = window_loc.column;
+        wc.end_line = window_loc.end_line;
+        wc.end_column = window_loc.end_column;
+        s.window = wc;
+        skip_ws();
+        // Reject a second WINDOW clause. Span over the duplicate keyword.
+        if (match_keyword("WINDOW")) {
+          return make_loc_error(
+              static_cast<int>(i),
+              "CREATE STREAM: duplicate WINDOW clause");
+        }
+      }
+
+      // Semantic checks (unknown TYPE, csv_burst↔WINDOW correlation) live
+      // in the analyzer (libs/analyzer/src/ddl_analyzer.cpp).
+
+      // After source / TYPE / WINDOW: first non-whitespace must be `;` or
+      // end-of-input.
+      if (i < sql.size() && sql[i] != ';') {
+        return make_loc_error(
+            static_cast<int>(i),
+            "CREATE STREAM: expected `;` after source name");
+      }
+
+      stream_source = std::move(s);
+    } else if (is_create_stream &&
+               std::regex_search(sql, m, kBareFrom)) {
+      return make_loc_error(
+          static_cast<int>(m.position(1)),
+          "CREATE STREAM: FROM requires a quoted source name");
+    }
+  }
+
+  // Parse the optional CREATE MATERIALIZED VIEW `TO '<template>'` output
+  // target before normalization strips it. The template is a parent path
+  // with optional `{col}` placeholders, each picking the value of a
+  // projected TEXT column per row (validated in handle_create_mat_view).
+  // The host writes one tag per numeric projected column under the resolved
+  // path. `TO` is valid only on MATERIALIZED views.
+  std::optional<parser::ast::OutputTarget> output_target;
+  {
+    static const std::regex kMatView(R"(\bMATERIALIZED\s+VIEW\b)",
+                                     std::regex::icase);
+    // Group 1 = quote char (paired via backreference), group 2 = content.
+    static const std::regex kToClause(R"re(\bTO\s+(["'])([^"']*)\1)re",
+                                       std::regex::icase);
+    std::smatch m;
+    if (std::regex_search(sql, m, kToClause)) {
+      auto src = parser::make_source_text(sql);
+      auto loc_error = [&](int byte_offset,
+                           const std::string& msg) -> CompilationResult {
+        auto loc = parser::compute_location(src, byte_offset);
+        CompilationResult r{};
+        r.errors.push_back(
+            {msg, loc.line, loc.column, loc.end_line, loc.end_column});
+        return r;
+      };
+
+      // `TO "..."` is only meaningful on a materialized view.
+      if (!std::regex_search(sql, kMatView)) {
+        return loc_error(
+            static_cast<int>(m.position(0)),
+            "TO output target is only valid on CREATE MATERIALIZED VIEW");
+      }
+
+      parser::ast::OutputTarget ot;
+      ot.tag_template = m[2].str();
+      // Span the quoted token (both quotes).
+      int quote_offset = static_cast<int>(m.position(2)) - 1;
+      auto qloc = parser::compute_location(src, quote_offset);
+      ot.line = qloc.line;
+      ot.column = qloc.column;
+      ot.end_line = qloc.end_line;
+      ot.end_column = qloc.end_column;
+
+      // Parse `{col}` placeholders and the `{$instance}`/`{$view}` deploy-
+      // time variables. Column resolution (projected, TEXT) happens in
+      // handle_create_mat_view once the field_map is known.
+      if (auto err = parse_uri_placeholders(
+              src, ot.tag_template, static_cast<int>(m.position(2)),
+              "TO template", /*allow_externals=*/true, ot.placeholders)) {
+        return *err;
+      }
+
+      output_target = std::move(ot);
+    }
+  }
+
   const std::string normalized = normalize_sql(sql);
 
   // Step 1: Parse
@@ -950,6 +1377,22 @@ CompilationResult compile_sql(const std::string& sql,
   pg_query_free_parse_result(json_result);
   parser::free_result(parse_result);
 
+  // Attach the extracted FROM "..." / TYPE / WINDOW metadata to the AST so
+  // the analyzer can validate it alongside other CREATE STREAM rules.
+  if (stream_source.has_value()) {
+    if (auto* s = std::get_if<parser::ast::CreateStreamStmt>(&stmt)) {
+      s->source = *stream_source;
+    }
+  }
+
+  // Attach the extracted TO "..." output target to the view AST so the
+  // compiler can validate its placeholders against the projected columns.
+  if (output_target.has_value()) {
+    if (auto* s = std::get_if<parser::ast::CreateViewStmt>(&stmt)) {
+      s->output_target = std::move(output_target);
+    }
+  }
+
   // Step 2.5: Semantic analysis. Returns diagnostics with source locations.
   // If the analyzer reports errors, surface them and short-circuit before
   // compilation runs. As Phase C migrations land, more checks fire here
@@ -977,7 +1420,8 @@ CompilationResult compile_sql(const std::string& sql,
                                 [](const parser::ast::ColumnDefAST& c) {
                                   return c.primary_key;
                                 });
-      return has_pk ? handle_create_table(*s) : handle_create_stream(*s);
+      if (has_pk) return handle_create_table(*s);
+      return handle_create_stream(*s);
     }
     if (auto* s = std::get_if<parser::ast::CreateViewStmt>(&stmt)) {
       return handle_create_mat_view(*s, catalog);
@@ -1305,9 +1749,12 @@ void apply_result_to_catalog(CatalogSnapshot& catalog,
                             : EntityType::MATERIALIZED_VIEW;
       vm.view_type = r.view_type;
       vm.field_map = r.field_map;
+      vm.field_origins = r.field_origins;
       vm.source_streams = r.source_streams;
       vm.program_json = r.program_json;
       vm.key_index = r.key_index;
+      vm.output_target = r.output_target;
+      vm.output_payload_columns = r.output_payload_columns;
       catalog.views[r.entity_name] = vm;
       break;
     }

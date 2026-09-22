@@ -58,7 +58,7 @@ TEST_F(GroupByTest, BasicGroupByWithSum) {
   std::vector<Expr> group_by;
   group_by.push_back(col("instrument_id"));
 
-  auto [ep, field_map, is_seg] =
+  auto [ep, field_map, _origins, is_seg] =
       compile_group_by(select_list, group_by, std::nullopt, input, scope,
                        builder);
 
@@ -139,7 +139,7 @@ TEST_F(GroupByTest, MultiAggregateGroupBy) {
   std::vector<Expr> group_by;
   group_by.push_back(col("instrument_id"));
 
-  auto [ep, field_map, is_seg2] =
+  auto [ep, field_map, _origins, is_seg2] =
       compile_group_by(select_list, group_by, std::nullopt, input, scope,
                        builder);
 
@@ -188,7 +188,7 @@ TEST_F(GroupByTest, NonAggregatedColumnPassthrough) {
   std::vector<Expr> group_by;
   group_by.push_back(col("instrument_id"));
 
-  auto [ep, field_map, is_seg3] =
+  auto [ep, field_map, _origins, is_seg3] =
       compile_group_by(select_list, group_by, std::nullopt, input, scope,
                        builder);
 
@@ -237,7 +237,7 @@ TEST_F(GroupByTest, CompositeGroupByTwoKeys) {
   group_by.push_back(col("instrument_id"));
   group_by.push_back(col("account_id"));
 
-  auto [ep, field_map, is_seg4] =
+  auto [ep, field_map, _origins, is_seg4] =
       compile_group_by(select_list, group_by, std::nullopt, input, scope,
                        builder, 4 /*num_input_cols*/);
 
@@ -301,7 +301,7 @@ TEST_F(GroupByTest, MovingMinMaxInsideGroupBy) {
   std::vector<Expr> group_by;
   group_by.push_back(col("instrument_id"));
 
-  auto [ep, field_map, is_seg5] =
+  auto [ep, field_map, _origins, is_seg5] =
       compile_group_by(select_list, group_by, std::nullopt, input, scope,
                        builder);
 
@@ -710,7 +710,7 @@ TEST_F(SegmentGroupByTest, SegmentOnlyGroupBy) {
   abs_args.push_back(col("amplitude"));
   group_by.push_back(cmp_expr(func_expr("ABS", std::move(abs_args)), ">", num(0)));
 
-  auto [ep, field_map, is_seg] =
+  auto [ep, field_map, _origins, is_seg] =
       compile_group_by(select_list, group_by, std::nullopt, input, scope, builder);
 
   // Should be segment-only
@@ -803,7 +803,7 @@ TEST_F(SegmentGroupByTest, MixedGroupBy) {
   abs_args.push_back(col("amplitude"));
   group_by.push_back(cmp_expr(func_expr("ABS", std::move(abs_args)), ">", num(0)));
 
-  auto [ep, field_map, is_seg] =
+  auto [ep, field_map, _origins, is_seg] =
       compile_group_by(select_list, group_by, std::nullopt, input, scope, builder);
 
   // Not segment-only (has persistent key)
@@ -956,7 +956,7 @@ TEST_F(SegmentGroupByTest, CompositeKeysWithSegmentExpression) {
   abs_args.push_back(col("amplitude"));
   group_by.push_back(cmp_expr(func_expr("ABS", std::move(abs_args)), ">", num(0)));
 
-  auto [ep, field_map, is_seg] =
+  auto [ep, field_map, _origins, is_seg] =
       compile_group_by(select_list, group_by, std::nullopt, input, scope, builder,
                        3 /*num_input_cols: device_id(0), amplitude(1), frequency(2)*/);
 
@@ -1138,7 +1138,7 @@ TEST_F(SegmentGroupByTest, MixedGroupByJsonRoundTrip) {
 
   // Need to set up the outer graph with Input/Output since to_json() expects them
   builder.add_operator("input_0", "Input");
-  auto [ep, field_map, is_seg] =
+  auto [ep, field_map, _origins, is_seg] =
       compile_group_by(select_list, group_by, std::nullopt, input, scope, builder);
   builder.add_operator("output_0", "Output");
   builder.connect(ep, {"output_0", "i1"});
@@ -1246,7 +1246,7 @@ TEST_F(GroupByTest, NumericSegmentFloorTsDivision) {
   floor_args.push_back(binary_expr("/", func_expr("TS", {}), num(1000000.0)));
   group_by.push_back(func_expr("FLOOR", std::move(floor_args)));
 
-  auto [ep, field_map, is_seg] =
+  auto [ep, field_map, _origins, is_seg] =
       compile_group_by(select_list, group_by, std::nullopt, input, scope,
                        builder, /*num_input_cols=*/1);
 

@@ -213,6 +213,10 @@ json result_to_json(const CompilationResult& r) {
   j["key_index"] = r.key_index;
   j["select_tier"] = select_tier_str(r.select_tier);
   j["insert_payload"] = r.insert_payload;
+  if (r.output_target.has_value()) {
+    j["output_target"] = *r.output_target;
+    j["output_payload_columns"] = r.output_payload_columns;
+  }
 
   // stream_schema
   json schema;
@@ -223,6 +227,34 @@ json result_to_json(const CompilationResult& r) {
                     {"type", (c.type == ColumnType::TEXT) ? "TEXT" : "DOUBLE"}});
   }
   schema["columns"] = cols;
+  if (r.stream_schema.source.has_value()) {
+    const auto& s = *r.stream_schema.source;
+    json src = {
+        {"name", s.name},
+        {"type", s.effective_type() == SourceType::CSV_BURST ? "csv_burst"
+                                                              : "scalar"},
+        {"line", s.line},
+        {"column", s.column},
+        {"end_line", s.end_line},
+        {"end_column", s.end_column}};
+    if (s.type.has_value()) {
+      src["type_clause"] = {{"value", s.type->value == SourceType::CSV_BURST
+                                          ? "csv_burst"
+                                          : "scalar"},
+                            {"line", s.type->line},
+                            {"column", s.type->column},
+                            {"end_line", s.type->end_line},
+                            {"end_column", s.type->end_column}};
+    }
+    if (s.window.has_value()) {
+      src["window_clause"] = {{"value", s.window->value},
+                              {"line", s.window->line},
+                              {"column", s.window->column},
+                              {"end_line", s.window->end_line},
+                              {"end_column", s.window->end_column}};
+    }
+    schema["source"] = src;
+  }
   j["stream_schema"] = schema;
 
   // table_schema

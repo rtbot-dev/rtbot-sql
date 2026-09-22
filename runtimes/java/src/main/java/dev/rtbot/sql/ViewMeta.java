@@ -24,6 +24,11 @@ public class ViewMeta {
     @SerializedName("field_map")
     public Map<String, Integer> fieldMap;
 
+    // Output alias → (source_stream, source_column) for direct
+    // `column AS alias` projections. See FieldOrigin docs.
+    @SerializedName("field_origins")
+    public Map<String, FieldOrigin> fieldOrigins;
+
     @SerializedName("source_streams")
     public List<String> sourceStreams;
 
@@ -44,6 +49,7 @@ public class ViewMeta {
 
     public ViewMeta() {
         this.fieldMap = new HashMap<>();
+        this.fieldOrigins = new HashMap<>();
         this.sourceStreams = new ArrayList<>();
         this.programJson = "";
         this.outputStream = "";

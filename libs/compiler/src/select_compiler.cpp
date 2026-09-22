@@ -112,6 +112,7 @@ SelectResult compile_select_projection(
   if (can_use_vector_project) {
     std::vector<int> indices;
     FieldMap field_map;
+    FieldOrigins field_origins;
 
     for (size_t i = 0; i < select_list.size(); ++i) {
       const auto& col =
@@ -125,13 +126,17 @@ SelectResult compile_select_projection(
 
       std::string alias = select_list[i].alias.value_or(col.column_name);
       field_map[alias] = static_cast<int>(i);
+      // Direct column projection — remember the source so output decoders
+      // can find the source TEXT column's StringDictionary even after a
+      // rename (`column AS alias`).
+      field_origins[alias] = {binding.stream_name, col.column_name};
     }
 
     auto proj_id = builder.next_id("proj");
     builder.add_operator(proj_id, "VectorProject", {}, {}, {},
                          {{"indices", indices}});
     builder.connect(projection_input, {proj_id, "i1"});
-    return {{proj_id, "o1"}, field_map};
+    return {{proj_id, "o1"}, field_map, field_origins};
   }
 
   // --- Attempt fused expression path ---
@@ -142,6 +147,7 @@ SelectResult compile_select_projection(
     std::vector<double> constants;
     std::vector<double> all_bytecode;
     FieldMap field_map;
+    FieldOrigins field_origins;
     bool all_fusable = true;
 
     // When RTBOT_FUSE_WINDOWED is set, windowed functions (MOVING_AVG,
@@ -165,6 +171,18 @@ SelectResult compile_select_projection(
       std::string alias =
           select_list[i].alias.value_or(default_alias(select_list[i].expr));
       field_map[alias] = static_cast<int>(i);
+      // Track source for ColumnRef select items so output decoders can
+      // dictionary-decode renamed TEXT columns. Expressions (aggregates,
+      // arithmetic) produce DOUBLE outputs and have no single origin —
+      // skip them.
+      if (auto* col =
+              std::get_if<parser::ast::ColumnRef>(&select_list[i].expr)) {
+        auto resolved = scope.resolve(*col);
+        if (auto* binding =
+                std::get_if<analyzer::ColumnBinding>(&resolved)) {
+          field_origins[alias] = {binding->stream_name, col->column_name};
+        }
+      }
     }
 
     if (all_fusable && !column_to_input.empty()) {
@@ -247,7 +265,7 @@ SelectResult compile_select_projection(
             fev_params);
         builder.connect(source_ep, {fev_id, "i1"});
 
-        return {{fev_id, "o1"}, field_map};
+        return {{fev_id, "o1"}, field_map, field_origins};
       }
 
       // Non-single-source fusable path wants to use the multi-port FE; if
@@ -294,13 +312,14 @@ SelectResult compile_select_projection(
                         {fused_id, "i" + std::to_string(i + 1)});
       }
 
-      return {{fused_id, "o1"}, field_map};
+      return {{fused_id, "o1"}, field_map, field_origins};
     }
   }
 
   // --- Fallback: compile each item as operator chains, compose with VectorCompose ---
   std::vector<Endpoint> endpoints;
   FieldMap field_map;
+  FieldOrigins field_origins;
 
   for (size_t i = 0; i < select_list.size(); ++i) {
     const auto& item = select_list[i];
@@ -314,6 +333,15 @@ SelectResult compile_select_projection(
     std::string alias =
         item.alias.value_or(default_alias(item.expr));
     field_map[alias] = static_cast<int>(i);
+    // See can_use_vector_project / fused paths: track origin for direct
+    // ColumnRef projections so output decoders can decode renamed TEXT
+    // columns via the source stream's StringDictionary.
+    if (auto* col = std::get_if<parser::ast::ColumnRef>(&item.expr)) {
+      auto resolved = scope.resolve(*col);
+      if (auto* binding = std::get_if<analyzer::ColumnBinding>(&resolved)) {
+        field_origins[alias] = {binding->stream_name, col->column_name};
+      }
+    }
   }
 
   auto compose_id = builder.next_id("compose");
@@ -325,7 +353,7 @@ SelectResult compile_select_projection(
                     {compose_id, "i" + std::to_string(i + 1)});
   }
 
-  return {{compose_id, "o1"}, field_map};
+  return {{compose_id, "o1"}, field_map, field_origins};
 }
 
 }  // namespace rtbot_sql::compiler
