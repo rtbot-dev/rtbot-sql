@@ -44,7 +44,11 @@ jobs:
         run: |
           set -euo pipefail
           git clone "https://x-access-token:${RTBOT_REPO_READ_TOKEN}@github.com/rtbot-dev/rtbot.git" "${RUNNER_TEMP}/rtbot"
-          git -C "${RUNNER_TEMP}/rtbot" checkout "${{ vars.RTBOT_REF }}"
+          if [ -n "${GITHUB_HEAD_REF:-}" ] && git -C "${RUNNER_TEMP}/rtbot" rev-parse --verify "origin/${GITHUB_HEAD_REF}" >/dev/null 2>&1; then
+            git -C "${RUNNER_TEMP}/rtbot" checkout "${GITHUB_HEAD_REF}"
+          else
+            git -C "${RUNNER_TEMP}/rtbot" checkout "${{ vars.RTBOT_REF }}"
+          fi
           if [ ! -f "${RUNNER_TEMP}/rtbot/tools/BUILD.bazel" ]; then
             printf 'exports_files(["non_bcr_deps.bzl"])\n' > "${RUNNER_TEMP}/rtbot/tools/BUILD.bazel"
           fi
