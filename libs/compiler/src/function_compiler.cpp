@@ -45,12 +45,12 @@ Endpoint ensure_endpoint(ExprResult result, const Endpoint& input_endpoint,
 // Callers reach this only with an expression that constant-folds to a
 // positive value; non-folding or non-positive inputs are rejected before
 // compilation. Non-integer folded values (e.g. 2.5) are silently truncated.
-int require_constant_int(const std::string& /*func_name*/,
-                         const parser::ast::Expr& expr,
-                         const std::string& /*param_name*/) {
+int64_t require_constant_int(const std::string& /*func_name*/,
+                             const parser::ast::Expr& expr,
+                             const std::string& /*param_name*/) {
   auto folded = analyzer::try_fold(expr);
   if (!folded) unreachable();
-  return static_cast<int>(*folded);
+  return static_cast<int64_t>(*folded);
 }
 
 }  // namespace
@@ -63,6 +63,7 @@ bool is_aggregate_or_windowed(const std::string& name) {
          upper == "MOVING_AVERAGE" || upper == "MOVING_SUM" ||
          upper == "MOVING_COUNT" || upper == "MOVING_STD" ||
          upper == "STDDEV" || upper == "MOVING_MIN" || upper == "MOVING_MAX" ||
+         upper == "DIFF" || upper == "EMA" ||
          upper == "FIR" || upper == "IIR" ||
          upper == "RESAMPLE" || upper == "PEAK_DETECT";
 }
@@ -257,6 +258,24 @@ Endpoint compile_function(const std::string& name,
     return {diff_id, "o1"};
   }
 
+  if (upper == "EMA") {
+    auto folded = analyzer::try_fold(args[1]);
+    if (!folded) unreachable();
+    double param = *folded;
+    double alpha = (param > 1.0) ? (2.0 / (param + 1.0)) : param;
+    auto expr_ep = ensure_endpoint(
+        compile_expression(args[0], input_endpoint, scope, builder, cache,
+                           source_endpoints),
+        input_endpoint, builder);
+    auto iir_id = builder.next_id("ema");
+    builder.add_operator(
+        iir_id, "InfiniteImpulseResponse",
+        {{"init_from_first_sample", 1.0}}, {},
+        {{"b_coeffs", {alpha}}, {"a_coeffs", {alpha - 1.0}}});
+    builder.connect(expr_ep, {iir_id, "i1"});
+    return {iir_id, "o1"};
+  }
+
   if (upper == "FIR") {
     auto* arr = &std::get<parser::ast::ArrayLiteral>(args[1]);
     auto expr_ep = ensure_endpoint(
@@ -288,7 +307,7 @@ Endpoint compile_function(const std::string& name,
   }
 
   if (upper == "RESAMPLE") {
-    int interval = require_constant_int("RESAMPLE", args[1], "interval");
+    int64_t interval = require_constant_int("RESAMPLE", args[1], "interval");
     auto expr_ep = ensure_endpoint(
         compile_expression(args[0], input_endpoint, scope, builder, cache,
                            source_endpoints),

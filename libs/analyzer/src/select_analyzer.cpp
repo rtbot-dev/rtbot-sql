@@ -103,7 +103,8 @@ bool is_windowed_function_name(const std::string& name) {
   return upper == "MOVING_AVERAGE" || upper == "MOVING_SUM" ||
          upper == "MOVING_COUNT" || upper == "MOVING_STD" ||
          upper == "STDDEV" || upper == "MOVING_MIN" ||
-         upper == "MOVING_MAX" || upper == "FIR" || upper == "IIR" ||
+         upper == "MOVING_MAX" || upper == "DIFF" || upper == "EMA" ||
+         upper == "FIR" || upper == "IIR" ||
          upper == "RESAMPLE" || upper == "PEAK_DETECT";
 }
 
