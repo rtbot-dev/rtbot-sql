@@ -3433,5 +3433,86 @@ TEST_F(E2eRuntimeTest, SegmentFusionBooleanExprSumCount) {
   }
 }
 
+TEST_F(E2eRuntimeTest, DiffInSelectAndExpressionE2E) {
+  auto r = compile(
+      "CREATE MATERIALIZED VIEW diff_v AS "
+      "SELECT price, DIFF(price) AS dp, price - DIFF(price) AS prev_p "
+      "FROM trades");
+  rtbot::Program program(r.program_json);
+  int dp_idx = r.field_map.at("dp");
+  int prev_idx = r.field_map.at("prev_p");
+
+  auto b1 = send(program, 1, {1, 10.0, 1, 0});
+  EXPECT_EQ(count_outputs(b1), 0u);
+
+  auto b2 = send(program, 2, {1, 25.0, 1, 0});
+  auto out2 = extract_output(b2);
+  ASSERT_FALSE(out2.empty());
+  EXPECT_DOUBLE_EQ(out2[dp_idx], 15.0);
+  EXPECT_DOUBLE_EQ(out2[prev_idx], 10.0);
+}
+
+TEST_F(E2eRuntimeTest, TimeShift64BitTimestampE2E) {
+  auto r = compile(
+      "CREATE MATERIALIZED VIEW shifted AS "
+      "SELECT TIMESHIFT(price, 3600000000) AS p_1h FROM trades");
+  rtbot::Program program(r.program_json);
+  auto b = send(program, 1000, {1, 42.0, 1, 0});
+  ASSERT_EQ(count_outputs(b), 1u);
+  for (const auto& [op_id, op_batch] : b) {
+    for (const auto& [port, msgs] : op_batch) {
+      if (!msgs.empty()) {
+        EXPECT_EQ(msgs[0]->time, 3600001000LL);
+      }
+    }
+  }
+}
+
+TEST_F(E2eRuntimeTest, EmaAndMovingMinMaxE2E) {
+  // 1. Seeded EMA emits y_0 = x_0 on the very first sample (t=1)
+  {
+    auto r = compile(
+        "CREATE MATERIALIZED VIEW ema_v AS "
+        "SELECT price, EMA(price, 0.5) AS ema_p FROM trades");
+    rtbot::Program program(r.program_json);
+    int ema_idx = r.field_map.at("ema_p");
+
+    auto out1 = extract_output(send(program, 1, {1, 10.0, 1, 0}));
+    ASSERT_FALSE(out1.empty());
+    EXPECT_DOUBLE_EQ(out1[ema_idx], 10.0);
+
+    auto out2 = extract_output(send(program, 2, {1, 20.0, 1, 0}));
+    ASSERT_FALSE(out2.empty());
+    EXPECT_DOUBLE_EQ(out2[ema_idx], 15.0);
+
+    auto out3 = extract_output(send(program, 3, {1, 14.0, 1, 0}));
+    ASSERT_FALSE(out3.empty());
+    EXPECT_DOUBLE_EQ(out3[ema_idx], 14.5);
+  }
+
+  // 2. MOVING_MIN / MOVING_MAX (WindowMinMax) emits once window (W=2) is full
+  {
+    auto r = compile(
+        "CREATE MATERIALIZED VIEW mm_v AS "
+        "SELECT MOVING_MIN(price, 2) AS mmin, MOVING_MAX(price, 2) AS mmax "
+        "FROM trades");
+    rtbot::Program program(r.program_json);
+    int mmin_idx = r.field_map.at("mmin");
+    int mmax_idx = r.field_map.at("mmax");
+
+    EXPECT_EQ(count_outputs(send(program, 1, {1, 10.0, 1, 0})), 0u);
+
+    auto out2 = extract_output(send(program, 2, {1, 20.0, 1, 0}));
+    ASSERT_FALSE(out2.empty());
+    EXPECT_DOUBLE_EQ(out2[mmin_idx], 10.0);
+    EXPECT_DOUBLE_EQ(out2[mmax_idx], 20.0);
+
+    auto out3 = extract_output(send(program, 3, {1, 14.0, 1, 0}));
+    ASSERT_FALSE(out3.empty());
+    EXPECT_DOUBLE_EQ(out3[mmin_idx], 14.0);
+    EXPECT_DOUBLE_EQ(out3[mmax_idx], 20.0);
+  }
+}
+
 }  // namespace
 }  // namespace rtbot_sql::api

@@ -1,6 +1,9 @@
 #include "rtbot_sql/analyzer/function_signatures.h"
 
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <limits>
 #include <string>
 
 #include "rtbot_sql/analyzer/const_fold.h"
@@ -34,7 +37,7 @@ bool is_aggregate_or_windowed(const std::string& u) {
          u == "MAX" || u == "MOVING_AVERAGE" || u == "MOVING_SUM" ||
          u == "MOVING_COUNT" || u == "MOVING_STD" || u == "STDDEV" ||
          u == "MOVING_MIN" || u == "MOVING_MAX" || u == "DIFF" ||
-         u == "FIR" || u == "IIR" || u == "RESAMPLE" ||
+         u == "EMA" || u == "FIR" || u == "IIR" || u == "RESAMPLE" ||
          u == "PEAK_DETECT";
 }
 
@@ -48,9 +51,10 @@ bool is_scalar_builtin(const std::string& u) {
 // Validate that `arg` constant-folds to a positive integer value. Folded
 // expressions like `2*3` and `FLOOR(7.7)` are accepted because the result
 // is an integer; `2.5` and `cpu+1` are rejected.
-void check_const_int_positive(const parser::ast::FuncCall& fc, std::size_t idx,
-                              const std::string& param_name,
-                              DiagnosticBag& bag, std::string_view sql) {
+void check_const_int_positive(
+    const parser::ast::FuncCall& fc, std::size_t idx,
+    const std::string& param_name, DiagnosticBag& bag, std::string_view sql,
+    int64_t max_val = std::numeric_limits<int>::max()) {
   if (idx >= fc.args.size()) return;
   const auto& arg = fc.args[idx];
   parser::ast::SourceLocation loc = expr_span(arg, sql);
@@ -59,8 +63,15 @@ void check_const_int_positive(const parser::ast::FuncCall& fc, std::size_t idx,
     bag.error(fc.name + ": " + param_name + " must be a constant integer", loc);
     return;
   }
-  int v = static_cast<int>(*folded);
-  if (v != *folded || v <= 0) {
+  // 9223372036854775808.0 == 2^63; any double >= 2^63 overflows signed int64_t.
+  if (!std::isfinite(*folded) || *folded <= 0.0 ||
+      *folded >= 9223372036854775808.0 ||
+      *folded > static_cast<double>(max_val)) {
+    bag.error(fc.name + ": " + param_name + " must be a positive integer", loc);
+    return;
+  }
+  int64_t v = static_cast<int64_t>(*folded);
+  if (static_cast<double>(v) != *folded || v <= 0 || v > max_val) {
     bag.error(fc.name + ": " + param_name + " must be a positive integer", loc);
   }
 }
@@ -194,6 +205,20 @@ void validate_function_call(const parser::ast::FuncCall& fc,
     }
     return;
   }
+  if (u == "EMA") {
+    if (fc.args.size() != 2) {
+      bag.error("EMA requires 2 arguments: (expr, alpha_or_span)", fc.loc);
+      return;
+    }
+    parser::ast::SourceLocation loc = expr_span(fc.args[1], sql);
+    auto folded = try_fold(fc.args[1]);
+    if (!folded || !std::isfinite(*folded) || *folded <= 0.0) {
+      bag.error(
+          "EMA: second argument must be a positive constant (alpha in (0, 1] or span > 1)",
+          loc);
+    }
+    return;
+  }
   if (u == "FIR") {
     if (fc.args.size() != 2) {
       bag.error("FIR requires 2 arguments: (expr, ARRAY[coefficients])",
@@ -227,7 +252,8 @@ void validate_function_call(const parser::ast::FuncCall& fc,
       bag.error("RESAMPLE requires 2 arguments: (expr, interval)", fc.loc);
       return;
     }
-    check_const_int_positive(fc, 1, "interval", bag, sql);
+    check_const_int_positive(fc, 1, "interval", bag, sql,
+                             std::numeric_limits<int64_t>::max());
     return;
   }
   if (u == "PEAK_DETECT") {

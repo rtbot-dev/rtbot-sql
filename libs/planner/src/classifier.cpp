@@ -51,6 +51,8 @@ bool expr_has_windowed(const parser::ast::Expr& expr) {
     std::transform(upper.begin(), upper.end(), upper.begin(), ::toupper);
     if (upper == "MOVING_AVERAGE" || upper == "MOVING_SUM" ||
         upper == "MOVING_COUNT" || upper == "MOVING_STD" ||
+        upper == "STDDEV" || upper == "MOVING_MIN" ||
+        upper == "MOVING_MAX" || upper == "DIFF" || upper == "EMA" ||
         upper == "FIR" || upper == "IIR" || upper == "RESAMPLE" ||
         upper == "PEAK_DETECT") {
       return true;

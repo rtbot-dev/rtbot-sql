@@ -39,6 +39,16 @@ struct RuntimeOutputMessage {
   std::string port;
 };
 
+struct Int64ColumnBuffer {
+  std::vector<std::int64_t> data;
+};
+
+struct Float64MatrixBuffer {
+  std::vector<double> data;
+  std::size_t nrows = 0;
+  std::size_t ncols = 0;
+};
+
 // Thin adapter around the shared rtbot_sql::api::decode_program_batch.
 // The shared helper handles iteration + stable sort; this function only
 // copies the decoded fields into the pybind-exposed POJO shape.
@@ -106,29 +116,41 @@ class NativeSessionPipeline {
   }
 
   std::vector<RuntimeOutputMessage> feed_buffer(
-      py::array_t<int64_t, py::array::c_style> timestamps,
-      py::array_t<double, py::array::c_style> values,
+      py::buffer timestamps,
+      py::buffer values,
       const std::string& port = "i1") {
-    auto ts_info = timestamps.request();
-    auto vals_info = values.request();
-    if (ts_info.ndim != 1 || vals_info.ndim != 2) {
-      throw std::invalid_argument(
-          "timestamps must be 1D, values must be 2D");
-    }
-    if (ts_info.shape[0] != vals_info.shape[0]) {
-      throw std::invalid_argument(
-          "timestamps and values must have the same number of rows");
-    }
-    const auto nrows = static_cast<std::size_t>(ts_info.shape[0]);
-    const auto ncols = static_cast<std::size_t>(vals_info.shape[1]);
+    return decode_batch(run_receive_buffer(timestamps, values, port));
+  }
 
-    static_assert(sizeof(std::int64_t) == sizeof(rtbot::timestamp_t),
-                  "int64 vs timestamp_t mismatch");
-    const auto* times = reinterpret_cast<const rtbot::timestamp_t*>(ts_info.ptr);
-    const auto* rows = static_cast<const double*>(vals_info.ptr);
+  py::dict feed_buffer_columnar(
+      py::buffer timestamps,
+      py::buffer values,
+      const std::string& port = "i1") {
+    auto batch = run_receive_buffer(timestamps, values, port);
+    auto decoded = rtbot_sql::api::decode_program_batch(batch);
 
-    auto batch = program_.receive_buffer(port, rows, nrows, ncols, times);
-    return decode_batch(batch);
+    struct OpAcc {
+      Int64ColumnBuffer ts;
+      Float64MatrixBuffer vals;
+    };
+    std::map<std::string, OpAcc> by_op;
+    for (const auto& m : decoded) {
+      auto& acc = by_op[m.operator_id];
+      acc.ts.data.push_back(static_cast<std::int64_t>(m.timestamp));
+      if (acc.vals.ncols == 0 && !m.values.empty()) {
+        acc.vals.ncols = m.values.size();
+      }
+      acc.vals.data.insert(acc.vals.data.end(), m.values.begin(), m.values.end());
+      acc.vals.nrows += 1;
+    }
+
+    py::dict out;
+    for (auto& [op_id, acc] : by_op) {
+      out[py::str(op_id)] = py::make_tuple(
+          py::cast(std::move(acc.ts)),
+          py::cast(std::move(acc.vals)));
+    }
+    return out;
   }
 
   std::vector<RuntimeOutputMessage> feed(
@@ -142,6 +164,68 @@ class NativeSessionPipeline {
   }
 
  private:
+  rtbot::ProgramMsgBatch run_receive_buffer(
+      py::buffer& timestamps,
+      py::buffer& values,
+      const std::string& port) {
+    auto ts_info = timestamps.request();
+    auto vals_info = values.request();
+    if (ts_info.ndim != 1 || ts_info.itemsize != sizeof(std::int64_t)) {
+      throw std::invalid_argument(
+          "timestamps must be a 1D 64-bit integer buffer");
+    }
+    const std::string ts_fmt = ts_info.format;
+    if (ts_fmt != "q" && ts_fmt != "l" && ts_fmt != "Q" && ts_fmt != "L" &&
+        ts_fmt != "=q" && ts_fmt != "=l" && ts_fmt != "=Q" && ts_fmt != "=L") {
+      throw std::invalid_argument(
+          "timestamps buffer must have 64-bit integer dtype");
+    }
+    if (ts_info.shape[0] > 1 &&
+        ts_info.strides[0] != static_cast<py::ssize_t>(sizeof(std::int64_t))) {
+      throw std::invalid_argument("timestamps buffer must be C-contiguous");
+    }
+    if (vals_info.itemsize != sizeof(double) ||
+        (vals_info.format != "d" && vals_info.format != "=d")) {
+      throw std::invalid_argument("values must be a float64 buffer");
+    }
+    const auto nrows = static_cast<std::size_t>(ts_info.shape[0]);
+    std::size_t ncols = 0;
+    if (vals_info.ndim == 2) {
+      if (static_cast<std::size_t>(vals_info.shape[0]) != nrows) {
+        throw std::invalid_argument(
+            "timestamps and values must have the same number of rows");
+      }
+      ncols = static_cast<std::size_t>(vals_info.shape[1]);
+      if (nrows > 0 && ncols > 0) {
+        if (vals_info.strides[1] != static_cast<py::ssize_t>(sizeof(double)) ||
+            (nrows > 1 &&
+             vals_info.strides[0] !=
+                 static_cast<py::ssize_t>(ncols * sizeof(double)))) {
+          throw std::invalid_argument("values 2D buffer must be C-contiguous");
+        }
+      }
+    } else if (vals_info.ndim == 1) {
+      const auto total = static_cast<std::size_t>(vals_info.shape[0]);
+      if (nrows > 0 && total % nrows != 0) {
+        throw std::invalid_argument(
+            "1D values buffer length must be a multiple of timestamps length");
+      }
+      if (total > 1 &&
+          vals_info.strides[0] != static_cast<py::ssize_t>(sizeof(double))) {
+        throw std::invalid_argument("values 1D buffer must be C-contiguous");
+      }
+      ncols = nrows > 0 ? (total / nrows) : 0;
+    } else {
+      throw std::invalid_argument("values must be 1D or 2D");
+    }
+
+    static_assert(sizeof(std::int64_t) == sizeof(rtbot::timestamp_t),
+                  "int64 vs timestamp_t mismatch");
+    const auto* times = reinterpret_cast<const rtbot::timestamp_t*>(ts_info.ptr);
+    const auto* rows = static_cast<const double*>(vals_info.ptr);
+    return program_.receive_buffer(port, rows, nrows, ncols, times);
+  }
+
   rtbot::Program program_;
 };
 
@@ -255,6 +339,51 @@ PYBIND11_MODULE(_rtbot_sql_native, m) {
       .def_readwrite("operator_id", &RuntimeOutputMessage::operator_id)
       .def_readwrite("port", &RuntimeOutputMessage::port);
 
+  py::class_<Int64ColumnBuffer>(m, "Int64ColumnBuffer", py::buffer_protocol())
+      .def_buffer([](Int64ColumnBuffer& b) -> py::buffer_info {
+        return py::buffer_info(
+            b.data.data(),
+            sizeof(std::int64_t),
+            py::format_descriptor<std::int64_t>::format(),
+            1,
+            {static_cast<py::ssize_t>(b.data.size())},
+            {static_cast<py::ssize_t>(sizeof(std::int64_t))});
+      })
+      .def("__len__", [](const Int64ColumnBuffer& b) { return b.data.size(); })
+      .def("__getitem__", [](const Int64ColumnBuffer& b, py::ssize_t i) {
+        if (i < 0) i += static_cast<py::ssize_t>(b.data.size());
+        if (i < 0 || static_cast<std::size_t>(i) >= b.data.size()) {
+          throw py::index_error();
+        }
+        return b.data[static_cast<std::size_t>(i)];
+      })
+      .def("tolist", [](const Int64ColumnBuffer& b) { return b.data; });
+
+  py::class_<Float64MatrixBuffer>(m, "Float64MatrixBuffer", py::buffer_protocol())
+      .def_buffer([](Float64MatrixBuffer& b) -> py::buffer_info {
+        return py::buffer_info(
+            b.data.data(),
+            sizeof(double),
+            py::format_descriptor<double>::format(),
+            2,
+            {static_cast<py::ssize_t>(b.nrows),
+             static_cast<py::ssize_t>(b.ncols)},
+            {static_cast<py::ssize_t>(b.ncols * sizeof(double)),
+             static_cast<py::ssize_t>(sizeof(double))});
+      })
+      .def_property_readonly("shape", [](const Float64MatrixBuffer& b) {
+        return py::make_tuple(b.nrows, b.ncols);
+      })
+      .def("__len__", [](const Float64MatrixBuffer& b) { return b.nrows; })
+      .def("tolist", [](const Float64MatrixBuffer& b) {
+        std::vector<std::vector<double>> rows(b.nrows);
+        for (std::size_t r = 0; r < b.nrows; ++r) {
+          rows[r].assign(b.data.begin() + r * b.ncols,
+                         b.data.begin() + (r + 1) * b.ncols);
+        }
+        return rows;
+      });
+
   py::class_<NativePipeline>(m, "NativePipeline")
       .def(py::init<const std::string&>(), py::arg("program_json"))
       .def("feed", &NativePipeline::feed,
@@ -271,6 +400,10 @@ PYBIND11_MODULE(_rtbot_sql_native, m) {
            py::arg("values"),
            py::arg("port") = "i1")
       .def("feed_buffer", &NativeSessionPipeline::feed_buffer,
+           py::arg("timestamps"),
+           py::arg("values"),
+           py::arg("port") = "i1")
+      .def("feed_buffer_columnar", &NativeSessionPipeline::feed_buffer_columnar,
            py::arg("timestamps"),
            py::arg("values"),
            py::arg("port") = "i1");

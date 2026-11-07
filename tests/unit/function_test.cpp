@@ -421,5 +421,68 @@ TEST(FunctionAnalyzerTest, MaxWrongArgCountRejected) {
   EXPECT_TRUE(r.has_errors());
 }
 
+// DIFF(quantity) dispatched through compile_expression (reproducer for missing
+// DIFF in compiler::is_aggregate_or_windowed).
+TEST_F(FunctionTest, ExpressionCompilerDispatchesDIFF) {
+  EXPECT_TRUE(is_aggregate_or_windowed("DIFF"));
+  EXPECT_TRUE(is_aggregate_or_windowed("EMA"));
+  auto f = std::make_unique<FuncCall>();
+  f->name = "DIFF";
+  f->args.push_back(col("quantity"));
+  Expr expr = std::move(f);
+
+  auto result = compile_expression(expr, input, scope, builder);
+  ASSERT_TRUE(std::holds_alternative<Endpoint>(result));
+  ASSERT_EQ(builder.operators().size(), 2u);
+  EXPECT_EQ(builder.operators()[0].type, "VectorExtract");
+  EXPECT_EQ(builder.operators()[1].type, "Difference");
+}
+
+// EMA(price, 0.2) → VectorExtract + InfiniteImpulseResponse(b={0.2}, a={-0.8}, init_from_first_sample=1)
+TEST_F(FunctionTest, EmaAlphaProducesSeededIIR) {
+  std::vector<Expr> args;
+  args.push_back(col("price"));
+  args.push_back(num(0.2));
+  auto ep = compile_function("EMA", args, input, scope, builder);
+
+  ASSERT_EQ(builder.operators().size(), 2u);
+  auto& ext = builder.operators()[0];
+  auto& iir = builder.operators()[1];
+  EXPECT_EQ(ext.type, "VectorExtract");
+  EXPECT_EQ(iir.type, "InfiniteImpulseResponse");
+  EXPECT_EQ(iir.params.at("init_from_first_sample"), 1.0);
+  ASSERT_EQ(iir.double_array_params.at("b_coeffs").size(), 1u);
+  ASSERT_EQ(iir.double_array_params.at("a_coeffs").size(), 1u);
+  EXPECT_NEAR(iir.double_array_params.at("b_coeffs")[0], 0.2, 1e-12);
+  EXPECT_NEAR(iir.double_array_params.at("a_coeffs")[0], -0.8, 1e-12);
+  EXPECT_EQ(ep.operator_id, iir.id);
+}
+
+// EMA(price, 9) → span N=9 => alpha = 2/(9+1) = 0.2
+TEST_F(FunctionTest, EmaSpanProducesSeededIIR) {
+  std::vector<Expr> args;
+  args.push_back(col("price"));
+  args.push_back(num(9.0));
+  auto ep = compile_function("EMA", args, input, scope, builder);
+
+  ASSERT_EQ(builder.operators().size(), 2u);
+  auto& iir = builder.operators()[1];
+  EXPECT_EQ(iir.type, "InfiniteImpulseResponse");
+  EXPECT_EQ(iir.params.at("init_from_first_sample"), 1.0);
+  EXPECT_NEAR(iir.double_array_params.at("b_coeffs")[0], 0.2, 1e-12);
+  EXPECT_NEAR(iir.double_array_params.at("a_coeffs")[0], -0.8, 1e-12);
+  EXPECT_EQ(ep.operator_id, iir.id);
+}
+
+TEST(FunctionAnalyzerTest, EmaInvalidSecondArgRejected) {
+  auto catalog = trades_catalog();
+  auto r0 = rtbot_sql::api::compile_sql(
+      "CREATE MATERIALIZED VIEW v AS SELECT EMA(price, 0) FROM trades", catalog);
+  EXPECT_TRUE(r0.has_errors());
+  auto r_neg = rtbot_sql::api::compile_sql(
+      "CREATE MATERIALIZED VIEW v AS SELECT EMA(price, -0.5) FROM trades", catalog);
+  EXPECT_TRUE(r_neg.has_errors());
+}
+
 }  // namespace
 }  // namespace rtbot_sql::compiler

@@ -64,9 +64,9 @@ http_archive(
 http_archive(
     name = "cxxopts",
     build_file = "//tools/external:cxxopts.BUILD",
-    sha256 = "25b644a2bfa9c6704d723be51b026bc02420dfdee1277a49bfe5df3f19b0eaa4",
-    strip_prefix = "cxxopts-3.1.1",
-    url = "https://github.com/jarro2783/cxxopts/archive/refs/tags/v3.1.1.zip",
+    sha256 = "3bfc70542c521d4b55a46429d808178916a579b28d048bd8c727ee76c39e2072",
+    strip_prefix = "cxxopts-3.3.1",
+    url = "https://github.com/jarro2783/cxxopts/archive/refs/tags/v3.3.1.tar.gz",
 )
 
 # --- pybind11 ---

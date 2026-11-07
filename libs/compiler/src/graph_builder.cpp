@@ -52,6 +52,9 @@ static const std::set<std::string> int_params = {
     "key_index", "numInputPorts", "k", "score_index", "t0", "shift",
     "snapFirst"};
 
+static const std::set<std::string> bool_params = {
+    "init_from_first_sample"};
+
 json operator_to_json(const OperatorDef& op) {
   json j;
   j["id"] = op.id;
@@ -71,8 +74,10 @@ json operator_to_json(const OperatorDef& op) {
   for (const auto& [key, val] : op.params) {
     // numInputPorts is consumed by portTypes generation, not emitted separately
     if (op.type == "Input" && key == "numInputPorts") continue;
-    if (int_params.count(key)) {
-      j[key] = static_cast<int>(val);
+    if (bool_params.count(key)) {
+      j[key] = (val != 0.0);
+    } else if (int_params.count(key)) {
+      j[key] = static_cast<int64_t>(val);
     } else {
       j[key] = val;
     }
@@ -258,6 +263,8 @@ static OperatorDef operator_from_json(const json& j) {
     const auto& val = it.value();
     if (val.is_number()) {
       op.params[it.key()] = val.get<double>();
+    } else if (val.is_boolean()) {
+      op.params[it.key()] = val.get<bool>() ? 1.0 : 0.0;
     } else if (val.is_string()) {
       op.string_params[it.key()] = val.get<std::string>();
     } else if (val.is_array() && !val.empty()) {

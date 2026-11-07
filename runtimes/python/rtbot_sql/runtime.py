@@ -3,16 +3,17 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 from .catalog import InMemoryCatalog, StreamSchema, ViewMeta
 from .compiler import compile_select_to_program, compile_sql, native
 from .formatter import format_rows
 from .jupyter import show_graph as display_graph
-from .pipeline_runner import LocalPipelineRunner
+from .pipeline_runner import LocalPipelineRunner, coerce_input_buffers
 from .stream_store import InMemoryStreamStore
 
 try:
@@ -37,6 +38,143 @@ class InsertResult:
 
   def __repr__(self):
     return f"Inserted {self.rows:,} rows in {self.elapsed_s:.2f}s ({self.rows_per_sec:,.0f} rows/sec)"
+
+
+@dataclass
+class BacktestResult:
+  """Columnar output for a view from a zero-copy backtest run.
+
+  Supports both attribute access (``.timestamps``, ``.values``, ``.columns``)
+  and tuple unpacking (``timestamps, values, columns = result``).
+  """
+  timestamps: Any
+  values: Any
+  columns: List[str]
+
+  def __iter__(self):
+    yield self.timestamps
+    yield self.values
+    yield self.columns
+
+  def __getitem__(self, idx: int):
+    return (self.timestamps, self.values, self.columns)[idx]
+
+  def __len__(self) -> int:
+    return 3
+
+
+def bind_sql_params(
+    sql: str,
+    params: Optional[Mapping[str, Union[int, float]]],
+) -> str:
+  """Safely substitute numeric ``:name`` or ``{name}`` parameters in SQL.
+
+  Skips single-quoted string literals, double-quoted identifiers, ``--`` line
+  comments, ``/* ... */`` block comments, and PostgreSQL ``::type`` casts.
+  Raises :class:`SqlError` if a parameter value is non-numeric/non-finite or
+  if an unbound placeholder appears in the query.
+  """
+  if not params:
+    return sql
+
+  formatted: Dict[str, str] = {}
+  for k, v in params.items():
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+      raise SqlError([f"Parameter '{k}' must be a finite int or float, got {type(v).__name__}"])
+    fv = float(v)
+    if not math.isfinite(fv):
+      raise SqlError([f"Parameter '{k}' must be finite, got {v}"])
+    if isinstance(v, int):
+      val_str = str(v)
+    else:
+      val_str = format(fv, ".17g")
+    formatted[str(k)] = f"({val_str})" if val_str.startswith("-") else val_str
+
+  out: List[str] = []
+  i = 0
+  n = len(sql)
+  while i < n:
+    ch = sql[i]
+    # Single-quoted string literal
+    if ch == "'":
+      start = i
+      i += 1
+      while i < n:
+        if sql[i] == "'":
+          i += 1
+          if i < n and sql[i] == "'":
+            i += 1
+            continue
+          break
+        i += 1
+      out.append(sql[start:i])
+      continue
+    # Double-quoted identifier
+    if ch == '"':
+      start = i
+      i += 1
+      while i < n:
+        if sql[i] == '"':
+          i += 1
+          if i < n and sql[i] == '"':
+            i += 1
+            continue
+          break
+        i += 1
+      out.append(sql[start:i])
+      continue
+    # Line comment
+    if ch == "-" and i + 1 < n and sql[i + 1] == "-":
+      start = i
+      i += 2
+      while i < n and sql[i] != "\n":
+        i += 1
+      out.append(sql[start:i])
+      continue
+    # Block comment
+    if ch == "/" and i + 1 < n and sql[i + 1] == "*":
+      start = i
+      i += 2
+      while i + 1 < n and not (sql[i] == "*" and sql[i + 1] == "/"):
+        i += 1
+      i = min(n, i + 2)
+      out.append(sql[start:i])
+      continue
+    # PostgreSQL :: cast
+    if ch == ":" and i + 1 < n and sql[i + 1] == ":":
+      out.append("::")
+      i += 2
+      continue
+    # :param placeholder
+    if ch == ":" and i + 1 < n and (sql[i + 1].isalpha() or sql[i + 1] == "_"):
+      prev = sql[i - 1] if i > 0 else " "
+      if not (prev.isalnum() or prev == "_"):
+        j = i + 1
+        while j < n and (sql[j].isalnum() or sql[j] == "_"):
+          j += 1
+        name = sql[i + 1:j]
+        if name not in formatted:
+          raise SqlError([f"Unbound SQL parameter: :{name}"])
+        out.append(formatted[name])
+        i = j
+        continue
+    # {param} placeholder
+    if ch == "{":
+      j = i + 1
+      if j < n and (sql[j].isalpha() or sql[j] == "_"):
+        while j < n and (sql[j].isalnum() or sql[j] == "_"):
+          j += 1
+        if j < n and sql[j] == "}":
+          name = sql[i + 1:j]
+          if name not in formatted:
+            raise SqlError([f"Unbound SQL parameter: {{{name}}}"])
+          out.append(formatted[name])
+          i = j + 1
+          continue
+    out.append(ch)
+    i += 1
+
+  return "".join(out)
 
 
 def _enum_name(value: Any) -> str:
@@ -75,6 +213,8 @@ class RtBotSql:
     self._session_pipeline: Optional[Any] = None
     self._session_op_to_view: Dict[str, str] = {}
     self._session_stream_port: Dict[str, str] = {}
+    self._unstored_streams: set[str] = set()
+    self._suppressed_views: set[str] = set()
 
   def _next_timestamp(self) -> int:
     now = int(time.time() * 1000)
@@ -91,8 +231,13 @@ class RtBotSql:
     out = re.sub(r"^\s*DROP\s+STREAM\b", "DROP TABLE", out, flags=re.IGNORECASE)
     return out
 
-  def execute(self, sql: str):
-    compilation = compile_sql(sql, self._catalog.snapshot(), self._ts_units_per_second)
+  def execute(
+      self,
+      sql: str,
+      params: Optional[Mapping[str, Union[int, float]]] = None,
+  ):
+    bound_sql = bind_sql_params(sql, params)
+    compilation = compile_sql(bound_sql, self._catalog.snapshot(), self._ts_units_per_second)
 
     new_ts = compilation["new_ts_units_per_second"]
     if new_ts > 0:
@@ -121,7 +266,7 @@ class RtBotSql:
         self._handle_drop(result)
 
       elif statement == native.StatementType.SELECT:
-        last_select_result = self._handle_select(sql, result)
+        last_select_result = self._handle_select(bound_sql, result)
 
       else:
         raise SqlError([f"Unsupported statement type: {statement}"])
@@ -260,6 +405,7 @@ class RtBotSql:
     name = result.drop_entity_name
     self._catalog.drop(name)
     self._store.clear(name)
+    self._unstored_streams.discard(name)
     self._invalidate_session()
 
   def _append_and_propagate(
@@ -521,62 +667,200 @@ class RtBotSql:
       *,
       store_raw: bool = False,
   ) -> InsertResult:
-    """Ingest a batch of rows from numpy arrays without a DataFrame wrapper.
-
-    Parameters are column-major inputs matched to the schema order of the
-    target stream:
-
-      - ``timestamps`` — 1D int64-coercible array of monotone timestamps.
-      - ``value_columns`` — 2D float64-coercible array of shape
-        ``(n_rows, n_cols)`` (row-major); ``n_cols`` must equal the
-        target stream's column count.
-
-    Mirrors the Java ``insertBuffer(String, long[], double[][])`` fast
-    path: data goes straight to the buffer API (``receive_buffer``) with
-    no DataFrame round-trip, no row-by-row Python iteration.
-    """
-    if not _HAS_NUMPY:
-      raise ImportError("insert_buffer requires numpy")
-
+    """Ingest a batch of rows from numpy arrays or 2D sequences without a DataFrame wrapper."""
     schema = self._catalog.lookup_stream(stream_name)
     if schema is None:
       raise SqlError([f"Unknown stream: {stream_name}"])
 
-    ts_arr = np.ascontiguousarray(timestamps, dtype=np.int64)
-    val_arr = np.ascontiguousarray(value_columns, dtype=np.float64)
-    if ts_arr.ndim != 1:
-      raise SqlError(["insert_buffer: timestamps must be 1D"])
-    if val_arr.ndim != 2:
-      raise SqlError(["insert_buffer: value_columns must be 2D"])
-    if ts_arr.shape[0] != val_arr.shape[0]:
-      raise SqlError([
-          "insert_buffer: row count mismatch between timestamps "
-          f"({ts_arr.shape[0]}) and value_columns ({val_arr.shape[0]})"
-      ])
-    if schema.columns and val_arr.shape[1] != len(schema.columns):
+    try:
+      ts_buf, val_buf, row_count, ncols = coerce_input_buffers(timestamps, value_columns)
+    except ValueError as exc:
+      raise SqlError([f"insert_buffer: {exc}"]) from exc
+
+    if schema.columns and row_count > 0 and ncols != len(schema.columns):
       raise SqlError([
           f"insert_buffer column count mismatch for {stream_name}: "
-          f"schema={len(schema.columns)}, got={val_arr.shape[1]}"
+          f"schema={len(schema.columns)}, got={ncols}"
       ])
 
-    row_count = int(ts_arr.shape[0])
     if row_count == 0:
       return InsertResult(rows=0, elapsed_s=0.0, rows_per_sec=0.0)
 
     t0 = time.perf_counter()
 
-    if store_raw:
-      for i in range(row_count):
-        self._store.append(
-            stream_name, int(ts_arr[i]), val_arr[i].tolist(),
-        )
-
+    # Deploy session (and backfill any prior history) BEFORE appending the new
+    # batch to _store so a lazy redeploy does not double-feed the new rows.
     self._ensure_session_deployed()
-    self._feed_session_buffer(stream_name, ts_arr, val_arr)
+
+    if store_raw:
+      if _HAS_NUMPY:
+        for i in range(row_count):
+          self._store.append(
+              stream_name, int(ts_buf[i]), val_buf[i].tolist(),
+          )
+      else:
+        for i in range(row_count):
+          row_slice = list(val_buf[i * ncols:(i + 1) * ncols])
+          self._store.append(stream_name, int(ts_buf[i]), row_slice)
+    else:
+      self._unstored_streams.add(stream_name)
+
+    self._feed_session_buffer(stream_name, ts_buf, val_buf)
 
     elapsed = time.perf_counter() - t0
     rps = row_count / elapsed if elapsed > 0 else float('inf')
     return InsertResult(rows=row_count, elapsed_s=elapsed, rows_per_sec=rps)
+
+  def backtest(
+      self,
+      stream_name: str,
+      timestamps: Any,
+      value_columns: Any,
+      *,
+      views: Optional[Sequence[str]] = None,
+  ) -> Dict[str, BacktestResult]:
+    """Feed a batch of historical data through the consolidated session and
+    return zero-copy columnar outputs per view without Python store overhead."""
+    schema = self._catalog.lookup_stream(stream_name)
+    if schema is None:
+      raise SqlError([f"Unknown stream: {stream_name}"])
+
+    try:
+      ts_buf, val_buf, row_count, ncols = coerce_input_buffers(timestamps, value_columns)
+    except ValueError as exc:
+      raise SqlError([f"backtest: {exc}"]) from exc
+
+    if schema.columns and row_count > 0 and ncols != len(schema.columns):
+      raise SqlError([
+          f"backtest column count mismatch for {stream_name}: "
+          f"schema={len(schema.columns)}, got={ncols}"
+      ])
+
+    self._ensure_session_deployed()
+    if self._session_pipeline is None:
+      return {}
+
+    port = self._session_stream_port.get(stream_name)
+    if port is not None:
+      col_by_op = self._runner.feed_session_buffer_columnar(
+          self._session_pipeline, ts_buf, val_buf, port=port,
+      )
+    else:
+      col_by_op = {}
+
+    wanted = set(views) if views is not None else None
+    results: Dict[str, BacktestResult] = {}
+    for op_id, view_name in self._session_op_to_view.items():
+      if wanted is not None and view_name not in wanted:
+        continue
+      view_meta = self._catalog.lookup_view(view_name)
+      field_map = dict(view_meta.field_map) if view_meta is not None else {}
+      ordered = sorted(field_map.items(), key=lambda item: item[1])
+      col_names = [name for name, _ in ordered]
+      col_indices = [idx for _, idx in ordered]
+
+      if op_id in col_by_op:
+        out_ts, out_vals = col_by_op[op_id]
+        if _HAS_NUMPY:
+          if col_indices and out_vals.ndim == 2 and out_vals.shape[1] > 0:
+            out_vals = out_vals[:, col_indices]
+        else:
+          if col_indices:
+            out_vals = [[row[idx] for idx in col_indices] for row in out_vals]
+      else:
+        if _HAS_NUMPY:
+          out_ts = np.empty((0,), dtype=np.int64)
+          out_vals = np.empty((0, len(col_names)), dtype=np.float64)
+        else:
+          out_ts = []
+          out_vals = []
+
+      results[view_name] = BacktestResult(
+          timestamps=out_ts,
+          values=out_vals,
+          columns=col_names,
+      )
+    return results
+
+  def sweep(
+      self,
+      stream_name: str,
+      timestamps: Any,
+      value_columns: Any,
+      query: str,
+      param_grid: Sequence[Mapping[str, Union[int, float]]],
+  ) -> List[Dict[str, Any]]:
+    """Evaluate a parameterized query across ``param_grid`` in a single
+    consolidated C++ pass over ``(timestamps, value_columns)``.
+
+    Each parameter combination is compiled as a view in a temporary session
+    sharing the same input stream, so the C++ engine scans the input buffer
+    once across all parameter combinations.
+    """
+    if not param_grid:
+      return []
+    schema = self._catalog.lookup_stream(stream_name)
+    if schema is None:
+      raise SqlError([f"Unknown stream: {stream_name}"])
+
+    temp = RtBotSql()
+    temp._ts_units_per_second = self._ts_units_per_second
+    # Clone registered streams and tables into the temporary session
+    snap = self._catalog.snapshot()
+    for s_name, s_schema in snap.streams.items():
+      temp._catalog.register_stream(s_name, s_schema)
+    for t_name, t_schema in snap.tables.items():
+      temp._catalog.register_table(t_name, t_schema)
+
+    stripped = query.strip().rstrip(";")
+    is_create_view = bool(
+        re.match(r"^\s*CREATE\s+(?:MATERIALIZED\s+)?VIEW\b", stripped, flags=re.IGNORECASE)
+    )
+
+    view_names: List[str] = []
+    for idx, params in enumerate(param_grid):
+      vname = f"__sweep_{idx}"
+      if is_create_view:
+        rewritten = re.sub(
+            r"^(\s*CREATE\s+(?:MATERIALIZED\s+)?VIEW\s+)\S+",
+            rf"\1{vname}",
+            stripped,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+      else:
+        rewritten = f"CREATE MATERIALIZED VIEW {vname} AS {stripped}"
+      bound = bind_sql_params(rewritten, params)
+      comp = compile_sql(bound, temp._catalog.snapshot(), temp._ts_units_per_second)
+      for res in comp["results"]:
+        if res.has_errors():
+          raise SqlError(res.errors)
+        vmeta = ViewMeta(
+            name=vname,
+            entity_type=native.EntityType.MATERIALIZED_VIEW,
+            view_type=res.view_type,
+            field_map=dict(res.field_map),
+            source_streams=list(res.source_streams),
+            program_json=res.program_json,
+            output_stream=vname,
+            per_key_prefix=f"{vname}:key:",
+            known_keys=[],
+            key_index=int(res.key_index),
+        )
+        temp._catalog.register_view(vname, vmeta)
+      view_names.append(vname)
+
+    bt = temp.backtest(stream_name, timestamps, value_columns, views=view_names)
+    out: List[Dict[str, Any]] = []
+    for params, vname in zip(param_grid, view_names):
+      res = bt[vname]
+      out.append({
+          "params": dict(params),
+          "timestamps": res.timestamps,
+          "values": res.values,
+          "columns": res.columns,
+      })
+    return out
 
   def insert_dataframe(
       self,
@@ -636,13 +920,18 @@ class RtBotSql:
 
     row_count = len(timestamps)
 
+    # Deploy session (and backfill any prior history) BEFORE appending the new
+    # batch to _store so a lazy redeploy does not double-feed the new rows.
+    self._ensure_session_deployed()
+
     # Store raw stream data if requested (needed for backfill on view creation
     # and for multi-source interleaved replay).
     if store_raw:
       for i in range(row_count):
         self._store.append(stream_name, int(timestamps[i]), value_cols[i].tolist())
+    elif row_count > 0:
+      self._unstored_streams.add(stream_name)
 
-    self._ensure_session_deployed()
     self._feed_session_buffer(stream_name, timestamps, value_cols)
 
     return row_count
@@ -679,28 +968,72 @@ class RtBotSql:
     )
     self._backfill_session_from_store()
 
+  def _resolve_base_streams(self, view_name: str) -> set[str]:
+    """Return the transitive base stream/table names that ``view_name`` reads from."""
+    base: set[str] = set()
+    visited: set[str] = set()
+    stack = [view_name]
+    while stack:
+      curr = stack.pop()
+      if curr in visited:
+        continue
+      visited.add(curr)
+      vmeta = self._catalog.lookup_view(curr)
+      if vmeta is None:
+        base.add(curr)
+        continue
+      for src in vmeta.source_streams:
+        if self._catalog.lookup_view(src) is not None:
+          stack.append(src)
+        else:
+          base.add(src)
+    return base
+
   def _backfill_session_from_store(self) -> None:
     """Replay stored base-stream data through a freshly deployed
     session so newly registered views inherit history from their
     source streams (e.g. after DROP+recreate or when a view is
     created after inserts)."""
     events: List[Tuple[int, int, str, List[float]]] = []
+    streams_with_events: set[str] = set()
     stream_idx = 0
     for stream, port in self._session_stream_port.items():
-      for msg in self._store.read(stream):
+      msgs = self._store.read(stream)
+      if msgs:
+        streams_with_events.add(stream)
+      for msg in msgs:
         events.append((int(msg.timestamp), stream_idx, port,
                         [float(v) for v in msg.values]))
       stream_idx += 1
     if not events:
       return
+    # Clear existing view outputs before replaying the full session so views
+    # that were already registered before this redeploy do not accumulate
+    # duplicate rows. Preserve views whose transitive base streams had unstored
+    # (`store_raw=False`) inserts or have no stored events.
+    self._suppressed_views.clear()
+    for view_name in set(self._session_op_to_view.values()):
+      view_meta = self._catalog.lookup_view(view_name)
+      sources = self._resolve_base_streams(view_name)
+      if not (sources & streams_with_events):
+        continue
+      if (sources & self._unstored_streams) and self._store.read(view_name):
+        self._suppressed_views.add(view_name)
+        continue
+      self._store.clear(view_name)
+      if view_meta is not None:
+        view_meta.known_keys.clear()
     events.sort(key=lambda e: (e[0], e[1]))
     # Reverse-map port → stream so `_feed_session_row` can re-resolve
     # the port from the stream name. Avoids bypassing the helper for
     # this cold path.
     port_to_stream = {port: s for s, port in self._session_stream_port.items()}
-    for ts, _idx, port, values in events:
-      stream = port_to_stream.get(port, "")
-      self._feed_session_row(stream, ts, values)
+    try:
+      for ts, _idx, port, values in events:
+        stream = port_to_stream.get(port, "")
+        self._feed_session_row(stream, ts, values)
+    finally:
+      self._suppressed_views.clear()
 
   def _invalidate_session(self) -> None:
     """Tear down the consolidated session so the next insert rebuilds
@@ -720,10 +1053,12 @@ class RtBotSql:
     session hasn't been deployed yet."""
     if self._session_pipeline is None:
       return
-    port = self._session_stream_port.get(stream_name, "i1")
+    port = self._session_stream_port.get(stream_name)
+    if port is None:
+      return
     for out in self._session_pipeline.feed(timestamp, values, port):
       view_name = self._session_op_to_view.get(out.operator_id)
-      if view_name is None:
+      if view_name is None or view_name in self._suppressed_views:
         continue
       self._append_and_propagate(
           view_name, int(out.timestamp),
@@ -740,7 +1075,9 @@ class RtBotSql:
     ``Program::receive_buffer`` via the pybind zero-copy path."""
     if self._session_pipeline is None:
       return
-    port = self._session_stream_port.get(stream_name, "i1")
+    port = self._session_stream_port.get(stream_name)
+    if port is None:
+      return
     outputs = self._runner.feed_session_buffer(
         self._session_pipeline, timestamps, value_cols, port=port,
     )
@@ -786,6 +1123,8 @@ class RtBotSql:
 
       if store_raw:
         self._append_and_propagate(stream_name, timestamp, values)
+      else:
+        self._unstored_streams.add(stream_name)
       self._feed_session_row(stream_name, timestamp, values)
       row_count += 1
 

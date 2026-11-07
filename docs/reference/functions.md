@@ -121,6 +121,35 @@ Compiles to: `WindowMinMax(mode="max", window_size=N)` operator.
 
 Digital signal processing functions for sensor data, waveforms, and time-series conditioning.
 
+### EMA(expr, alpha_or_span)
+
+Causal Exponential Moving Average seeded on the first sample ($y_0 = x_0$, eliminating zero-startup bias):
+
+$$y_0 = x_0, \qquad y_t = \alpha x_t + (1 - \alpha) y_{t-1}$$
+
+The second argument accepts either:
+- A smoothing factor $\alpha \in (0, 1]$ directly (e.g., `EMA(price, 0.2)`), or
+- A period/span $N > 1$, which converts via the standard recurrence $\alpha = \frac{2}{N + 1}$ (e.g., `EMA(price, 9)` uses $\alpha = 0.2$).
+
+```sql
+-- Direct smoothing factor alpha = 0.2
+SELECT EMA(price, 0.2) AS ema_fast,
+       EMA(price, 20)  AS ema_span_20
+FROM trades
+```
+
+Compiles to: `InfiniteImpulseResponse(b_coeffs=[alpha], a_coeffs=[alpha - 1.0], init_from_first_sample=true)` operator.
+
+### DIFF(expr)
+
+First difference between consecutive samples ($y_t = x_t - x_{t-1}$). Emits starting from the second sample.
+
+```sql
+SELECT DIFF(price) AS price_change FROM trades
+```
+
+Compiles to: `Difference` operator.
+
 ### FIR(expr, ARRAY[coefficients])
 
 Finite Impulse Response filter. Applies a weighted sum of the last N values, where N is the number of coefficients.
@@ -163,10 +192,7 @@ SELECT RESAMPLE_CONSTANT(temperature, 1000) AS temp_1hz FROM sensors
 
 Useful when input data arrives irregularly and downstream operators require aligned timestamps.
 
-The optional `snap_first` argument (0 or 1, default 0) enables snap-to-grid mode: the resampler
-snaps to the current grid point on first message and uses each incoming value immediately at the
-next grid point (rather than holding the previous value). This is used internally by
-`CREATE ALIGNED STREAM` to eliminate one bin of latency.
+The optional `snap_first` argument (0 or 1, default 0) enables snap-to-grid mode for **late-flushed bin aggregates** (such as `CREATE ALIGNED STREAM ... BIN(dt)`): when an upstream segmented bin closes only upon arrival of the next bin's trigger event at $t_{\text{trigger}} \ge (k+1)\Delta t$, `snap_first=1` stamps that already-completed bin at grid boundary $(k+1)\Delta t$ without adding an extra bin of hold latency. Do not set `snap_first=1` on raw unbinned sample streams; for raw streams use the default `snap_first=0` (causal zero-order hold).
 
 Compiles to: `ResamplerConstant(interval=N, t0=0 [, snapFirst=1])` operator.
 

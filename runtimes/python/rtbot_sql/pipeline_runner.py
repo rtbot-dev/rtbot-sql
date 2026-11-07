@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import array
 from dataclasses import dataclass
-from typing import Any, Iterable, List
+from typing import Any, Dict, Iterable, List, Tuple
 
 from .compiler import native
 from .stream_store import Message
@@ -13,6 +14,57 @@ try:
   _HAS_NUMPY = True
 except ImportError:
   _HAS_NUMPY = False
+
+
+def coerce_input_buffers(timestamps: Any, values_2d: Any) -> Tuple[Any, Any, int, int]:
+  """Coerce timestamps (1D int64) and values_2d (2D float64) into contiguous
+  C-buffer objects (numpy arrays when available, stdlib array.array otherwise)."""
+  if _HAS_NUMPY:
+    ts_arr = np.ascontiguousarray(timestamps, dtype=np.int64)
+    val_arr = np.ascontiguousarray(values_2d, dtype=np.float64)
+    if ts_arr.ndim != 1:
+      raise ValueError("timestamps must be 1D")
+    if val_arr.ndim != 2:
+      raise ValueError("value_columns must be 2D")
+    if ts_arr.shape[0] != val_arr.shape[0]:
+      raise ValueError(
+          f"row count mismatch between timestamps ({ts_arr.shape[0]}) "
+          f"and value_columns ({val_arr.shape[0]})"
+      )
+    return ts_arr, val_arr, int(ts_arr.shape[0]), int(val_arr.shape[1])
+
+  if (
+      isinstance(timestamps, array.array)
+      and timestamps.typecode == "q"
+      and isinstance(values_2d, array.array)
+      and values_2d.typecode == "d"
+  ):
+    nrows = len(timestamps)
+    if nrows > 0 and len(values_2d) % nrows != 0:
+      raise ValueError(
+          f"row count mismatch between timestamps ({nrows}) "
+          f"and flat value buffer ({len(values_2d)})"
+      )
+    ncols = (len(values_2d) // nrows) if nrows > 0 else 0
+    return timestamps, values_2d, nrows, ncols
+
+  ts_list = [int(t) for t in timestamps]
+  if any(not isinstance(r, (list, tuple)) for r in values_2d):
+    raise ValueError("value_columns must be 2D")
+  rows_list = [[float(x) for x in row] for row in values_2d]
+  nrows = len(ts_list)
+  if nrows != len(rows_list):
+    raise ValueError(
+        f"row count mismatch between timestamps ({nrows}) "
+        f"and value_columns ({len(rows_list)})"
+    )
+  ncols = len(rows_list[0]) if nrows > 0 else 0
+  for r in rows_list:
+    if len(r) != ncols:
+      raise ValueError("all rows in value_columns must have the same length")
+  ts_buf = array.array("q", ts_list)
+  flat_vals = array.array("d", (x for r in rows_list for x in r))
+  return ts_buf, flat_vals, nrows, ncols
 
 
 @dataclass
@@ -104,13 +156,8 @@ class LocalPipelineRunner:
       port: str = "i1",
   ) -> List[PipelineOutput]:
     """Feed one batch through the consolidated session pipeline."""
-    if not _HAS_NUMPY:
-      raise ImportError("feed_session_buffer requires numpy")
-    native_outputs = session.feed_buffer(
-        np.ascontiguousarray(timestamps, dtype=np.int64),
-        np.ascontiguousarray(values_2d, dtype=np.float64),
-        str(port),
-    )
+    ts_buf, val_buf, _, _ = coerce_input_buffers(timestamps, values_2d)
+    native_outputs = session.feed_buffer(ts_buf, val_buf, str(port))
     return [
         PipelineOutput(
             timestamp=int(out.timestamp),
@@ -120,3 +167,22 @@ class LocalPipelineRunner:
         )
         for out in native_outputs
     ]
+
+  def feed_session_buffer_columnar(
+      self,
+      session: "native.NativeSessionPipeline",
+      timestamps: Any,
+      values_2d: Any,
+      port: str = "i1",
+  ) -> Dict[str, Tuple[Any, Any]]:
+    """Feed one batch through the consolidated session pipeline and return
+    columnar buffers per output operator_id without per-row Python objects."""
+    ts_buf, val_buf, _, _ = coerce_input_buffers(timestamps, values_2d)
+    raw = session.feed_buffer_columnar(ts_buf, val_buf, str(port))
+    out: Dict[str, Tuple[Any, Any]] = {}
+    for op_id, (out_ts, out_vals) in raw.items():
+      if _HAS_NUMPY:
+        out[str(op_id)] = (np.asarray(out_ts), np.asarray(out_vals))
+      else:
+        out[str(op_id)] = (out_ts.tolist(), out_vals.tolist())
+    return out
