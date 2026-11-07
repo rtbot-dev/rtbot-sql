@@ -985,6 +985,49 @@ class AlignedStreamSugarTest(unittest.TestCase):
 
 
 class BackfillAndParameterizedSqlTest(unittest.TestCase):
+  def test_nested_segmented_groups_survive_session_consolidation(self):
+    # POWER prevents the burst fast path: each keyed prototype contains a
+    # nested Pipeline whose prototype reference must survive consolidation.
+    readings = [
+        {"time": 1, "device": 1.0, "channel": 7.0, "x": 3.0},
+        {"time": 2, "device": 2.0, "channel": 7.0, "x": 5.0},
+        {"time": 3, "device": 1.0, "channel": 7.0, "x": 4.0},
+        {"time": 4, "device": 2.0, "channel": 7.0, "x": 12.0},
+        {"time": 5, "device": 1.0, "channel": 7.0, "x": 0.0},
+        {"time": 6, "device": 2.0, "channel": 7.0, "x": 0.0},
+    ]
+    for buffered in [False, True]:
+      with self.subTest(buffered=buffered):
+        sql = rtbot_sql.RtBotSql()
+        sql.execute("CREATE STREAM s (device DOUBLE, channel DOUBLE, x DOUBLE)")
+        for name, offset in [("rms", 0), ("shifted", 10)]:
+          sql.execute(
+              f"CREATE MATERIALIZED VIEW {name} AS "
+              "SELECT device, channel, COUNT(*) AS n, "
+              f"POWER(SUM(x*x)/COUNT(*), 0.5) + {offset} AS value "
+              "FROM s GROUP BY device, channel, ABS(x) > 0"
+          )
+        if buffered:
+          sql.insert_buffer("s", [r["time"] for r in readings],
+                            [[r["device"], r["channel"], r["x"]] for r in readings])
+        else:
+          sql.insert_dataframe("s", readings)
+        for name, offset in [("rms", 0), ("shifted", 10)]:
+          columns, rows = _columns_and_rows(sql.execute(f"SELECT * FROM {name} WHERE n > 1"))
+          records = [dict(zip(columns, row)) for row in rows]
+          records.sort(key=lambda row: row["device"])
+          self.assertEqual(len(records), 2)
+          for row, device, expected, timestamp in zip(
+              records, [1.0, 2.0], [math.sqrt(12.5), math.sqrt(84.5)], [5, 6]):
+            self.assertEqual(row["device"], device)
+            self.assertEqual(row["channel"], 7.0)
+            self.assertEqual(row["n"], 2.0)
+            actual_time = row["time"]
+            if hasattr(actual_time, "timestamp"):
+              actual_time = actual_time.timestamp()
+            self.assertEqual(actual_time, timestamp)
+            self.assertAlmostEqual(row["value"], expected + offset, places=10)
+
   def test_create_second_view_does_not_duplicate_first_view_store(self):
     """Minimal reproducer: creating a second view after inserts must not duplicate
     rows already stored in the first materialized view."""

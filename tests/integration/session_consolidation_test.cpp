@@ -47,6 +47,37 @@ class SessionConsolidationTest : public ::testing::Test {
 // Empty session: no views.
 // ---------------------------------------------------------------------------
 
+TEST_F(SessionConsolidationTest, NestedSegmentPrototypeReferencesArePreserved) {
+  for (const auto& name : {"rms", "other_rms"}) {
+    auto r = compile_sql(
+        std::string("CREATE MATERIALIZED VIEW ") + name +
+        " AS SELECT instrument_id, quantity, COUNT(*) AS n, "
+        "POWER(SUM(price * price) / COUNT(*), 0.5) AS rms "
+        "FROM trades GROUP BY instrument_id, quantity, ABS(price) > 0",
+        catalog);
+    ASSERT_FALSE(r.has_errors());
+    register_view(name, r, EntityType::MATERIALIZED_VIEW);
+  }
+  auto session = compile_session_program(catalog);
+  ASSERT_FALSE(session.has_errors());
+  const auto graph = json::parse(session.program_json);
+  size_t nested_pipelines = 0;
+  for (const auto& op : graph.at("operators")) {
+    if (op.at("type") != "KeyedPipeline") continue;
+    for (const auto& inner : op.at("prototype").at("operators")) {
+      if (inner.at("type") != "Pipeline") continue;
+      ++nested_pipelines;
+      ASSERT_TRUE(inner.contains("input_port_types"));
+      EXPECT_EQ(inner.at("input_port_types"), json::array({"vector_number"}));
+      ASSERT_TRUE(inner.contains("operators"));
+      EXPECT_FALSE(inner.at("operators").empty());
+      EXPECT_TRUE(inner.contains("entryOperator"));
+      EXPECT_TRUE(inner.contains("outputMappings"));
+    }
+  }
+  EXPECT_EQ(nested_pipelines, 2u);
+}
+
 TEST_F(SessionConsolidationTest, NoViewsIsError) {
   auto s = compile_session_program(catalog);
   EXPECT_TRUE(s.has_errors())

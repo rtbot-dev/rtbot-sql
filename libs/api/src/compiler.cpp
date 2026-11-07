@@ -1627,14 +1627,24 @@ SessionCompilationResult compile_session_program(
 
     const std::string prefix = vname + "__";
 
-    // Clone prototypes with view-prefixed ids (operator refs below get
-    // rewritten to the new prototype id). Inner operators in the prototype
-    // are in a separate scope and do not need renaming.
+    // Prototype ids share the session namespace, including references from
+    // operators inside other prototypes. Build the complete map first so
+    // forward references are rewritten as well. Inner operator ids remain
+    // local to each prototype and do not need renaming.
     std::map<std::string, std::string> proto_rename;
     for (const auto& proto : per_view.prototypes()) {
+      proto_rename[proto.id] = prefix + proto.id;
+    }
+    for (const auto& proto : per_view.prototypes()) {
       compiler::PrototypeDef cloned = proto;
-      cloned.id = prefix + proto.id;
-      proto_rename[proto.id] = cloned.id;
+      cloned.id = proto_rename.at(proto.id);
+      for (auto& inner_op : cloned.operators) {
+        auto ref = inner_op.string_params.find("prototype");
+        if (ref != inner_op.string_params.end()) {
+          auto renamed = proto_rename.find(ref->second);
+          if (renamed != proto_rename.end()) ref->second = renamed->second;
+        }
+      }
       merged.add_prototype(cloned);
     }
 
