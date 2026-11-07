@@ -66,6 +66,7 @@ public class RtBotSqlRuntime {
      */
     private ByteBuffer sessionOutBuf = null;
     private static final int SESSION_OUT_BUF_INITIAL_CAPACITY = 64 * 1024;
+    private double[] scratchValues = new double[16];
 
     /**
      * Preresolved view metadata keyed by the merged-graph terminal operator
@@ -612,16 +613,17 @@ public class RtBotSqlRuntime {
     private void dispatchSessionBinary(ByteBuffer buf, int bytes) {
         buf.order(ByteOrder.nativeOrder()).position(0).limit(bytes);
         int nOut = buf.getInt();
+        double[] scratch = scratchValues;
         for (int m = 0; m < nOut; m++) {
             int opIdx = buf.getInt();
             int nVals = buf.getInt();
             long ts = buf.getLong();
-            List<Double> values = new ArrayList<>(nVals);
-            for (int v = 0; v < nVals; v++) values.add(buf.getDouble());
+            if (scratch.length < nVals) scratch = scratchValues = new double[nVals];
+            for (int v = 0; v < nVals; v++) scratch[v] = buf.getDouble();
             if (opIdx < 0 || opIdx >= sessionTerminalsByIndex.length) continue;
             SessionViewInfo info = sessionTerminalsByIndex[opIdx];
             if (info == null) continue;
-            applySessionOutput(info, ts, values);
+            applySessionOutput(info, ts, scratch, nVals);
         }
     }
 
@@ -636,6 +638,22 @@ public class RtBotSqlRuntime {
         OutputListener listener = subscriptions.get(info.viewName);
         if (listener != null) {
             listener.onMessage(info.viewName, timestamp, values);
+        }
+    }
+
+    private void applySessionOutput(SessionViewInfo info, long timestamp,
+                                     double[] values, int nValues) {
+        if (info.storeOutput && collectMode) {
+            List<Double> boxed = new ArrayList<>(nValues);
+            for (int v = 0; v < nValues; v++) boxed.add(values[v]);
+            store.append(info.viewName, timestamp, boxed);
+            if (info.keyed && info.keyIndex < nValues) {
+                catalog.addKey(info.viewName, values[info.keyIndex]);
+            }
+        }
+        OutputListener listener = subscriptions.get(info.viewName);
+        if (listener != null) {
+            listener.onMessage(info.viewName, timestamp, values, nValues);
         }
     }
 
