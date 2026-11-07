@@ -369,6 +369,77 @@ class FeedBatchCorrectnessTest(unittest.TestCase):
         [[100.0, 95.0, 5.0], [101.0, 95.0, 6.0]],
     )
 
+  def test_insert_with_store_raw_on_undeployed_session_does_not_double_ingest(self):
+    """Minimal reproducer: insert_buffer / insert_dataframe with store_raw=True
+    when _session_pipeline is None (e.g. after DROP VIEW) must not feed rows twice."""
+    sql = rtbot_sql.RtBotSql()
+    sql.execute("CREATE STREAM s (x DOUBLE)")
+    sql.execute("CREATE MATERIALIZED VIEW v1 AS SELECT x FROM s")
+    sql.execute("CREATE MATERIALIZED VIEW v2 AS SELECT x * 2 AS y FROM s")
+    # Dropping v2 invalidates _session_pipeline while v1 remains registered
+    sql.execute("DROP VIEW v2")
+
+    ts = np.array([1, 2, 3], dtype=np.int64)
+    vals = np.array([[10.0], [20.0], [30.0]], dtype=np.float64)
+    sql.insert_buffer("s", ts, vals, store_raw=True)
+
+    _, rows = _columns_and_rows(sql.execute("SELECT * FROM v1"))
+    self.assertEqual(len(rows), 3, f"Expected 3 rows in v1, got {len(rows)} (double ingestion)")
+
+  def test_create_second_view_does_not_duplicate_existing_view_store(self):
+    """Minimal reproducer: creating a second view after stored inserts must backfill
+    the new view without duplicating rows already stored in the first view."""
+    sql = rtbot_sql.RtBotSql()
+    sql.execute("CREATE STREAM s (x DOUBLE)")
+    sql.execute("CREATE MATERIALIZED VIEW v1 AS SELECT x FROM s")
+
+    df = pd.DataFrame({"time": [1, 2, 3], "x": [10.0, 20.0, 30.0]})
+    sql.insert_dataframe("s", df, store_raw=True)
+
+    # Creating v2 triggers session redeploy + backfill from store
+    sql.execute("CREATE MATERIALIZED VIEW v2 AS SELECT x * 2 AS y FROM s")
+
+    _, rows_v1 = _columns_and_rows(sql.execute("SELECT * FROM v1"))
+    _, rows_v2 = _columns_and_rows(sql.execute("SELECT * FROM v2"))
+    self.assertEqual(len(rows_v1), 3, f"Expected 3 rows in v1, got {len(rows_v1)} (duplicate backfill)")
+    self.assertEqual(len(rows_v2), 3)
+
+  def test_parameterized_execute_backtest_and_sweep(self):
+    """Verify parameterized SQL (:param), columnar backtest(), and multi-view sweep()."""
+    sql = rtbot_sql.RtBotSql()
+    sql.execute("CREATE STREAM ticks (price DOUBLE)")
+    sql.execute(
+        "CREATE MATERIALIZED VIEW sig AS "
+        "SELECT price, EMA(price, :alpha) AS ema_p, "
+        "price - EMA(price, :alpha) AS resid "
+        "FROM ticks",
+        params={"alpha": 0.5},
+    )
+
+    ts = np.array([1, 2, 3, 4], dtype=np.int64)
+    vals = np.array([[10.0], [20.0], [14.0], [18.0]], dtype=np.float64)
+
+    bt = sql.backtest("ticks", ts, vals)
+    self.assertIn("sig", bt)
+    sig_ts, sig_vals, sig_cols = bt["sig"]
+    self.assertEqual(sig_cols, ["price", "ema_p", "resid"])
+    np.testing.assert_array_equal(sig_ts, ts)
+    # Seeded EMA(0.5): y0=10, y1=15, y2=14.5, y3=16.25
+    np.testing.assert_allclose(sig_vals[:, 1], [10.0, 15.0, 14.5, 16.25])
+    np.testing.assert_allclose(sig_vals[:, 2], [0.0, 5.0, -0.5, 1.75])
+
+    # Parameter sweep over alpha values in a single consolidated pass
+    sweep_results = sql.sweep(
+        stream_name="ticks",
+        timestamps=ts,
+        value_columns=vals,
+        query="SELECT EMA(price, :alpha) AS ema_p FROM ticks",
+        param_grid=[{"alpha": 0.5}, {"alpha": 0.25}],
+    )
+    self.assertEqual(len(sweep_results), 2)
+    np.testing.assert_allclose(sweep_results[0]["values"][:, 0], [10.0, 15.0, 14.5, 16.25])
+    np.testing.assert_allclose(sweep_results[1]["values"][:, 0], [10.0, 12.5, 12.875, 14.15625])
+
 
 class FeedBatchPerformanceTest(unittest.TestCase):
   """Verify batch path performance characteristics.

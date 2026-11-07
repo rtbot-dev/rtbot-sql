@@ -966,6 +966,180 @@ class AlignedStreamSugarTest(unittest.TestCase):
     self.assertEqual(messages[2].timestamp, 3000)
     self.assertAlmostEqual(messages[2].values[0], 45.0, places=5)
 
+  def test_aligned_stream_1h_bin_no_32bit_overflow(self):
+    """CREATE ALIGNED STREAM with BIN(1h) (= 3,600,000,000 us > INT32_MAX)
+    must not overflow 32-bit int parameters in TIMESHIFT / RESAMPLE_CONSTANT."""
+    rt = rtbot_sql.RtBotSql()
+    rt.execute("CREATE ALIGNED STREAM hourly (temp DOUBLE) BIN(1h)")
+
+    # Bin 0: [0, 3_600_000_000)
+    rt.insert_mixed("temp", 100_000_000, [20.0])
+    rt.insert_mixed("temp", 200_000_000, [30.0])
+    # Bin 1: [3_600_000_000, 7_200_000_000) -> flushes bin 0 avg (25.0) at t=3_600_000_000
+    rt.insert_mixed("temp", 3_700_000_000, [40.0])
+
+    messages = rt._store.read("hourly")
+    self.assertEqual(len(messages), 1)
+    self.assertEqual(messages[0].timestamp, 3_600_000_000)
+    self.assertAlmostEqual(messages[0].values[0], 25.0, places=5)
+
+
+class BackfillAndParameterizedSqlTest(unittest.TestCase):
+  def test_create_second_view_does_not_duplicate_first_view_store(self):
+    """Minimal reproducer: creating a second view after inserts must not duplicate
+    rows already stored in the first materialized view."""
+    sql = rtbot_sql.RtBotSql()
+    sql.execute("CREATE STREAM s (x DOUBLE)")
+    sql.execute("CREATE MATERIALIZED VIEW v1 AS SELECT x FROM s")
+    sql.execute("INSERT INTO s VALUES (10.0)")
+    sql.execute("INSERT INTO s VALUES (20.0)")
+    sql.execute("INSERT INTO s VALUES (30.0)")
+
+    # Creating v2 redeploys session and backfills from store
+    sql.execute("CREATE MATERIALIZED VIEW v2 AS SELECT x * 2 AS y FROM s")
+
+    _, rows_v1 = _columns_and_rows(sql.execute("SELECT * FROM v1"))
+    _, rows_v2 = _columns_and_rows(sql.execute("SELECT * FROM v2"))
+    self.assertEqual(len(rows_v1), 3, f"Expected 3 rows in v1, got {len(rows_v1)}")
+    self.assertEqual(len(rows_v2), 3, f"Expected 3 rows in v2, got {len(rows_v2)}")
+
+  def test_insert_buffer_on_undeployed_session_does_not_double_ingest(self):
+    """Minimal reproducer: insert_buffer(..., store_raw=True) when _session_pipeline
+    is None (e.g. after DROP VIEW) must not feed rows twice."""
+    sql = rtbot_sql.RtBotSql()
+    sql.execute("CREATE STREAM s (x DOUBLE)")
+    sql.execute("CREATE MATERIALIZED VIEW v1 AS SELECT x FROM s")
+    sql.execute("CREATE MATERIALIZED VIEW v2 AS SELECT x * 2 AS y FROM s")
+    sql.execute("DROP VIEW v2")
+
+    sql.insert_buffer("s", [1, 2, 3], [[10.0], [20.0], [30.0]], store_raw=True)
+    _, rows_v1 = _columns_and_rows(sql.execute("SELECT * FROM v1"))
+    self.assertEqual(len(rows_v1), 3, f"Expected 3 rows in v1, got {len(rows_v1)}")
+
+  def test_parameterized_execute_backtest_and_sweep(self):
+    """Verify :param / {param} substitution, columnar backtest(), and multi-view sweep()."""
+    sql = rtbot_sql.RtBotSql()
+    sql.execute("CREATE STREAM ticks (price DOUBLE)")
+    sql.execute(
+        "CREATE MATERIALIZED VIEW sig AS "
+        "SELECT price, EMA(price, :alpha) AS ema_p, "
+        "price - EMA(price, {alpha}) AS resid "
+        "FROM ticks",
+        params={"alpha": 0.5},
+    )
+
+    ts = [1, 2, 3, 4]
+    vals = [[10.0], [20.0], [14.0], [18.0]]
+    bt = sql.backtest("ticks", ts, vals)
+    self.assertIn("sig", bt)
+    sig_ts, sig_vals, sig_cols = bt["sig"]
+    self.assertEqual(sig_cols, ["price", "ema_p", "resid"])
+    self.assertEqual(list(sig_ts), [1, 2, 3, 4])
+    expected_ema = [10.0, 15.0, 14.5, 16.25]
+    expected_resid = [0.0, 5.0, -0.5, 1.75]
+    for i in range(4):
+      self.assertAlmostEqual(sig_vals[i][1], expected_ema[i], places=9)
+      self.assertAlmostEqual(sig_vals[i][2], expected_resid[i], places=9)
+
+    sweep_out = sql.sweep(
+        stream_name="ticks",
+        timestamps=ts,
+        value_columns=vals,
+        query="SELECT EMA(price, :alpha) AS ema_p FROM ticks",
+        param_grid=[{"alpha": 0.5}, {"alpha": 0.25}],
+    )
+    self.assertEqual(len(sweep_out), 2)
+    for i, exp in enumerate([10.0, 15.0, 14.5, 16.25]):
+      self.assertAlmostEqual(sweep_out[0]["values"][i][0], exp, places=9)
+    for i, exp in enumerate([10.0, 12.5, 12.875, 14.15625]):
+      self.assertAlmostEqual(sweep_out[1]["values"][i][0], exp, places=9)
+
+  def test_bind_sql_params_negative_after_minus_not_comment(self):
+    """Substituting a negative parameter right after '-' must not form a '--' SQL comment."""
+    bound = rtbot_sql.bind_sql_params("SELECT price-:offset FROM s", {"offset": -2})
+    self.assertEqual(bound, "SELECT price-(-2) FROM s")
+
+    sql = rtbot_sql.RtBotSql()
+    sql.execute("CREATE STREAM s (price DOUBLE)")
+    sql.execute(
+        "CREATE MATERIALIZED VIEW v AS SELECT price-:offset AS shifted FROM s",
+        params={"offset": -2},
+    )
+    sql.insert_buffer("s", [1], [[10.0]])
+    _, rows = _columns_and_rows(sql.execute("SELECT * FROM v"))
+    self.assertEqual(len(rows), 1)
+    self.assertAlmostEqual(rows[0][1], 12.0, places=9)
+
+  def test_backfill_preserves_view_on_unstored_stream(self):
+    """Creating a new view on a stored stream must not wipe outputs of a view
+    whose source stream was ingested with store_raw=False."""
+    sql = rtbot_sql.RtBotSql()
+    sql.execute("CREATE STREAM s_fast (x DOUBLE)")
+    sql.execute("CREATE STREAM s_stored (y DOUBLE)")
+    sql.execute("CREATE MATERIALIZED VIEW v_fast AS SELECT x FROM s_fast")
+    sql.insert_buffer("s_fast", [1, 2], [[10.0], [20.0]], store_raw=False)
+    sql.insert_buffer("s_stored", [1, 2], [[100.0], [200.0]], store_raw=True)
+
+    # Creating v_stored triggers _backfill_session_from_store with events from s_stored
+    sql.execute("CREATE MATERIALIZED VIEW v_stored AS SELECT y FROM s_stored")
+
+    _, rows_fast = _columns_and_rows(sql.execute("SELECT * FROM v_fast"))
+    _, rows_stored = _columns_and_rows(sql.execute("SELECT * FROM v_stored"))
+    self.assertEqual(len(rows_fast), 2)
+    self.assertEqual(len(rows_stored), 2)
+
+  def test_fallback_without_numpy_and_native_buffer_validation(self):
+    """Verify stdlib array.array fallback when _HAS_NUMPY=False and C++ buffer validation."""
+    import array
+    import rtbot_sql.pipeline_runner as pr
+    import rtbot_sql.runtime as rt_mod
+
+    orig_pr = pr._HAS_NUMPY
+    orig_rt = rt_mod._HAS_NUMPY
+    try:
+      pr._HAS_NUMPY = False
+      rt_mod._HAS_NUMPY = False
+      sql = rtbot_sql.RtBotSql()
+      sql.execute("CREATE STREAM s (x DOUBLE)")
+      sql.execute("CREATE MATERIALIZED VIEW v AS SELECT EMA(x, 0.5) AS e FROM s")
+      res = sql.insert_buffer("s", [1, 2], [[10.0], [20.0]], store_raw=True)
+      self.assertEqual(res.rows, 2)
+      bt = sql.backtest("s", [3, 4], [[14.0], [18.0]])
+      self.assertEqual(bt["v"].timestamps, [3, 4])
+      self.assertEqual(len(bt["v"].values), 2)
+    finally:
+      pr._HAS_NUMPY = orig_pr
+      rt_mod._HAS_NUMPY = orig_rt
+
+    # Verify C++ run_receive_buffer rejects wrong-dtype buffers
+    sql2 = rtbot_sql.RtBotSql()
+    sql2.execute("CREATE STREAM s (x DOUBLE)")
+    sql2.execute("CREATE MATERIALIZED VIEW v AS SELECT x FROM s")
+    sql2._ensure_session_deployed()
+    bad_ts = array.array("d", [1.0, 2.0])  # float64 instead of int64
+    good_vals = array.array("d", [10.0, 20.0])
+    with self.assertRaises(ValueError):
+      sql2._session_pipeline.feed_buffer(bad_ts, good_vals, "i1")
+
+  def test_chained_views_and_unmapped_stream_backtest(self):
+    """Chained views (s -> v1 -> v2) must not duplicate rows on backfill,
+    and backtesting an unmapped stream must not feed port i1."""
+    sql = rtbot_sql.RtBotSql()
+    sql.execute("CREATE STREAM s (x DOUBLE)")
+    sql.execute("CREATE STREAM unused (x DOUBLE)")
+    sql.execute("CREATE MATERIALIZED VIEW v1 AS SELECT x FROM s")
+    sql.execute("CREATE MATERIALIZED VIEW v2 AS SELECT x * 2 AS y FROM v1")
+    sql.insert_buffer("s", [1, 2], [[10.0], [20.0]], store_raw=True)
+
+    # Creating v3 triggers backfill; v2 (whose direct source is v1) must not duplicate
+    sql.execute("CREATE MATERIALIZED VIEW v3 AS SELECT x + 1 AS z FROM s")
+    _, rows_v2 = _columns_and_rows(sql.execute("SELECT * FROM v2"))
+    self.assertEqual(len(rows_v2), 2)
+
+    # Backtesting 'unused' must not feed 's' on port i1
+    bt = sql.backtest("unused", [3], [[99.0]])
+    self.assertEqual(len(bt["v1"].timestamps), 0)
+
 
 if __name__ == "__main__":
   unittest.main()

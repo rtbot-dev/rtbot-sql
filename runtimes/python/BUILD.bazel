@@ -246,3 +246,12 @@ py_test(
     tags = ["manual"],
     deps = [":rtbot_sql"],
 )
+
+py_test(
+    name = "batch_feed_test",
+    srcs = ["test/batch_feed_test.py"],
+    main = "test/batch_feed_test.py",
+    timeout = "moderate",
+    tags = ["manual"],
+    deps = [":rtbot_sql"],
+)
